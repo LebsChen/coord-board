@@ -732,4 +732,92 @@ describe("coord board", () => {
     expect(new Headers(headers).get("x-coord-board-signature")).toMatch(/^sha256=/);
     fetchSpy.mockRestore();
   });
+
+  it("aggregates an isolated team snapshot and protects leader controls", async () => {
+    const projectA = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-project-a", name: "Team A" }),
+    });
+    const projectB = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-project-b", name: "Team B" }),
+    });
+    expect(projectA.response.status).toBe(201);
+    expect(projectB.response.status).toBe(201);
+    const developer = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-developer", project_id: "team-project-a", name: "Developer", role: "开发" }),
+    });
+    const teammate = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-teammate", project_id: "team-project-a", name: "Teammate", role: "开发" }),
+    });
+    const lead = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-lead", project_id: "team-project-a", name: "Lead", role: "编排" }),
+    });
+    const other = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-other", project_id: "team-project-b", name: "Other", role: "开发" }),
+    });
+    const developerToken = String(developer.body.token);
+    const teammateToken = String(teammate.body.token);
+    const leadToken = String(lead.body.token);
+    const otherToken = String(other.body.token);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "team-project-a", title: "Team task", required_gates: ["tests"] }),
+    });
+    const taskId = String(task.body.id);
+    expect((await call(`/api/board/tasks/${taskId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    const otherTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "team-project-b", title: "Other task" }),
+    });
+    const snapshot = await call("/api/board/team", {}, developerToken);
+    expect(snapshot.response.status).toBe(200);
+    expect(snapshot.body.project.id).toBe("team-project-a");
+    expect(snapshot.body.agents.map((agent: any) => agent.id)).toEqual(expect.arrayContaining(["team-developer", "team-teammate", "team-lead"]));
+    expect(snapshot.body.agents.find((agent: any) => agent.id === "team-developer").current_task.id).toBe(taskId);
+    expect(snapshot.body.tasks.find((item: any) => item.id === taskId).required_gates).toEqual(["tests"]);
+    expect(snapshot.body.tasks.find((item: any) => item.id === String(otherTask.body.id))).toBeUndefined();
+    expect((await call("/api/board/team?project=team-project-b", {}, developerToken)).response.status).toBe(403);
+    expect((await call(`/api/board/team?project=team-project-a`, {}, "test-token")).response.status).toBe(200);
+
+    const deniedReassign = await call(`/api/board/tasks/${taskId}/reassign`, {
+      method: "POST",
+      body: JSON.stringify({ assignee_agent_id: "team-teammate" }),
+    }, developerToken);
+    expect(deniedReassign.response.status).toBe(403);
+    const unchanged = await call(`/api/board/tasks/${taskId}`, {}, developerToken);
+    expect(unchanged.body.assignee_agent_id).toBeNull();
+    const reassigned = await call(`/api/board/tasks/${taskId}/reassign`, {
+      method: "POST",
+      body: JSON.stringify({ assignee_agent_id: "team-teammate" }),
+    }, leadToken);
+    expect(reassigned.response.status).toBe(200);
+    expect(reassigned.body.assignee_agent_id).toBe("team-teammate");
+    expect(reassigned.body.phase).toBe("ready");
+    expect(reassigned.body.lease_owner).toBeNull();
+
+    const releasable = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "team-project-a", title: "Release task" }),
+    });
+    const releasableId = String(releasable.body.id);
+    expect((await call(`/api/board/tasks/${releasableId}/claim`, { method: "POST" }, teammateToken)).response.status).toBe(200);
+    const deniedRelease = await call(`/api/board/tasks/${releasableId}/release`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "team-teammate" }),
+    }, developerToken);
+    expect(deniedRelease.response.status).toBe(403);
+    expect((await call(`/api/board/tasks/${releasableId}`, {}, developerToken)).body.lease_owner).toBe("team-teammate");
+    const forcedRelease = await call(`/api/board/tasks/${releasableId}/release`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "team-teammate" }),
+    }, leadToken);
+    expect(forcedRelease.response.status).toBe(200);
+    expect((await call(`/api/board/tasks/${releasableId}`, {}, developerToken)).body.lease_owner).toBeNull();
+    expect((await call(`/api/board/team?project=team-project-b`, {}, otherToken)).response.status).toBe(200);
+  });
 });

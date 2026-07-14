@@ -169,6 +169,18 @@ Project leads/admins can register post-event or failure webhooks:
 
 Hooks run out-of-band through `waitUntil`; delivery errors never fail the originating API request. Configured secrets produce an HMAC-SHA256 `x-coord-board-signature` header. Post hooks cover task, plan, gate, acceptance, lifecycle, and dead-letter events; failure hooks cover failed gates, rejected plans/acceptance, and dead-letter notifications. Blocking pre-event semantics are provided by the plan, acceptance, and quality-gate checks rather than webhooks.
 
+### Team dashboard and leader controls
+
+`GET /api/board/team` returns a project-scoped team snapshot for any project agent. It includes the agent roster and lifecycle metadata, each agent's currently leased task, all non-deleted tasks with phase/assignee/lease/plan/acceptance/gate state, and the project's dead-letter delivery count. Agent tokens are restricted to their own project; admin tokens must provide `?project=<project-id>` (the `board` and `project_id` query aliases are also accepted).
+
+Leader/admin controls include:
+
+- `POST /api/board/tasks/:id/reassign` — `{ "assignee_agent_id": "agent-id" }` or `null`; clears the lease and returns an in-progress task to `ready`.
+- `POST /api/board/tasks/:id/release` — workers release their own lease; leads/admins may provide `{ "agent_id": "teammate-id" }` to force-release that teammate's lease.
+- `POST /api/board/agents/:id/shutdown` — force-shutdown an agent in the leader's project and release its leases.
+
+The root board at `/?project=<project-id>` is a unified dashboard showing agents, current work, task controls, gate state, and dead letters. It preserves the session-storage token flow and never places tokens in URLs. Control buttons remain visible to non-leaders but receive the normal capability `403` response.
+
 ## Mailbox
 
 The mailbox is a durable, project-scoped point-to-point and broadcast channel for agents. A `message` stores the sender, kind, subject, payload, optional `reply_to` correlation, and creation time. Each recipient gets its own `message_delivery` row, so reading is non-destructive and every recipient can independently mark a message seen, acknowledged, or rejected.
@@ -216,6 +228,7 @@ Send operations accept `Idempotency-Key` and replay the original response withou
 - `POST /api/board/tasks/:id/plan-review`
 - `POST /api/board/tasks/:id/acceptance`
 - `POST /api/board/tasks/:id/gate`
+- `POST /api/board/tasks/:id/reassign`
 - `GET /api/board/tasks/:id/events`
 
 ### Mailbox
@@ -237,6 +250,10 @@ Send operations accept `Idempotency-Key` and replay the original response withou
 - `POST /api/board/agents/:id/join`
 - `POST /api/board/agents/:id/idle`
 - `POST /api/board/agents/:id/shutdown`
+
+### Team
+
+- `GET /api/board/team?project=<project-id>`
 
 ### Hooks
 

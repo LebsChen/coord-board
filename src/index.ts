@@ -532,12 +532,19 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
 async function releaseTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
-  const denied = capabilityDenied(auth, "release", access.row);
-  if (denied) return denied;
   const body = await parseBody(request);
-  const identityError = checkAgentIdentity(body, auth);
-  if (identityError) return identityError;
-  const owner = bodyAgent(body, auth);
+  const currentOwner = access.row?.lease_owner ? String(access.row.lease_owner) : null;
+  const requestedOwner = body.agent_id === null ? null : (body.agent_id === undefined ? currentOwner : String(body.agent_id));
+  const override = requestedOwner !== null && (isAdmin(auth) || auth.agentId !== requestedOwner);
+  const denied = override
+    ? capabilityDenied(auth, "manage", access.row)
+    : capabilityDenied(auth, "release", access.row);
+  if (denied) return denied;
+  if (!override) {
+    const identityError = checkAgentIdentity(body, auth);
+    if (identityError) return identityError;
+  }
+  const owner = requestedOwner || bodyAgent(body, auth);
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:release:${taskId}`, key);
   if (replay) return replay;
@@ -547,10 +554,43 @@ async function releaseTask(request: Request, env: Env, auth: Auth, taskId: strin
     env.DB.prepare(
       "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND lease_owner = ? AND deleted_at IS NULL",
     ).bind(timestamp, taskId, projectId, owner),
-    conditionalEvent(env.DB, taskId, "released", owner, { project_id: projectId }, "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND lease_owner IS NULL AND updated_at = ?)", [taskId, projectId, timestamp]),
+    conditionalEvent(env.DB, taskId, "released", actor(auth), { project_id: projectId, released_agent_id: owner, forced: override }, "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND lease_owner IS NULL AND updated_at = ?)", [taskId, projectId, timestamp]),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "lease not owned" }, 409);
   return saveIdempotentResponse(env.DB, `task:release:${taskId}`, key, json({ ok: true }));
+}
+
+async function reassignTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "manage", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const assignee = body.assignee_agent_id === null || body.assignee_agent_id === ""
+    ? null
+    : (body.assignee_agent_id === undefined ? undefined : String(body.assignee_agent_id));
+  if (assignee !== null && assignee !== undefined) {
+    const target = await env.DB.prepare("SELECT id FROM agent WHERE id = ? AND project_id = ?").bind(assignee, access.row?.board_id).first();
+    if (!target) return json({ error: "assignee agent not found in project" }, 422);
+  }
+  const current = access.row as Record<string, unknown>;
+  const timestamp = now();
+  const nextPhase = current.phase === "in_progress" ? "ready" : current.phase;
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE task_item
+       SET assignee_agent_id = ?, phase = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+       WHERE id = ? AND board_id = ? AND deleted_at IS NULL`,
+    ).bind(assignee ?? null, nextPhase, timestamp, taskId, current.board_id),
+    event(env.DB, taskId, "reassigned", actor(auth), {
+      project_id: current.board_id,
+      assignee_agent_id: assignee ?? null,
+      previous_assignee_agent_id: current.assignee_agent_id ?? null,
+      previous_lease_owner: current.lease_owner ?? null,
+    }),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "task not found" }, 404);
+  return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
 }
 
 async function completeTask(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
@@ -1306,16 +1346,89 @@ async function hooks(request: Request, env: Env, auth: Auth): Promise<Response> 
   return json({ id: newHookId, project_id: projectId, event_types: events, url, phase, active: 1, created_at: timestamp }, 201);
 }
 
+async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const url = new URL(request.url);
+  const requestedProject = url.searchParams.get("project") || url.searchParams.get("board") || url.searchParams.get("project_id");
+  if (!isAdmin(auth) && requestedProject && requestedProject !== auth.projectId) {
+    return json({ error: "project access denied" }, 403);
+  }
+  const projectId = requestedProject || (isAdmin(auth) ? null : auth.projectId);
+  if (!projectId) return json({ error: "project selector is required for admin tokens" }, 400);
+  const project = await env.DB.prepare("SELECT id, name FROM project WHERE id = ?").bind(projectId).first<{ id: string; name: string }>();
+  if (!project) return json({ error: "project not found" }, 404);
+  const [agentRows, taskRows, deadRows] = await Promise.all([
+    env.DB.prepare(
+      "SELECT id, project_id, name, role, status, last_seen_at, metadata_json, created_at, updated_at FROM agent WHERE project_id = ? ORDER BY name, id",
+    ).bind(projectId).all<Record<string, unknown>>(),
+    env.DB.prepare(
+      "SELECT * FROM task_item WHERE board_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at",
+    ).bind(projectId).all<Record<string, unknown>>(),
+    env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM message_delivery WHERE project_id = ? AND status = 'dead'",
+    ).bind(projectId).first<{ count: number }>(),
+  ]);
+  const tasks = taskRows.results;
+  const taskIds = tasks.map((task) => String(task.id));
+  const gates = taskIds.length
+    ? await env.DB.prepare(
+      `SELECT task_id, gate_name, status, by_agent, note, created_at, updated_at
+       FROM task_gate WHERE task_id IN (${taskIds.map(() => "?").join(",")}) ORDER BY gate_name`,
+    ).bind(...taskIds).all<Record<string, unknown>>()
+    : { results: [] as Record<string, unknown>[] };
+  const gatesByTask = new Map<string, Record<string, unknown>[]>();
+  for (const gate of gates.results) {
+    const taskGates = gatesByTask.get(String(gate.task_id)) ?? [];
+    taskGates.push(gate);
+    gatesByTask.set(String(gate.task_id), taskGates);
+  }
+  const taskViews = tasks.map((task) => ({
+    id: task.id,
+    title: task.title,
+    phase: task.phase,
+    assignee_agent_id: task.assignee_agent_id,
+    lease_owner: task.lease_owner,
+    lease_expires_at: task.lease_expires_at,
+    plan_status: task.plan_status,
+    acceptance_status: task.acceptance_status,
+    required_gates: requiredGates(task),
+    gates: gatesByTask.get(String(task.id)) ?? [],
+  }));
+  const taskByLease = new Map<string, Record<string, unknown>>();
+  for (const task of taskViews) {
+    if (task.lease_owner) taskByLease.set(String(task.lease_owner), task);
+  }
+  const agents = agentRows.results.map((agent) => ({
+    id: agent.id,
+    project_id: agent.project_id,
+    name: agent.name,
+    role: agent.role,
+    status: agent.status,
+    last_seen_at: agent.last_seen_at,
+    current_task: taskByLease.get(String(agent.id)) ?? null,
+  }));
+  return json({
+    project: { id: project.id, name: project.name },
+    agents,
+    tasks: taskViews,
+    dead_letter_count: Number(deadRows?.count ?? 0),
+  });
+}
+
 const html = `<!doctype html><meta charset="utf-8"><title>Coord Board</title>
-<style>body{font:14px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}input,textarea,button{padding:.5rem;margin:.2rem}textarea{width:100%}.task{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:.5rem 0}.blocked{opacity:.55}</style>
-<h1>Coord Board</h1><h2 id="project-heading"></h2><label>Bearer token <input id="token" type="password" size="50"></label><label>Agent ID <input id="agent" value="ui-agent"></label><button onclick="saveAndLoad()">Load</button>
-<form onsubmit="add(event)"><input id="title" placeholder="Task title" required><input id="board" value="default" placeholder="project"><button>Add</button></form><main id="tasks"></main>
+<style>body{font:14px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}input,textarea,button{padding:.5rem;margin:.2rem}section{margin:1.5rem 0}.task,.agent{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:.5rem 0}.muted{color:#666}.blocked{opacity:.55}.pill{display:inline-block;background:#eee;border-radius:999px;padding:.15rem .5rem;margin-left:.3rem}button{cursor:pointer}</style>
+<h1>Coord Board</h1><h2 id="project-heading"></h2><label>Bearer token <input id="token" type="password" size="50"></label><label>Agent ID <input id="agent" value="ui-agent"></label><button onclick="saveAndLoad()">Load dashboard</button>
+<form onsubmit="add(event)"><input id="title" placeholder="Task title" required><input id="board" value="default" placeholder="project"><button>Add task</button></form>
+<section><h3>Agents</h3><div id="agents" class="muted">Load a project to view the team.</div></section>
+<section><h3>Tasks</h3><main id="tasks" class="muted">Load a project to view tasks.</main></section>
+<section><h3>Dead letters</h3><div id="deadletters" class="muted">—</div></section>
 <script>
-const query=new URLSearchParams(location.search); const project=query.get('project')||query.get('board')||sessionStorage.getItem('coord-board-project')||'default'; const token=document.querySelector('#token'); token.value=sessionStorage.getItem('coord-board-token')||''; document.querySelector('#project-heading').textContent='Project: '+project; document.querySelector('#board').value=project; document.querySelector('#board').readOnly=Boolean(query.get('project')||query.get('board')); const api=(p,o={})=>fetch('/api/board'+p,{...o,headers:{Authorization:'Bearer '+token.value,'Content-Type':'application/json',...(o.headers||{})}}).then(r=>r.json());
+const query=new URLSearchParams(location.search); const project=query.get('project')||query.get('board')||sessionStorage.getItem('coord-board-project')||'default'; const token=document.querySelector('#token'); token.value=sessionStorage.getItem('coord-board-token')||''; document.querySelector('#project-heading').textContent='Project: '+project; document.querySelector('#board').value=project; document.querySelector('#board').readOnly=Boolean(query.get('project')||query.get('board')); const api=(p,o={})=>fetch('/api/board'+p,{...o,headers:{Authorization:'Bearer '+token.value,'Content-Type':'application/json',...(o.headers||{})}}).then(async r=>({status:r.status,data:await r.json()}));
 function saveAndLoad(){sessionStorage.setItem('coord-board-token',token.value);sessionStorage.setItem('coord-board-project',project);load()}
-async function load(){const d=await api('/tasks?project='+encodeURIComponent(project));document.querySelector('#tasks').innerHTML=(d.tasks||[]).map(t=>'<article class="task '+(t.dependencies.length?'blocked':'')+'"><b>'+esc(t.title)+'</b> <small>'+t.phase+' / '+(t.lease_owner||'unassigned')+'</small><p>'+esc(t.description||'')+'</p><button onclick="claim(\\''+t.id+'\\')">Claim</button><button onclick="complete(\\''+t.id+'\\')">Complete</button></article>').join('')}
-async function add(e){e.preventDefault();await api('/tasks',{method:'POST',body:JSON.stringify({title:document.querySelector('#title').value,board_id:project})});e.target.reset();load()}
-async function claim(id){const agent=document.querySelector('#agent').value;await api('/tasks/'+id+'/claim',{method:'POST',body:JSON.stringify({agent_id:agent})});load()} async function complete(id){await api('/tasks/'+id+'/complete',{method:'POST',body:JSON.stringify({agent_id:document.querySelector('#agent').value})});load()} function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function result(r){if(r.status>=400) alert(r.data.error||'Request failed');return r}
+async function load(){const r=await api('/team?project='+encodeURIComponent(project));if(r.status>=400){document.querySelector('#agents').textContent=r.data.error||'Unable to load team';return}const d=r.data;document.querySelector('#agents').innerHTML=(d.agents||[]).map(a=>'<article class="agent"><b>'+esc(a.name||a.id)+'</b> <span class="pill">'+esc(a.status)+'</span> <span class="muted">'+esc(a.role||'worker')+' · last seen '+esc(a.last_seen_at||'never')+'</span>'+(a.current_task?'<div>Current task: '+esc(a.current_task.title)+' ('+esc(a.current_task.phase)+')</div>':'<div class="muted">No leased task</div>')+'<button onclick="shutdown(\\''+esc(a.id)+'\\')">Force shutdown</button></article>').join('')||'<span class="muted">No agents</span>';document.querySelector('#tasks').innerHTML=(d.tasks||[]).map(t=>'<article class="task"><b>'+esc(t.title)+'</b> <span class="pill">'+esc(t.phase)+'</span><div>Assignee: '+esc(t.assignee_agent_id||'unassigned')+' · Lease: '+esc(t.lease_owner||'none')+(t.lease_expires_at?' until '+esc(t.lease_expires_at):'')+'</div><div>Plan: '+esc(t.plan_status||'none')+' · Acceptance: '+esc(t.acceptance_status||'none')+' · Gates: '+esc((t.gates||[]).map(g=>g.gate_name+':'+g.status).join(', ')||'none')+'</div><button onclick="claim(\\''+esc(t.id)+'\\')">Claim</button><button onclick="complete(\\''+esc(t.id)+'\\')">Complete</button><button onclick="reassign(\\''+esc(t.id)+'\\')">Reassign</button>'+(t.lease_owner?'<button onclick="release(\\''+esc(t.id)+'\\',\\''+esc(t.lease_owner)+'\\')">Force release</button>':'')+'</article>').join('')||'<span class="muted">No tasks</span>';document.querySelector('#deadletters').textContent=String(d.dead_letter_count??0)}
+async function add(e){e.preventDefault();result(await api('/tasks',{method:'POST',body:JSON.stringify({title:document.querySelector('#title').value,board_id:project})}));e.target.reset();load()}
+async function claim(id){result(await api('/tasks/'+id+'/claim',{method:'POST',body:JSON.stringify({agent_id:document.querySelector('#agent').value})}));load()} async function complete(id){result(await api('/tasks/'+id+'/complete',{method:'POST',body:JSON.stringify({agent_id:document.querySelector('#agent').value})}));load()} async function shutdown(id){result(await api('/agents/'+id+'/shutdown',{method:'POST',body:'{}'}));load()} async function release(id,agent){result(await api('/tasks/'+id+'/release',{method:'POST',body:JSON.stringify({agent_id:agent})}));load()} async function reassign(id){const agent=prompt('Assignee agent id (blank to clear):','');if(agent===null)return;result(await api('/tasks/'+id+'/reassign',{method:'POST',body:JSON.stringify({assignee_agent_id:agent||null})}));load()} load()
 </script>`;
 
 export default {
@@ -1336,12 +1449,13 @@ export default {
       return json({ error: "unauthorized" }, 401);
     }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);
-    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|plan|plan-review|acceptance|gate|dependencies|events))?)?$/);
+    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];
       const action = taskMatch[2];
       if (action === "claim" && taskId) return claimTask(request, env, auth, ctx, taskId);
       if (action === "release" && taskId) return releaseTask(request, env, auth, taskId);
+      if (action === "reassign" && taskId && request.method === "POST") return reassignTask(request, env, auth, taskId);
       if (action === "complete" && taskId) return completeTask(request, env, auth, ctx, taskId);
       if (action === "review" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "review");
       if (action === "verify" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "verify");
@@ -1358,6 +1472,7 @@ export default {
       return handleTask(request, env, auth, taskId);
     }
     if (url.pathname === "/api/board/projects") return projects(request, env, auth);
+    if (url.pathname === "/api/board/team" && request.method === "GET") return teamSnapshot(request, env, auth);
     const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/(heartbeat|join|idle|shutdown))?$/);
     if (agentMatch) {
       return agentMatch[1] && url.pathname.endsWith("/heartbeat")
