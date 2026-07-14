@@ -12,6 +12,10 @@ const call = (path: string, init: RequestInit = {}, token = "test-token") => {
     body: await response.json() as Record<string, any>,
   }));
 };
+const sha256ForTest = async (value: string) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 
 describe("coord board", () => {
   beforeAll(async () => {
@@ -1028,5 +1032,134 @@ describe("coord board", () => {
       body: JSON.stringify({ title: "reused after cleanup" }),
     });
     expect(reused.response.status).toBe(201);
+  });
+
+  it("rotates agent tokens and rejects revoked credentials", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "credentials-project", name: "Credentials" }),
+    });
+    expect(project.response.status).toBe(201);
+    const registration = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "credentials-worker",
+        project_id: "credentials-project",
+        name: "Credentials Worker",
+        role: "worker",
+      }),
+    });
+    expect(registration.response.status).toBe(201);
+    const oldToken = String(registration.body.token);
+    const rotated = await call("/api/board/agents/credentials-worker/rotate-token", { method: "POST" });
+    expect(rotated.response.status).toBe(200);
+    const newToken = String(rotated.body.token);
+    expect(newToken).not.toBe(oldToken);
+    expect((await call("/api/board/agents", {}, oldToken)).response.status).toBe(401);
+    expect((await call("/api/board/agents", {}, newToken)).response.status).toBe(200);
+    expect(rotated.body.token_hash).toBeUndefined();
+  });
+
+  it("revokes a worker token on shutdown and blocks subsequent claims", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "credentials-project", name: "Credentials" }),
+    });
+    const registration = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "shutdown-revoke-worker",
+        project_id: "credentials-project",
+        name: "Shutdown Worker",
+        role: "worker",
+      }),
+    });
+    const token = String(registration.body.token);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "credentials-project", title: "claim before revoke" }),
+    });
+    const claimed = await call(`/api/board/tasks/${task.body.id}/claim`, { method: "POST" }, token);
+    expect(claimed.response.status).toBe(200);
+    const shutdown = await call("/api/board/agents/shutdown-revoke-worker/shutdown", {
+      method: "POST",
+      body: JSON.stringify({ revoke_token: true }),
+    });
+    expect(shutdown.response.status).toBe(200);
+    expect(shutdown.body.token_revoked).toBe(true);
+    const anotherTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "credentials-project", title: "claim after revoke" }),
+    });
+    const denied = await call(`/api/board/tasks/${anotherTask.body.id}/claim`, { method: "POST" }, token);
+    expect(denied.response.status).toBe(401);
+  });
+
+  it("issues project-scoped read-only share tokens with expiry", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "credentials-project", name: "Credentials" }),
+    });
+    const issued = await call("/api/board/share-token", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "credentials-project", ttl_seconds: 3600 }),
+    });
+    expect(issued.response.status).toBe(201);
+    const token = String(issued.body.token);
+    const team = await call("/api/board/team?project=credentials-project", {}, token);
+    expect(team.response.status).toBe(200);
+    const deniedMutation = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "credentials-project", title: "share must not mutate" }),
+    }, token);
+    expect(deniedMutation.response.status).toBe(403);
+    expect(deniedMutation.body.error).toContain("read-only");
+    await env.DB.prepare("UPDATE share_token SET expires_at = ? WHERE token_hash = ?")
+      .bind("2000-01-01T00:00:00.000Z", await sha256ForTest(token)).run();
+    expect((await call("/api/board/team?project=credentials-project", {}, token)).response.status).toBe(401);
+  });
+
+  it("serves canonical role-aware briefings without credentials or desktop-sync claims", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "credentials-project", name: "Credentials" }),
+    });
+    const worker = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "briefing-worker",
+        project_id: "credentials-project",
+        name: "Briefing Worker",
+        role: "worker",
+      }),
+    });
+    const lead = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "briefing-lead",
+        project_id: "credentials-project",
+        name: "Briefing Lead",
+        role: "lead",
+      }),
+    });
+    const workerToken = String(worker.body.token);
+    const leadToken = String(lead.body.token);
+    const workerBriefing = await call("/api/board/briefing?role=worker&project=credentials-project", {}, workerToken);
+    expect(workerBriefing.response.status).toBe(200);
+    expect(workerBriefing.body.capabilities).toContain("claim");
+    expect(workerBriefing.body.capabilities).not.toContain("manage");
+    expect(workerBriefing.body.briefing_markdown).toContain("POST /api/board/tasks/:id/renew");
+    expect(workerBriefing.body.briefing_markdown).toContain("every 60–120 seconds");
+    expect(workerBriefing.body.briefing_markdown).toContain("Board API and mailbox");
+    expect(workerBriefing.body.briefing_markdown).not.toContain("desktop engine");
+    expect(workerBriefing.body.briefing_markdown).not.toContain(workerToken);
+    const leadBriefing = await call("/api/board/briefing?role=lead&project=credentials-project", {}, leadToken);
+    expect(leadBriefing.response.status).toBe(200);
+    expect(leadBriefing.body.capabilities).toContain("manage");
+    expect(leadBriefing.body.briefing_markdown).toContain("PATCH /api/board/tasks/:id");
+    expect(leadBriefing.body.briefing_markdown).toContain("assignee_agent_id");
+    expect(leadBriefing.body.briefing_markdown).toContain("POST /api/board/tasks/:id/reassign");
+    expect(leadBriefing.body.briefing_markdown).toContain("POST /api/board/agents/:id/shutdown");
+    expect(leadBriefing.body.briefing_markdown).not.toContain(leadToken);
   });
 });
