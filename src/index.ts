@@ -58,6 +58,14 @@ function isAdmin(auth: Auth): auth is Extract<Auth, { kind: "admin" }> {
   return auth.kind === "admin";
 }
 
+function isLead(auth: Auth): boolean {
+  return auth.kind === "agent" && /lead|orchestrator|编排/i.test(auth.role);
+}
+
+function managementDenied(auth: Auth): Response | null {
+  return isAdmin(auth) || isLead(auth) ? null : json({ error: "leader authorization required" }, 403);
+}
+
 function actor(auth: Auth): string | null {
   return auth.agentId;
 }
@@ -169,7 +177,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
   const method = request.method;
   if (method === "GET" && !taskId) {
     const url = new URL(request.url);
-    const requestedBoard = url.searchParams.get("board_id");
+    const requestedBoard = url.searchParams.get("board_id") || url.searchParams.get("project") || url.searchParams.get("board");
     if (requestedBoard && !projectAllowed(auth, requestedBoard)) {
       return json({ error: "project access denied" }, 403);
     }
@@ -181,6 +189,8 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     return json({ tasks: await Promise.all(rows.map((row) => taskView(db, row))) });
   }
   if (!taskId && method === "POST") {
+    const denied = managementDenied(auth);
+    if (denied) return denied;
     const body = await parseBody(request);
     const boardId = String(body.board_id || "default");
     if (!projectAllowed(auth, boardId)) return json({ error: "project access denied" }, 403);
@@ -227,6 +237,10 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
   if (access.error) return access.error;
   const current = access.row as Record<string, unknown>;
   if (method === "GET") return json(await taskView(db, current));
+  if (method === "PATCH" || method === "DELETE") {
+    const denied = managementDenied(auth);
+    if (denied) return denied;
+  }
   const body = await parseBody(request);
   const identityError = checkAgentIdentity(body, auth);
   if (identityError) return identityError;
@@ -370,6 +384,8 @@ async function completeTask(request: Request, env: Env, auth: Auth, taskId: stri
 }
 
 async function dependencies(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  const denied = managementDenied(auth);
+  if (denied) return denied;
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
   const body = await parseBody(request);
@@ -471,13 +487,13 @@ async function heartbeat(request: Request, env: Env, auth: Auth, agentId: string
 
 const html = `<!doctype html><meta charset="utf-8"><title>Coord Board</title>
 <style>body{font:14px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}input,textarea,button{padding:.5rem;margin:.2rem}textarea{width:100%}.task{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:.5rem 0}.blocked{opacity:.55}</style>
-<h1>Coord Board</h1><label>Bearer token <input id="token" type="password" size="50"></label><label>Agent ID <input id="agent" value="ui-agent"></label><button onclick="saveAndLoad()">Load</button>
+<h1>Coord Board</h1><h2 id="project-heading"></h2><label>Bearer token <input id="token" type="password" size="50"></label><label>Agent ID <input id="agent" value="ui-agent"></label><button onclick="saveAndLoad()">Load</button>
 <form onsubmit="add(event)"><input id="title" placeholder="Task title" required><input id="board" value="default" placeholder="project"><button>Add</button></form><main id="tasks"></main>
 <script>
-const token=document.querySelector('#token'); token.value=sessionStorage.getItem('coord-board-token')||''; const api=(p,o={})=>fetch('/api/board'+p,{...o,headers:{Authorization:'Bearer '+token.value,'Content-Type':'application/json',...(o.headers||{})}}).then(r=>r.json());
-function saveAndLoad(){sessionStorage.setItem('coord-board-token',token.value);load()}
-async function load(){const d=await api('/tasks');document.querySelector('#tasks').innerHTML=(d.tasks||[]).map(t=>'<article class="task '+(t.dependencies.length?'blocked':'')+'"><b>'+esc(t.title)+'</b> <small>'+t.phase+' / '+(t.lease_owner||'unassigned')+'</small><p>'+esc(t.description||'')+'</p><button onclick="claim(\\''+t.id+'\\')">Claim</button><button onclick="complete(\\''+t.id+'\\')">Complete</button></article>').join('')}
-async function add(e){e.preventDefault();await api('/tasks',{method:'POST',body:JSON.stringify({title:document.querySelector('#title').value,board_id:document.querySelector('#board').value})});e.target.reset();load()}
+const query=new URLSearchParams(location.search); const project=query.get('project')||query.get('board')||sessionStorage.getItem('coord-board-project')||'default'; const token=document.querySelector('#token'); token.value=sessionStorage.getItem('coord-board-token')||''; document.querySelector('#project-heading').textContent='Project: '+project; document.querySelector('#board').value=project; document.querySelector('#board').readOnly=Boolean(query.get('project')||query.get('board')); const api=(p,o={})=>fetch('/api/board'+p,{...o,headers:{Authorization:'Bearer '+token.value,'Content-Type':'application/json',...(o.headers||{})}}).then(r=>r.json());
+function saveAndLoad(){sessionStorage.setItem('coord-board-token',token.value);sessionStorage.setItem('coord-board-project',project);load()}
+async function load(){const d=await api('/tasks?project='+encodeURIComponent(project));document.querySelector('#tasks').innerHTML=(d.tasks||[]).map(t=>'<article class="task '+(t.dependencies.length?'blocked':'')+'"><b>'+esc(t.title)+'</b> <small>'+t.phase+' / '+(t.lease_owner||'unassigned')+'</small><p>'+esc(t.description||'')+'</p><button onclick="claim(\\''+t.id+'\\')">Claim</button><button onclick="complete(\\''+t.id+'\\')">Complete</button></article>').join('')}
+async function add(e){e.preventDefault();await api('/tasks',{method:'POST',body:JSON.stringify({title:document.querySelector('#title').value,board_id:project})});e.target.reset();load()}
 async function claim(id){const agent=document.querySelector('#agent').value;await api('/tasks/'+id+'/claim',{method:'POST',body:JSON.stringify({agent_id:agent})});load()} async function complete(id){await api('/tasks/'+id+'/complete',{method:'POST',body:JSON.stringify({agent_id:document.querySelector('#agent').value})});load()} function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 </script>`;
 

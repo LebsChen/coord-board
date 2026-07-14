@@ -123,6 +123,9 @@ describe("coord board", () => {
     expect(visibleA.body.tasks.some((task: { id: string }) => task.id === taskB.body.id)).toBe(false);
     const visibleB = await call("/api/board/tasks", {}, tokenB);
     expect(visibleB.body.tasks.map((task: { id: string }) => task.id)).toContain(taskB.body.id);
+    const projectFiltered = await call("/api/board/tasks?project=project-a");
+    expect(projectFiltered.body.tasks.every((task: { board_id: string }) => task.board_id === "project-a")).toBe(true);
+    expect(projectFiltered.body.tasks.some((task: { id: string }) => task.id === taskB.body.id)).toBe(false);
 
     const adminVisible = await call("/api/board/tasks");
     expect(adminVisible.body.tasks.map((task: { id: string }) => task.id)).toEqual(expect.arrayContaining([taskA.body.id, taskB.body.id]));
@@ -184,5 +187,82 @@ describe("coord board", () => {
     expect(next.response.status).toBe(200);
     expect(next.body.id).toBe(queueIds[2]);
     expect(next.body.lease_owner).toBe("project-agent-a2");
+  });
+
+  it("restricts task management to admins and lead-role agents", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "management-project", name: "Management Project" }),
+    });
+    expect(project.response.status).toBe(201);
+    const worker = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "management-worker", project_id: "management-project", name: "Worker", role: "开发" }),
+    });
+    const lead = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "management-lead", project_id: "management-project", name: "Lead", role: "编排" }),
+    });
+    expect(worker.response.status).toBe(201);
+    expect(lead.response.status).toBe(201);
+    const workerToken = String(worker.body.token);
+    const leadToken = String(lead.body.token);
+
+    const adminCreated = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "management-project", title: "Admin task" }),
+    });
+    expect(adminCreated.response.status).toBe(201);
+    const taskId = String(adminCreated.body.id);
+    const before = await call(`/api/board/tasks/${taskId}`, {}, workerToken);
+
+    const workerCreate = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "management-project", title: "Forbidden task" }),
+    }, workerToken);
+    const workerPatch = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: "Changed by worker" }),
+    }, workerToken);
+    const workerDependencies = await call(`/api/board/tasks/${taskId}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [] }),
+    }, workerToken);
+    const workerDelete = await call(`/api/board/tasks/${taskId}`, { method: "DELETE" }, workerToken);
+    expect(workerCreate.response.status).toBe(403);
+    expect(workerPatch.response.status).toBe(403);
+    expect(workerDependencies.response.status).toBe(403);
+    expect(workerDelete.response.status).toBe(403);
+    const after = await call(`/api/board/tasks/${taskId}`, {}, workerToken);
+    expect(after.body.title).toBe(before.body.title);
+    expect(after.body.deleted_at).toBe(before.body.deleted_at);
+    expect(after.body.dependencies).toEqual(before.body.dependencies);
+
+    const leadCreated = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "management-project", title: "Lead task" }),
+    }, leadToken);
+    expect(leadCreated.response.status).toBe(201);
+    const leadTaskId = String(leadCreated.body.id);
+    const leadPatched = await call(`/api/board/tasks/${leadTaskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: "Lead updated" }),
+    }, leadToken);
+    expect(leadPatched.response.status).toBe(200);
+    const leadDependencies = await call(`/api/board/tasks/${leadTaskId}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [taskId] }),
+    }, leadToken);
+    expect(leadDependencies.response.status).toBe(200);
+    const adminUpdated = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ description: "Admin update" }),
+    });
+    expect(adminUpdated.response.status).toBe(200);
+
+    const workerClaim = await call(`/api/board/tasks/${taskId}/claim`, { method: "POST" }, workerToken);
+    expect(workerClaim.response.status).toBe(200);
+    const workerComplete = await call(`/api/board/tasks/${taskId}/complete`, { method: "POST" }, workerToken);
+    expect(workerComplete.response.status).toBe(200);
   });
 });
