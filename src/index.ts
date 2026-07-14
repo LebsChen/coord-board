@@ -30,6 +30,8 @@ const MAILBOX_MAX_ATTEMPTS = 3;
 const DEFAULT_LEASE_SECONDS = 300;
 const MIN_LEASE_SECONDS = 10;
 const MAX_LEASE_SECONDS = 24 * 60 * 60;
+// Known boundary: requests slower than this can lose an in-progress reservation;
+// terminal upsert and mailbox SQL uniqueness remain the duplicate-execution safeguards.
 const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 15 * 60 * 1000;
 const BACKUP_ACCOUNT_KEY_VERSION = "v1";
 const DEFAULT_FAILOVER_MAX_REPLACEMENTS = 4;
@@ -41,6 +43,8 @@ const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
 const MAX_ACCOUNT_CLAIMS_PER_REQUEST = 100;
 const MAX_HOOK_DELIVERY_ATTEMPTS = 5;
 const HOOK_DELIVERY_BATCH_SIZE = 50;
+const HOOK_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const HOOK_DELIVERY_IN_FLIGHT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_TASK_ATTEMPTS = 5;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
@@ -146,11 +150,20 @@ function dispatchHooks(
   phase: "post" | "failure",
   payload: Json,
 ): void {
-  ctx.waitUntil(enqueueHookDeliveries(env.DB, projectId, eventType, phase, payload).catch(() => undefined));
+  // Keep hook persistence isolated from the business transaction; failures are explicit in Worker logs.
+  ctx.waitUntil(enqueueHookDeliveries(env.DB, projectId, eventType, phase, payload).catch((error) => {
+    console.error("hook outbox enqueue failed", error instanceof Error ? error.message : String(error));
+  }));
 }
 
 async function deliverHookOutbox(db: D1Database): Promise<void> {
   const timestamp = now();
+  const staleBefore = new Date(Date.now() - HOOK_DELIVERY_IN_FLIGHT_TIMEOUT_MS).toISOString();
+  await db.prepare(
+    `UPDATE hook_delivery
+     SET status = 'pending', next_attempt_at = ?, updated_at = ?, last_error = COALESCE(last_error, 'delivery lease expired')
+     WHERE status = 'delivering' AND updated_at <= ?`,
+  ).bind(timestamp, timestamp, staleBefore).run();
   const rows = await db.prepare(
     `SELECT d.*, h.url, h.secret
      FROM hook_delivery d
@@ -160,14 +173,19 @@ async function deliverHookOutbox(db: D1Database): Promise<void> {
      LIMIT ?`,
   ).bind(timestamp, HOOK_DELIVERY_BATCH_SIZE).all<Record<string, unknown>>();
   await Promise.all(rows.results.map(async (delivery) => {
-    const body = JSON.stringify({
-      event_type: delivery.event_type,
-      phase: delivery.phase,
-      project_id: delivery.project_id,
-      payload: JSON.parse(String(delivery.payload_json)),
-    });
+    const claimed = await db.prepare(
+      "UPDATE hook_delivery SET status = 'delivering', updated_at = ? WHERE id = ? AND status = 'pending'",
+    ).bind(timestamp, String(delivery.id)).run();
+    if ((claimed.meta.changes ?? 0) !== 1) return;
     let error: string | null = null;
+    let body = "";
     try {
+      body = JSON.stringify({
+        event_type: delivery.event_type,
+        phase: delivery.phase,
+        project_id: delivery.project_id,
+        payload: JSON.parse(String(delivery.payload_json)),
+      });
       if (!delivery.url) throw new Error("hook not found");
       const headers: HeadersInit = { "content-type": "application/json" };
       if (delivery.secret) headers["x-coord-board-signature"] = `sha256=${await hmacSha256(String(delivery.secret), body)}`;
@@ -178,7 +196,7 @@ async function deliverHookOutbox(db: D1Database): Promise<void> {
     }
     if (!error) {
       await db.prepare(
-        "UPDATE hook_delivery SET status = 'delivered', updated_at = ?, last_error = NULL WHERE id = ? AND status = 'pending'",
+        "UPDATE hook_delivery SET status = 'delivered', updated_at = ?, last_error = NULL WHERE id = ? AND status = 'delivering'",
       ).bind(timestamp, String(delivery.id)).run();
       return;
     }
@@ -189,7 +207,7 @@ async function deliverHookOutbox(db: D1Database): Promise<void> {
     await db.prepare(
       `UPDATE hook_delivery
        SET status = ?, attempt_count = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
-       WHERE id = ? AND status = 'pending'`,
+       WHERE id = ? AND status = 'delivering'`,
     ).bind(dead ? "dead" : "pending", attempts, nextAttempt, error, timestamp, String(delivery.id)).run();
   }));
 }
@@ -683,9 +701,14 @@ async function runCloudFailover(
 async function sweepLeases(db: D1Database, env?: Env): Promise<void> {
   const timestamp = now();
   const staleIdempotencyBefore = new Date(Date.now() - IDEMPOTENCY_IN_PROGRESS_TTL_MS).toISOString();
+  const hookDeliveryRetentionBefore = new Date(Date.now() - HOOK_DELIVERY_RETENTION_MS).toISOString();
   await db.prepare(
     "DELETE FROM idempotency_key WHERE response_status IS NULL AND created_at <= ?",
   ).bind(staleIdempotencyBefore).run();
+  await db.prepare(
+    "DELETE FROM hook_delivery WHERE status IN ('delivered', 'dead') AND updated_at <= ?",
+  ).bind(hookDeliveryRetentionBefore).run();
+  await db.prepare("DELETE FROM share_token WHERE expires_at < ?").bind(timestamp).run();
   await db.prepare(
     "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE status = 'reserved' AND updated_at <= ?",
   ).bind(timestamp, new Date(Date.now() - 10 * 60 * 1000).toISOString()).run().catch(() => undefined);
@@ -1570,15 +1593,36 @@ function mailboxMessageView(row: Record<string, unknown>): Record<string, unknow
   return { ...row, payload: mailboxPayload(row) };
 }
 
-function mailboxCursor(createdAt: string, rowId: string): string {
-  return btoa(JSON.stringify({ created_at: createdAt, id: rowId }));
+async function mailboxCursor(
+  secret: string,
+  projectId: string,
+  mode: "inbox" | "sent",
+  createdAt: string,
+  rowId: string,
+): Promise<string> {
+  const encoded = base64(new TextEncoder().encode(JSON.stringify({
+    project_id: projectId, mode, created_at: createdAt, id: rowId,
+  })));
+  return `${encoded}.${await hmacSha256(secret, encoded)}`;
 }
 
-function parseMailboxCursor(value: string | null): { created_at: string; id: string } | null {
+async function parseMailboxCursor(
+  secret: string,
+  value: string | null,
+  projectId: string,
+  mode: "inbox" | "sent",
+): Promise<{ created_at: string; id: string } | null> {
   if (!value) return null;
   try {
-    const parsed = JSON.parse(atob(value)) as Record<string, unknown>;
-    if (typeof parsed.created_at !== "string" || typeof parsed.id !== "string") return null;
+    const [encoded, signature] = value.split(".");
+    if (!encoded || !signature || signature !== await hmacSha256(secret, encoded)) return null;
+    const parsed = JSON.parse(new TextDecoder().decode(fromBase64(encoded))) as Record<string, unknown>;
+    if (
+      parsed.project_id !== projectId ||
+      parsed.mode !== mode ||
+      typeof parsed.created_at !== "string" ||
+      typeof parsed.id !== "string"
+    ) return null;
     return { created_at: parsed.created_at, id: parsed.id };
   } catch {
     return null;
@@ -1735,7 +1779,8 @@ async function listMailbox(request: Request, env: Env, auth: Auth, sent: boolean
   const parsedLimit = Number(url.searchParams.get("limit") ?? 50);
   const limit = Number.isFinite(parsedLimit) ? Math.min(200, Math.max(1, Math.floor(parsedLimit))) : 50;
   const cursorValue = url.searchParams.get("cursor");
-  const cursor = parseMailboxCursor(cursorValue);
+  const cursorScope = projectId ?? "*";
+  const cursor = await parseMailboxCursor(env.BOARD_TOKEN, cursorValue, cursorScope, sent ? "sent" : "inbox");
   if (cursorValue && !cursor) return json({ error: "invalid mailbox cursor" }, 400);
   const validStatuses: MailboxStatus[] = ["unread", "seen", "acked", "nacked", "dead"];
   if (!sent && status && !validStatuses.includes(status as MailboxStatus)) {
@@ -1788,7 +1833,13 @@ async function listMailbox(request: Request, env: Env, auth: Auth, sent: boolean
   const page = rows.results.slice(0, limit);
   const last = page[page.length - 1];
   const nextCursor = hasMore && last
-    ? mailboxCursor(String(sent ? last.created_at : last.updated_at), String(last.id))
+    ? await mailboxCursor(
+      env.BOARD_TOKEN,
+      cursorScope,
+      sent ? "sent" : "inbox",
+      String(sent ? last.created_at : last.updated_at),
+      String(last.id),
+    )
     : null;
   return json({
     messages: sent ? page.map(mailboxMessageView) : [],
@@ -2528,7 +2579,30 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
     acceptance_status: task.acceptance_status,
     required_gates: requiredGates(task),
     gates: gatesByTask.get(String(task.id)) ?? [],
+    blocked_upstream_task_ids: [] as string[],
   }));
+  const blockedTasks = taskViews.filter((task) => Number(task.blocked ?? 0) === 1);
+  const blockedDependencyRows = taskIds.length
+    ? await env.DB.prepare(
+      `SELECT d.task_id, d.depends_on_id
+       FROM task_dependency d
+       JOIN task_item dependency ON dependency.id = d.depends_on_id
+       WHERE d.task_id IN (${taskIds.map(() => "?").join(",")})
+         AND dependency.blocked = 1 AND dependency.deleted_at IS NULL`,
+    ).bind(...taskIds).all<{ task_id: string; depends_on_id: string }>()
+    : { results: [] as { task_id: string; depends_on_id: string }[] };
+  const blockedUpstreamsByTask = new Map<string, string[]>();
+  for (const row of blockedDependencyRows.results) {
+    const upstreams = blockedUpstreamsByTask.get(row.task_id) ?? [];
+    upstreams.push(row.depends_on_id);
+    blockedUpstreamsByTask.set(row.task_id, upstreams);
+  }
+  for (const taskView of taskViews) {
+    taskView.blocked_upstream_task_ids = blockedUpstreamsByTask.get(String(taskView.id)) ?? [];
+  }
+  const blockedDependencyTasks = taskViews.filter((taskView) => (
+    (blockedUpstreamsByTask.get(String(taskView.id)) ?? []).length > 0
+  ));
   const taskByLease = new Map<string, Record<string, unknown>>();
   for (const task of taskViews) {
     if (task.lease_owner) taskByLease.set(String(task.lease_owner), task);
@@ -2547,6 +2621,10 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
     agents,
     tasks: taskViews,
     dead_letter_count: Number(deadRows?.count ?? 0),
+    blocked_task_count: blockedTasks.length,
+    blocked_tasks: blockedTasks,
+    blocked_dependency_count: blockedDependencyTasks.length,
+    blocked_dependency_tasks: blockedDependencyTasks,
   });
 }
 

@@ -974,6 +974,7 @@ describe("coord board", () => {
     });
     const failingFetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("destination unavailable"));
     expect((await call(`/api/board/tasks/${task.body.id}/claim`, { method: "POST" }, String(agent.body.token))).response.status).toBe(200);
+    expect(await env.DB.prepare("SELECT status FROM hook_delivery WHERE hook_id = ? AND event_type = 'task_claimed'").bind(hook.body.id).first()).toBeTruthy();
     await worker.scheduled({} as ScheduledEvent, env);
     let delivery = await env.DB.prepare(
       "SELECT status, attempt_count, next_attempt_at, payload_json, last_error FROM hook_delivery WHERE hook_id = ?",
@@ -1023,6 +1024,89 @@ describe("coord board", () => {
     successFetch.mockRestore();
   });
 
+  it("prevents overlapping hook cron runs from posting twice and recovers stale deliveries", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "hook-hardening-project", name: "Hook Hardening" }),
+    });
+    expect(project.response.status).toBe(201);
+    const hook = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "hook-hardening-project",
+        event_type: "task_claimed",
+        url: "https://example.com/hardening-hook",
+      }),
+    });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "hook-hardening-agent", project_id: "hook-hardening-project", name: "Worker", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "hook-hardening-project", title: "Overlap task" }),
+    });
+    expect((await call(`/api/board/tasks/${task.body.id}/claim`, { method: "POST" }, String(agent.body.token))).response.status).toBe(200);
+    let resolveFetch!: () => void;
+    const fetchGate = new Promise<void>((resolve) => { resolveFetch = resolve; });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      await fetchGate;
+      return new Response("ok");
+    });
+    const first = worker.scheduled({} as ScheduledEvent, env);
+    await Promise.resolve();
+    const second = worker.scheduled({} as ScheduledEvent, env);
+    await Promise.resolve();
+    resolveFetch();
+    await Promise.all([first, second]);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect((await env.DB.prepare("SELECT status FROM hook_delivery WHERE hook_id = ?").bind(hook.body.id).first<{ status: string }>())?.status).toBe("delivered");
+    fetchSpy.mockRestore();
+
+    await env.DB.prepare(
+      `INSERT INTO hook_delivery
+       (id, hook_id, project_id, event_type, phase, payload_json, status, attempt_count, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'task_claimed', 'post', '{}', 'delivering', 0, ?, ?, ?)`,
+    ).bind("stale-hook-delivery", hook.body.id, "hook-hardening-project", "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z").run();
+    const recoveryFetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"));
+    await worker.scheduled({} as ScheduledEvent, env);
+    expect(recoveryFetch).toHaveBeenCalledTimes(1);
+    expect((await env.DB.prepare("SELECT status FROM hook_delivery WHERE id = ?").bind("stale-hook-delivery").first<{ status: string }>())?.status).toBe("delivered");
+    recoveryFetch.mockRestore();
+  });
+
+  it("cleans retained hook deliveries and expired share tokens during scheduled sweeps", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "cleanup-project", name: "Cleanup" }),
+    });
+    expect(project.response.status).toBe(201);
+    const hook = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "cleanup-project", event_type: "task_claimed", url: "https://example.com/cleanup" }),
+    });
+    await env.DB.prepare(
+      `INSERT INTO hook_delivery
+       (id, hook_id, project_id, event_type, phase, payload_json, status, attempt_count, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'task_claimed', 'post', '{}', ?, 1, ?, ?, ?)`,
+    ).bind("old-delivered", hook.body.id, "cleanup-project", "delivered", "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z").run();
+    await env.DB.prepare(
+      `INSERT INTO hook_delivery
+       (id, hook_id, project_id, event_type, phase, payload_json, status, attempt_count, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'task_claimed', 'post', '{}', 'pending', 0, ?, ?, ?)`,
+    ).bind("keep-pending", hook.body.id, "cleanup-project", "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z").run();
+    const issued = await call("/api/board/share-token", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "cleanup-project", ttl_seconds: 3600 }),
+    });
+    await env.DB.prepare("UPDATE share_token SET expires_at = ? WHERE token_hash = ?")
+      .bind("2000-01-01T00:00:00.000Z", await sha256ForTest(String(issued.body.token))).run();
+    await worker.scheduled({} as ScheduledEvent, env);
+    expect(await env.DB.prepare("SELECT id FROM hook_delivery WHERE id = ?").bind("old-delivered").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM hook_delivery WHERE id = ?").bind("keep-pending").first()).toBeTruthy();
+    expect(await env.DB.prepare("SELECT token_hash FROM share_token WHERE token_hash = ?").bind(await sha256ForTest(String(issued.body.token))).first()).toBeNull();
+  });
+
   it("paginates mailbox inbox and sent messages with project isolation", async () => {
     const project = await call("/api/board/projects", {
       method: "POST",
@@ -1051,6 +1135,10 @@ describe("coord board", () => {
     const sentNext = await call(`/api/mailbox/sent?project_id=mailbox-page-project&limit=2&cursor=${encodeURIComponent(sentPage.body.next_cursor)}`, {}, String(sender.body.token));
     expect(sentNext.body.messages).toHaveLength(1);
     expect(sentNext.body.next_cursor).toBeNull();
+    const tampered = `${sentPage.body.next_cursor.slice(0, -1)}${sentPage.body.next_cursor.endsWith("a") ? "b" : "a"}`;
+    expect((await call(`/api/mailbox/sent?project_id=mailbox-page-project&limit=2&cursor=${encodeURIComponent(tampered)}`, {}, String(sender.body.token))).response.status).toBe(400);
+    expect((await call(`/api/mailbox/inbox?limit=2&cursor=${encodeURIComponent(sentPage.body.next_cursor)}`, {}, String(sender.body.token))).response.status).toBe(400);
+    expect((await call(`/api/mailbox/sent?project_id=default&limit=2&cursor=${encodeURIComponent(sentPage.body.next_cursor)}`)).response.status).toBe(400);
 
     const inboxPage = await call("/api/mailbox/inbox?limit=1", {}, String(recipient.body.token));
     expect(inboxPage.response.status).toBe(200);
@@ -1149,6 +1237,19 @@ describe("coord board", () => {
       method: "POST",
       body: JSON.stringify({ board_id: "team-project-b", title: "Other task" }),
     });
+    const blockedUpstream = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "team-project-a", title: "Blocked upstream" }),
+    });
+    const blockedDownstream = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "team-project-a", title: "Blocked downstream" }),
+    });
+    await env.DB.prepare("UPDATE task_item SET blocked = 1 WHERE id = ?").bind(blockedUpstream.body.id).run();
+    expect((await call(`/api/board/tasks/${blockedDownstream.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [blockedUpstream.body.id] }),
+    }, leadToken)).response.status).toBe(200);
     const snapshot = await call("/api/board/team", {}, developerToken);
     expect(snapshot.response.status).toBe(200);
     expect(snapshot.body.project.id).toBe("team-project-a");
@@ -1156,6 +1257,10 @@ describe("coord board", () => {
     expect(snapshot.body.agents.find((agent: any) => agent.id === "team-developer").current_task.id).toBe(taskId);
     expect(snapshot.body.tasks.find((item: any) => item.id === taskId).required_gates).toEqual(["tests"]);
     expect(snapshot.body.tasks.find((item: any) => item.id === String(otherTask.body.id))).toBeUndefined();
+    expect(snapshot.body.blocked_task_count).toBe(1);
+    expect(snapshot.body.blocked_tasks.map((item: any) => item.id)).toContain(String(blockedUpstream.body.id));
+    expect(snapshot.body.blocked_dependency_count).toBe(1);
+    expect(snapshot.body.blocked_dependency_tasks[0].blocked_upstream_task_ids).toEqual([String(blockedUpstream.body.id)]);
     expect((await call("/api/board/team?project=team-project-b", {}, developerToken)).response.status).toBe(403);
     expect((await call(`/api/board/team?project=team-project-a`, {}, "test-token")).response.status).toBe(200);
 
