@@ -939,13 +939,173 @@ describe("coord board", () => {
     }, testerToken);
     expect(passed.response.status).toBe(200);
     expect((await call(`/api/board/tasks/${gatedId}/complete`, { method: "POST" }, developerToken)).response.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await worker.scheduled({} as ScheduledEvent, env);
     expect(fetchSpy).toHaveBeenCalled();
     const hookCall = fetchSpy.mock.calls[0];
     expect(hookCall).toBeTruthy();
     const headers = hookCall?.[0] instanceof Request ? hookCall[0].headers : (hookCall?.[1] as RequestInit | undefined)?.headers;
     expect(new Headers(headers).get("x-coord-board-signature")).toMatch(/^sha256=/);
     fetchSpy.mockRestore();
+  });
+
+  it("persists hook deliveries, retries failures, and dead-letters exhausted hooks", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "hook-outbox-project", name: "Hook Outbox" }),
+    });
+    expect(project.response.status).toBe(201);
+    const hook = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "hook-outbox-project",
+        event_type: "task_claimed",
+        url: "https://example.com/retry-hook",
+        secret: "outbox-secret",
+      }),
+    });
+    expect(hook.response.status).toBe(201);
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "hook-outbox-agent", project_id: "hook-outbox-project", name: "Worker", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "hook-outbox-project", title: "Hook retry task" }),
+    });
+    const failingFetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("destination unavailable"));
+    expect((await call(`/api/board/tasks/${task.body.id}/claim`, { method: "POST" }, String(agent.body.token))).response.status).toBe(200);
+    await worker.scheduled({} as ScheduledEvent, env);
+    let delivery = await env.DB.prepare(
+      "SELECT status, attempt_count, next_attempt_at, payload_json, last_error FROM hook_delivery WHERE hook_id = ?",
+    ).bind(hook.body.id).first<Record<string, unknown>>();
+    expect(delivery?.status).toBe("pending");
+    expect(Number(delivery?.attempt_count)).toBe(1);
+    expect(JSON.stringify(delivery)).not.toContain("outbox-secret");
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await env.DB.prepare("UPDATE hook_delivery SET next_attempt_at = ? WHERE hook_id = ?")
+        .bind("2000-01-01T00:00:00.000Z", hook.body.id).run();
+      await worker.scheduled({} as ScheduledEvent, env);
+    }
+    delivery = await env.DB.prepare(
+      "SELECT status, attempt_count FROM hook_delivery WHERE hook_id = ?",
+    ).bind(hook.body.id).first<Record<string, unknown>>();
+    expect(delivery?.status).toBe("dead");
+    expect(Number(delivery?.attempt_count)).toBe(5);
+    const deadView = await call("/api/board/hook-deliveries?project=hook-outbox-project&status=dead");
+    expect(deadView.response.status).toBe(200);
+    expect(JSON.stringify(deadView.body)).not.toContain("outbox-secret");
+    failingFetch.mockRestore();
+
+    const successHook = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "hook-outbox-project",
+        event_type: "task_completed",
+        url: "https://example.com/success-hook",
+        secret: "success-secret",
+      }),
+    });
+    const successFetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"));
+    const successTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "hook-outbox-project", title: "Hook success task" }),
+    });
+    expect((await call(`/api/board/tasks/${successTask.body.id}/claim`, { method: "POST" }, String(agent.body.token))).response.status).toBe(200);
+    expect((await call(`/api/board/tasks/${successTask.body.id}/complete`, { method: "POST" }, String(agent.body.token))).response.status).toBe(200);
+    await worker.scheduled({} as ScheduledEvent, env);
+    const successDelivery = await env.DB.prepare(
+      "SELECT status FROM hook_delivery WHERE hook_id = ?",
+    ).bind(successHook.body.id).first<{ status: string }>();
+    expect(successDelivery?.status).toBe("delivered");
+    const callsAfterSuccess = successFetch.mock.calls.length;
+    await worker.scheduled({} as ScheduledEvent, env);
+    expect(successFetch.mock.calls.length).toBe(callsAfterSuccess);
+    successFetch.mockRestore();
+  });
+
+  it("paginates mailbox inbox and sent messages with project isolation", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "mailbox-page-project", name: "Mailbox Pages" }),
+    });
+    expect(project.response.status).toBe(201);
+    const sender = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "mailbox-page-sender", project_id: "mailbox-page-project", name: "Sender", role: "worker" }),
+    });
+    const recipient = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "mailbox-page-recipient", project_id: "mailbox-page-project", name: "Recipient", role: "worker" }),
+    });
+    for (let index = 0; index < 3; index++) {
+      const sent = await call("/api/mailbox/messages", {
+        method: "POST",
+        body: JSON.stringify({ to: ["mailbox-page-recipient"], body: `page-${index}` }),
+      }, String(sender.body.token));
+      expect(sent.response.status).toBe(201);
+    }
+    const sentPage = await call("/api/mailbox/sent?project_id=mailbox-page-project&limit=2", {}, String(sender.body.token));
+    expect(sentPage.response.status).toBe(200);
+    expect(sentPage.body.messages).toHaveLength(2);
+    expect(typeof sentPage.body.next_cursor).toBe("string");
+    const sentNext = await call(`/api/mailbox/sent?project_id=mailbox-page-project&limit=2&cursor=${encodeURIComponent(sentPage.body.next_cursor)}`, {}, String(sender.body.token));
+    expect(sentNext.body.messages).toHaveLength(1);
+    expect(sentNext.body.next_cursor).toBeNull();
+
+    const inboxPage = await call("/api/mailbox/inbox?limit=1", {}, String(recipient.body.token));
+    expect(inboxPage.response.status).toBe(200);
+    expect(inboxPage.body.deliveries).toHaveLength(1);
+    expect(inboxPage.body.next_cursor).toBeTruthy();
+    const clamped = await call("/api/mailbox/inbox?limit=999", {}, String(recipient.body.token));
+    expect(clamped.response.status).toBe(200);
+    expect(clamped.body.deliveries.length).toBeLessThanOrEqual(200);
+    const denied = await call("/api/mailbox/sent?project_id=default", {}, String(sender.body.token));
+    expect(denied.response.status).toBe(403);
+  });
+
+  it("blocks toxic tasks after repeated attempts, notifies leaders, and supports reset", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "toxic-task-project", name: "Toxic Tasks" }),
+    });
+    expect(project.response.status).toBe(201);
+    const developer = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "toxic-developer", project_id: "toxic-task-project", name: "Developer", role: "开发" }),
+    });
+    const leader = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "toxic-leader", project_id: "toxic-task-project", name: "Leader", role: "编排" }),
+    });
+    const normal = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "toxic-task-project", title: "Normal retry" }),
+    });
+    await env.DB.prepare("UPDATE task_item SET attempt_count = 4 WHERE id = ?").bind(normal.body.id).run();
+    const normalClaim = await call(`/api/board/tasks/${normal.body.id}/claim`, { method: "POST" }, String(developer.body.token));
+    expect(normalClaim.response.status).toBe(200);
+    expect(normalClaim.body.attempt_count).toBe(5);
+
+    const toxic = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "toxic-task-project", title: "Poison task" }),
+    });
+    await env.DB.prepare("UPDATE task_item SET attempt_count = 5 WHERE id = ?").bind(toxic.body.id).run();
+    const blocked = await call(`/api/board/tasks/${toxic.body.id}/claim`, { method: "POST" }, String(developer.body.token));
+    expect(blocked.response.status).toBe(423);
+    expect(blocked.body.task.blocked).toBe(1);
+    expect((await call(`/api/board/tasks/${toxic.body.id}`, {}, String(developer.body.token))).body.lease_owner).toBeNull();
+    const inbox = await call("/api/mailbox/inbox", {}, String(leader.body.token));
+    expect(inbox.body.deliveries.some((delivery: { subject: string }) => delivery.subject === "疑似毒任务已熔断")).toBe(true);
+
+    const reset = await call(`/api/board/tasks/${toxic.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ phase: "pending", attempt_count: 0 }),
+    }, String(leader.body.token));
+    expect(reset.response.status).toBe(200);
+    expect(reset.body.blocked).toBe(0);
+    const reclaimed = await call(`/api/board/tasks/${toxic.body.id}/claim`, { method: "POST" }, String(developer.body.token));
+    expect(reclaimed.response.status).toBe(200);
   });
 
   it("aggregates an isolated team snapshot and protects leader controls", async () => {

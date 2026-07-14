@@ -39,6 +39,9 @@ const DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS = 5 * 60;
 const MIN_ACCOUNT_CLAIM_TTL_SECONDS = 30;
 const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
 const MAX_ACCOUNT_CLAIMS_PER_REQUEST = 100;
+const MAX_HOOK_DELIVERY_ATTEMPTS = 5;
+const HOOK_DELIVERY_BATCH_SIZE = 50;
+const MAX_TASK_ATTEMPTS = 5;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -108,6 +111,33 @@ function hookEvents(value: unknown): string[] {
   return typeof value === "string" ? [...new Set(value.split(",").map((eventType) => eventType.trim()).filter(Boolean))] : [];
 }
 
+async function enqueueHookDeliveries(
+  db: D1Database,
+  projectId: string,
+  eventType: string,
+  phase: "post" | "failure",
+  payload: Json,
+): Promise<void> {
+  const rows = await db.prepare(
+    "SELECT id, event_types_json FROM hook WHERE project_id = ? AND phase = ? AND active = 1",
+  ).bind(projectId, phase).all<{ id: string; event_types_json: string }>();
+  const timestamp = now();
+  const body = JSON.stringify(payload);
+  const statements = rows.results.flatMap((hook) => {
+    try {
+      if (!hookEvents(JSON.parse(hook.event_types_json)).includes(eventType)) return [];
+    } catch {
+      return [];
+    }
+    return [db.prepare(
+      `INSERT INTO hook_delivery
+       (id, hook_id, project_id, event_type, phase, payload_json, status, attempt_count, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
+    ).bind(id(), hook.id, projectId, eventType, phase, body, timestamp, timestamp, timestamp)];
+  });
+  if (statements.length > 0) await db.batch(statements);
+}
+
 function dispatchHooks(
   ctx: ExecutionContext,
   env: Env,
@@ -116,28 +146,51 @@ function dispatchHooks(
   phase: "post" | "failure",
   payload: Json,
 ): void {
-  ctx.waitUntil((async () => {
-    const rows = await env.DB.prepare(
-      "SELECT id, event_types_json, url, secret FROM hook WHERE project_id = ? AND phase = ? AND active = 1",
-    ).bind(projectId, phase).all<{ id: string; event_types_json: string; url: string; secret: string | null }>();
-    const body = JSON.stringify({ event_type: eventType, phase, project_id: projectId, payload });
-    await Promise.all(rows.results.filter((hook) => {
-      try {
-        return hookEvents(JSON.parse(hook.event_types_json)).includes(eventType);
-      } catch {
-        return false;
-      }
-    }).map(async (hook) => {
-      try {
-        const headers: HeadersInit = { "content-type": "application/json" };
-        if (hook.secret) headers["x-coord-board-signature"] = `sha256=${await hmacSha256(hook.secret, body)}`;
-        await fetch(hook.url, { method: "POST", headers, body });
-      } catch {
-        // Hook failures are intentionally isolated from the main request.
-      }
-    }));
-  })().catch(() => {
-    // Hook lookup and dispatch are best effort.
+  ctx.waitUntil(enqueueHookDeliveries(env.DB, projectId, eventType, phase, payload).catch(() => undefined));
+}
+
+async function deliverHookOutbox(db: D1Database): Promise<void> {
+  const timestamp = now();
+  const rows = await db.prepare(
+    `SELECT d.*, h.url, h.secret
+     FROM hook_delivery d
+     LEFT JOIN hook h ON h.id = d.hook_id
+     WHERE d.status = 'pending' AND d.next_attempt_at <= ?
+     ORDER BY d.next_attempt_at, d.created_at
+     LIMIT ?`,
+  ).bind(timestamp, HOOK_DELIVERY_BATCH_SIZE).all<Record<string, unknown>>();
+  await Promise.all(rows.results.map(async (delivery) => {
+    const body = JSON.stringify({
+      event_type: delivery.event_type,
+      phase: delivery.phase,
+      project_id: delivery.project_id,
+      payload: JSON.parse(String(delivery.payload_json)),
+    });
+    let error: string | null = null;
+    try {
+      if (!delivery.url) throw new Error("hook not found");
+      const headers: HeadersInit = { "content-type": "application/json" };
+      if (delivery.secret) headers["x-coord-board-signature"] = `sha256=${await hmacSha256(String(delivery.secret), body)}`;
+      const response = await fetch(String(delivery.url), { method: "POST", headers, body });
+      if (!response.ok) throw new Error(`hook returned ${response.status}`);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : "hook delivery failed";
+    }
+    if (!error) {
+      await db.prepare(
+        "UPDATE hook_delivery SET status = 'delivered', updated_at = ?, last_error = NULL WHERE id = ? AND status = 'pending'",
+      ).bind(timestamp, String(delivery.id)).run();
+      return;
+    }
+    const attempts = Number(delivery.attempt_count ?? 0) + 1;
+    const dead = attempts >= MAX_HOOK_DELIVERY_ATTEMPTS;
+    const backoffSeconds = Math.min(60 * 60, 30 * (2 ** Math.max(0, attempts - 1)));
+    const nextAttempt = new Date(Date.now() + backoffSeconds * 1000).toISOString();
+    await db.prepare(
+      `UPDATE hook_delivery
+       SET status = ?, attempt_count = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+       WHERE id = ? AND status = 'pending'`,
+    ).bind(dead ? "dead" : "pending", attempts, nextAttempt, error, timestamp, String(delivery.id)).run();
   }));
 }
 
@@ -836,6 +889,11 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const phase = body.phase === undefined ? current.phase : String(body.phase);
     const requirePlan = body.require_plan === undefined ? Number(current.require_plan ?? 0) : flag(body.require_plan);
     const requireAcceptance = body.require_acceptance === undefined ? Number(current.require_acceptance ?? 0) : flag(body.require_acceptance);
+    const requestedAttempts = body.attempt_count === undefined
+      ? Number(current.attempt_count ?? 0)
+      : Math.max(0, Math.floor(Number(body.attempt_count)));
+    const attemptCount = Number.isFinite(requestedAttempts) ? requestedAttempts : Number(current.attempt_count ?? 0);
+    const blocked = phase === "pending" && attemptCount === 0 ? 0 : Number(current.blocked ?? 0);
     const requiredGateNames = body.required_gates === undefined
       ? requiredGates(current)
       : gateNames(body.required_gates);
@@ -883,6 +941,8 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       require_acceptance: requireAcceptance,
       required_gates: JSON.stringify(requiredGateNames),
       assignee_agent_id: assignee,
+      attempt_count: attemptCount,
+      blocked,
       lease_owner: phase === "done" ? null : current.lease_owner ?? null,
       lease_expires_at: phase === "done" ? null : current.lease_expires_at ?? null,
       updated_at: timestamp,
@@ -891,12 +951,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?,
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, attempt_count = ?, blocked = ?,
              lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
              lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
              updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, phase, phase, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
       ...(phase === "done" && gateRequirementsChanged
         ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
@@ -922,6 +982,34 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
   return json({ error: "method not allowed" }, 405);
 }
 
+async function notifyProjectLeaders(
+  db: D1Database,
+  projectId: string,
+  subject: string,
+  payload: Json,
+): Promise<void> {
+  const agents = await db.prepare(
+    "SELECT id, role FROM agent WHERE project_id = ? AND status <> 'shutdown'",
+  ).bind(projectId).all<{ id: string; role: string }>();
+  const recipients = agents.results
+    .filter((agent) => roleCapabilities(agent.role).includes("manage"))
+    .map((agent) => agent.id);
+  if (recipients.length === 0) return;
+  const timestamp = now();
+  const messageId = id();
+  const message = db.prepare(
+    `INSERT INTO message
+     (id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
+     VALUES (?, ?, NULL, 'direct', ?, ?, NULL, NULL, ?)`,
+  ).bind(messageId, projectId, subject, JSON.stringify(payload), timestamp);
+  const deliveries = recipients.map((recipient) => db.prepare(
+    `INSERT INTO message_delivery
+     (id, message_id, project_id, recipient_agent_id, status, seen_at, acked_at, attempt_count, updated_at)
+     VALUES (?, ?, ?, ?, 'unread', NULL, NULL, 0, ?)`,
+  ).bind(id(), messageId, projectId, recipient, timestamp));
+  await db.batch([message, ...deliveries]);
+}
+
 async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
@@ -936,6 +1024,39 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:claim:${taskId}`, key);
   if (replay) return replay;
+  const currentAttempts = Number(access.row?.attempt_count ?? 0);
+  if (Number(access.row?.blocked ?? 0) === 1 || currentAttempts >= MAX_TASK_ATTEMPTS) {
+    const timestamp = now();
+    const blocked = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE task_item
+         SET blocked = 1, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND blocked = 0 AND attempt_count >= ?`,
+      ).bind(timestamp, taskId, projectId, MAX_TASK_ATTEMPTS),
+      conditionalEvent(
+        env.DB,
+        taskId,
+        "task_blocked",
+        owner,
+        { project_id: projectId, attempt_count: currentAttempts, reason: "attempt threshold exceeded" },
+        "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND blocked = 1 AND updated_at = ?)",
+        [taskId, projectId, timestamp],
+      ),
+    ]);
+    if ((blocked[0].meta.changes ?? 0) === 1) {
+      await notifyProjectLeaders(env.DB, projectId, "疑似毒任务已熔断", {
+        task_id: taskId,
+        attempt_count: currentAttempts,
+        reason: "task exceeded the retry attempt threshold",
+      });
+    }
+    const blockedTask = await task(env.DB, taskId);
+    const response = json({
+      error: "task blocked after exceeding retry attempt threshold",
+      task: await taskView(env.DB, blockedTask as Record<string, unknown>),
+    }, 423);
+    return saveIdempotentResponse(env.DB, `task:claim:${taskId}`, key, response);
+  }
   const requestedLeaseSeconds = leaseSeconds(body.lease_seconds);
   const expires = new Date(Date.now() + requestedLeaseSeconds * 1000).toISOString();
   const generation = Number(body.lease_generation ?? 0);
@@ -945,6 +1066,7 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
      SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ?, lease_generation = lease_generation + 1,
          attempt_count = attempt_count + 1, updated_at = ?
      WHERE id = ? AND board_id = ? AND deleted_at IS NULL
+       AND blocked = 0 AND attempt_count < ?
        AND (phase IN ('pending', 'ready') OR (phase = 'in_progress' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
        AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
        AND (assignee_agent_id IS NULL OR assignee_agent_id = ?)
@@ -954,7 +1076,7 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
          WHERE d.task_id = task_item.id AND (dependency.deleted_at IS NOT NULL OR dependency.phase <> 'done')
        )
        AND (? = 0 OR lease_generation = ?)`
-  ).bind(owner, expires, timestamp, taskId, projectId, timestamp, timestamp, owner, generation, generation);
+  ).bind(owner, expires, timestamp, taskId, projectId, MAX_TASK_ATTEMPTS, timestamp, timestamp, owner, generation, generation);
   const result = await env.DB.batch([
     update,
     conditionalEvent(
@@ -1448,6 +1570,21 @@ function mailboxMessageView(row: Record<string, unknown>): Record<string, unknow
   return { ...row, payload: mailboxPayload(row) };
 }
 
+function mailboxCursor(createdAt: string, rowId: string): string {
+  return btoa(JSON.stringify({ created_at: createdAt, id: rowId }));
+}
+
+function parseMailboxCursor(value: string | null): { created_at: string; id: string } | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(atob(value)) as Record<string, unknown>;
+    if (typeof parsed.created_at !== "string" || typeof parsed.id !== "string") return null;
+    return { created_at: parsed.created_at, id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
 async function mailboxDeliveryView(db: D1Database, deliveryId: string): Promise<Record<string, unknown> | null> {
   const row = await db.prepare(
     `SELECT d.*, m.sender_agent_id, m.kind, m.subject, m.payload_json, m.reply_to, m.created_at AS message_created_at
@@ -1595,6 +1732,11 @@ async function listMailbox(request: Request, env: Env, auth: Auth, sent: boolean
   }
   const projectId = requestedProject || (isAdmin(auth) ? null : auth.projectId);
   const status = url.searchParams.get("status");
+  const parsedLimit = Number(url.searchParams.get("limit") ?? 50);
+  const limit = Number.isFinite(parsedLimit) ? Math.min(200, Math.max(1, Math.floor(parsedLimit))) : 50;
+  const cursorValue = url.searchParams.get("cursor");
+  const cursor = parseMailboxCursor(cursorValue);
+  if (cursorValue && !cursor) return json({ error: "invalid mailbox cursor" }, 400);
   const validStatuses: MailboxStatus[] = ["unread", "seen", "acked", "nacked", "dead"];
   if (!sent && status && !validStatuses.includes(status as MailboxStatus)) {
     return json({ error: "invalid mailbox status" }, 400);
@@ -1614,6 +1756,10 @@ async function listMailbox(request: Request, env: Env, auth: Auth, sent: boolean
       conditions.push("m.project_id = ?");
       values.push(auth.projectId);
     }
+    if (cursor) {
+      conditions.push("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
+      values.push(cursor.created_at, cursor.created_at, cursor.id);
+    }
   } else {
     if (!isAdmin(auth) && !isMailboxInspector(auth)) {
       conditions.push("d.recipient_agent_id = ?");
@@ -1627,16 +1773,27 @@ async function listMailbox(request: Request, env: Env, auth: Auth, sent: boolean
       conditions.push("d.status = ?");
       values.push(status);
     }
+    if (cursor) {
+      conditions.push("(d.updated_at < ? OR (d.updated_at = ? AND d.id < ?))");
+      values.push(cursor.created_at, cursor.created_at, cursor.id);
+    }
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const query = sent
-    ? `SELECT m.* FROM message m ${where} ORDER BY m.created_at DESC`
+    ? `SELECT m.* FROM message m ${where} ORDER BY m.created_at DESC, m.id DESC LIMIT ?`
     : `SELECT d.*, m.sender_agent_id, m.kind, m.subject, m.payload_json, m.reply_to, m.created_at AS message_created_at
-       FROM message_delivery d JOIN message m ON m.id = d.message_id ${where} ORDER BY d.updated_at DESC`;
-  const rows = await env.DB.prepare(query).bind(...values).all<Record<string, unknown>>();
+       FROM message_delivery d JOIN message m ON m.id = d.message_id ${where} ORDER BY d.updated_at DESC, d.id DESC LIMIT ?`;
+  const rows = await env.DB.prepare(query).bind(...values, limit + 1).all<Record<string, unknown>>();
+  const hasMore = rows.results.length > limit;
+  const page = rows.results.slice(0, limit);
+  const last = page[page.length - 1];
+  const nextCursor = hasMore && last
+    ? mailboxCursor(String(sent ? last.created_at : last.updated_at), String(last.id))
+    : null;
   return json({
-    messages: sent ? rows.results.map(mailboxMessageView) : [],
-    deliveries: sent ? [] : rows.results.map((row) => ({ ...row, payload: mailboxPayload(row) })),
+    messages: sent ? page.map(mailboxMessageView) : [],
+    deliveries: sent ? [] : page.map((row) => ({ ...row, payload: mailboxPayload(row) })),
+    next_cursor: nextCursor,
   });
 }
 
@@ -2300,6 +2457,30 @@ async function hooks(request: Request, env: Env, auth: Auth): Promise<Response> 
   return json({ id: newHookId, project_id: projectId, event_types: events, url, phase, active: 1, created_at: timestamp }, 201);
 }
 
+async function hookDeliveries(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const url = new URL(request.url);
+  const projectId = url.searchParams.get("project") || url.searchParams.get("project_id");
+  if (!projectId) return json({ error: "project is required" }, 400);
+  const denied = capabilityDenied(auth, "manage", { board_id: projectId });
+  if (denied) return denied;
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const status = url.searchParams.get("status");
+  if (status && !["pending", "delivered", "dead"].includes(status)) {
+    return json({ error: "invalid hook delivery status" }, 400);
+  }
+  const conditions = ["project_id = ?"];
+  const values: unknown[] = [projectId];
+  if (status) {
+    conditions.push("status = ?");
+    values.push(status);
+  }
+  const rows = await env.DB.prepare(
+    `SELECT id, hook_id, project_id, event_type, phase, status, attempt_count, next_attempt_at, last_error, created_at, updated_at
+     FROM hook_delivery WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT 200`,
+  ).bind(...values).all<Record<string, unknown>>();
+  return json({ hook_deliveries: rows.results });
+}
+
 async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Response> {
   const url = new URL(request.url);
   const requestedProject = url.searchParams.get("project") || url.searchParams.get("board") || url.searchParams.get("project_id");
@@ -2339,6 +2520,7 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
     id: task.id,
     title: task.title,
     phase: task.phase,
+    blocked: task.blocked,
     assignee_agent_id: task.assignee_agent_id,
     lease_owner: task.lease_owner,
     lease_expires_at: task.lease_expires_at,
@@ -2459,9 +2641,13 @@ export default {
     if (url.pathname === "/api/board/hooks" || url.pathname.startsWith("/api/board/hooks/")) {
       return hooks(request, env, auth);
     }
+    if (url.pathname === "/api/board/hook-deliveries" && request.method === "GET") {
+      return hookDeliveries(request, env, auth);
+    }
     return json({ error: "not found" }, 404);
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await deliverHookOutbox(env.DB);
     await sweepLeases(env.DB, env);
   },
 };
