@@ -11,7 +11,8 @@ type TaskRow = Record<string, unknown>;
 type MailboxStatus = "unread" | "seen" | "acked" | "nacked" | "dead";
 type Auth =
   | { kind: "admin"; agentId: string | null }
-  | { kind: "agent"; agentId: string; projectId: string; role: string };
+  | { kind: "agent"; agentId: string; projectId: string; role: string }
+  | { kind: "share"; agentId: null; projectId: string; scope: "read" };
 
 const ALL_CAPABILITIES: readonly Capability[] = [
   "manage", "claim", "release", "complete", "review", "verify", "plan_submit", "plan_review", "accept", "gate",
@@ -152,13 +153,25 @@ async function authenticate(request: Request, env: Env): Promise<Auth | null> {
   const agent = await env.DB.prepare(
     "SELECT id, project_id, role FROM agent WHERE token_hash = ? AND token_revoked_at IS NULL",
   ).bind(tokenHash).first<{ id: string; project_id: string; role: string }>();
-  return agent
-    ? { kind: "agent", agentId: agent.id, projectId: agent.project_id, role: agent.role }
+  if (agent) return { kind: "agent", agentId: agent.id, projectId: agent.project_id, role: agent.role };
+  const share = await env.DB.prepare(
+    "SELECT project_id, scope FROM share_token WHERE token_hash = ? AND expires_at > ? AND scope = 'read'",
+  ).bind(tokenHash, now()).first<{ project_id: string; scope: "read" }>();
+  return share
+    ? { kind: "share", agentId: null, projectId: share.project_id, scope: "read" }
     : null;
 }
 
 function isAdmin(auth: Auth): auth is Extract<Auth, { kind: "admin" }> {
   return auth.kind === "admin";
+}
+
+function isShare(auth: Auth): auth is Extract<Auth, { kind: "share" }> {
+  return auth.kind === "share";
+}
+
+function canManage(auth: Auth): boolean {
+  return isAdmin(auth) || (auth.kind === "agent" && roleCapabilities(auth.role).includes("manage"));
 }
 
 function roleCapabilities(role: string): readonly Capability[] {
@@ -171,6 +184,7 @@ function roleCapabilities(role: string): readonly Capability[] {
 
 function capabilityDecision(auth: Auth, capability: Capability, task: TaskRow | null): { decision: Decision; reason: string } {
   if (isAdmin(auth)) return { decision: "allow", reason: "admin token has all capabilities" };
+  if (isShare(auth)) return { decision: "deny", reason: "share tokens are read-only" };
   if (!task || auth.projectId !== String(task.board_id)) {
     return { decision: "deny", reason: "task belongs to another project" };
   }
@@ -196,6 +210,7 @@ function actor(auth: Auth): string | null {
 function bodyAgent(body: Json, auth: Auth): string {
   const requested = typeof body.agent_id === "string" ? body.agent_id.trim() : "";
   if (isAdmin(auth)) return requested || auth.agentId || "";
+  if (isShare(auth)) return "";
   return requested || auth.agentId;
 }
 
@@ -212,6 +227,79 @@ function projectAllowed(auth: Auth, projectId: string): boolean {
 
 function isMailboxInspector(auth: Auth): boolean {
   return isAdmin(auth) || (auth.kind === "agent" && roleCapabilities(auth.role).includes("manage"));
+}
+
+function briefingCapabilities(role: string): Capability[] {
+  return [...roleCapabilities(role)];
+}
+
+function briefingMarkdown(role: string): string {
+  const capabilities = briefingCapabilities(role);
+  const lines = [
+    "## Coord Board access",
+    "",
+    "Authenticate every Board API request with `Authorization: Bearer <token>`; the calling session supplies the token separately.",
+    "Use the Board API and mailbox as the only worker↔team communication channel; send updates and read replies through those endpoints.",
+    "",
+    "### Read",
+    "- `GET /api/board/tasks?project=<project>` — list tasks for the project.",
+    "- `GET /api/board/tasks/:id` — read one task, dependencies, and gates.",
+    "- `GET /api/board/tasks/:id/events` — read the task event history.",
+    "- `GET /api/board/team?project=<project>` — read the team overview when permitted.",
+    "",
+  ];
+  if (capabilities.includes("claim")) {
+    lines.push(
+      "### Work leases",
+      "- `POST /api/board/tasks/:id/claim` with `{ \"agent_id\": \"<your-agent-id>\", \"lease_seconds\": 300 }` to claim an eligible task.",
+      "- `POST /api/board/tasks/:id/renew` with `{ \"agent_id\": \"<your-agent-id>\", \"lease_generation\": <generation>, \"lease_seconds\": 300 }` to renew your current lease without changing its generation.",
+      "- Start renewing before expiry (for example every 60–120 seconds for a 300-second lease); a renewal requires the current generation and an unexpired lease.",
+    );
+  }
+  if (capabilities.includes("release")) {
+    lines.push("- `POST /api/board/tasks/:id/release` with `{ \"agent_id\": \"<your-agent-id>\" }` to release your own lease.");
+  }
+  if (capabilities.includes("complete")) {
+    lines.push("- `POST /api/board/tasks/:id/complete` with `{ \"agent_id\": \"<your-agent-id>\", \"result\": \"<summary>\" }` to complete a task or submit acceptance when required; hold a valid lease.");
+  }
+  if (capabilities.includes("plan_submit")) {
+    lines.push("- `POST /api/board/tasks/:id/plan` with `{ \"agent_id\": \"<your-agent-id>\", \"plan\": \"<plan>\" }` to submit a plan while holding the task lease.");
+  }
+  if (capabilities.includes("review")) {
+    lines.push("- `POST /api/board/tasks/:id/review` with `{ \"decision\": \"pass\"|\"reject\", \"note\": \"<note>\" }` to record a review.");
+  }
+  if (capabilities.includes("verify")) {
+    lines.push("- `POST /api/board/tasks/:id/verify` with `{ \"decision\": \"pass\"|\"reject\", \"note\": \"<note>\" }` to record verification.");
+  }
+  if (capabilities.includes("gate")) {
+    lines.push("- `POST /api/board/tasks/:id/gate` with `{ \"gate\": \"<required-gate>\", \"decision\": \"pass\"|\"fail\", \"note\": \"<note>\" }` to record a quality gate.");
+  }
+  lines.push(
+    "",
+    "### Mailbox",
+    "- `POST /api/mailbox/messages` with `{ \"to\": [\"<agent-id>\"], \"subject\": \"<subject>\", \"body\": <payload> }` to send a direct message; use `\"to\": \"broadcast\"` for the project team.",
+    "- `GET /api/mailbox/inbox?project_id=<project>` to read received messages.",
+    "- `POST /api/mailbox/deliveries/:id/seen` to mark a delivery seen.",
+    "- `POST /api/mailbox/deliveries/:id/ack` to acknowledge a delivery.",
+    "- `POST /api/mailbox/deliveries/:id/nack` to retry or dead-letter a delivery.",
+  );
+  if (capabilities.includes("manage")) {
+    lines.push(
+      "",
+      "### Leader controls",
+      "- `POST /api/board/tasks` with `{ \"board_id\": \"<project>\", \"title\": \"<title>\", \"description\": \"<description>\" }` to create a task.",
+      "- `PATCH /api/board/tasks/:id` to update task fields, including `{ \"assignee_agent_id\": \"<agent-id>\" }` or `{ \"assignee_agent_id\": null }`.",
+      "- `POST /api/board/tasks/:id/reassign` with `{ \"assignee_agent_id\": \"<agent-id>\" }` or `null` to reassign and release the current lease.",
+      "- `PUT /api/board/tasks/:id/dependencies` with `{ \"depends_on\": [\"<task-id>\"] }` to replace dependencies.",
+      "- `POST /api/board/tasks/:id/plan-review` with `{ \"decision\": \"approve\"|\"reject\", \"note\": \"<note>\" }` to review a submitted plan.",
+      "- `POST /api/board/tasks/:id/acceptance` with `{ \"decision\": \"accept\"|\"reject\", \"note\": \"<note>\" }` to accept or reject submitted completion.",
+      "- `POST /api/board/tasks/:id/gate` with `{ \"gate\": \"<required-gate>\", \"decision\": \"pass\"|\"fail\", \"note\": \"<note>\" }` to record a quality gate.",
+      "- `GET /api/board/team?project=<project>` to inspect the team overview.",
+      "- `POST /api/board/tasks/:id/release` with `{ \"agent_id\": \"<teammate-id>\" }` to force-release a teammate's lease.",
+      "- `POST /api/board/agents/:id/shutdown` with `{ \"revoke_token\": true }` to force-shutdown a teammate and revoke its token.",
+    );
+  }
+  return lines.join("\n");
 }
 
 function idempotencyKey(request: Request, body: Json): string | null {
@@ -735,7 +823,7 @@ async function completeTask(request: Request, env: Env, auth: Auth, ctx: Executi
   const owner = bodyAgent(body, auth);
   const current = access.row as Record<string, unknown>;
   const timestamp = now();
-  const leaseOverride = isAdmin(auth) || roleCapabilities(auth.role).includes("manage");
+  const leaseOverride = canManage(auth);
   if (!leaseOverride && (
     current.lease_owner !== owner ||
     !current.lease_expires_at ||
@@ -1371,11 +1459,63 @@ async function projects(request: Request, env: Env, auth: Auth): Promise<Respons
   return saveIdempotentResponse(env.DB, "project:create", key, response);
 }
 
+async function briefing(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+  const url = new URL(request.url);
+  const role = (url.searchParams.get("role") || "").trim();
+  if (!role) return json({ error: "role is required" }, 400);
+  if (auth.kind === "agent" && auth.role !== role) {
+    return json({ error: "role does not match authenticated agent" }, 403);
+  }
+  const project = url.searchParams.get("project") || url.searchParams.get("project_id");
+  if (project && !projectAllowed(auth, project)) return json({ error: "project access denied" }, 403);
+  return json({
+    role,
+    project: project || (isAdmin(auth) || isShare(auth) ? null : auth.projectId),
+    capabilities: briefingCapabilities(role),
+    briefing_markdown: briefingMarkdown(role),
+  });
+}
+
+function boundedShareTtl(value: unknown): number {
+  const parsed = Number(value ?? 3600);
+  if (!Number.isFinite(parsed)) return 3600;
+  return Math.min(24 * 60 * 60, Math.max(60, Math.floor(parsed)));
+}
+
+async function issueShareToken(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const body = await parseBody(request);
+  const projectId = typeof body.project_id === "string" && body.project_id.trim()
+    ? body.project_id.trim()
+    : (isAdmin(auth) ? "" : auth.projectId);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 404);
+  const token = randomToken();
+  const timestamp = now();
+  const expiresAt = new Date(Date.now() + boundedShareTtl(body.ttl_seconds) * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO share_token(token_hash, project_id, expires_at, scope, created_by, created_at) VALUES (?, ?, ?, 'read', ?, ?)",
+  ).bind(await sha256(token), projectId, expiresAt, actor(auth), timestamp).run();
+  return json({
+    project_id: projectId,
+    scope: "read",
+    expires_at: expiresAt,
+    token,
+    token_warning: "Store this token now; it will never be returned again.",
+  }, 201);
+}
+
 async function agents(request: Request, env: Env, auth: Auth): Promise<Response> {
   if (request.method === "GET") {
     const rows = isAdmin(auth)
       ? await env.DB.prepare("SELECT id, project_id, name, role, status, last_seen_at, metadata_json, created_at, updated_at FROM agent ORDER BY project_id, name").all()
-      : await env.DB.prepare("SELECT id, project_id, name, role, status, last_seen_at, metadata_json, created_at, updated_at FROM agent WHERE id = ?").bind(auth.agentId).all();
+      : isShare(auth)
+        ? await env.DB.prepare("SELECT id, project_id, name, role, status, last_seen_at, metadata_json, created_at, updated_at FROM agent WHERE project_id = ? ORDER BY name, id").bind(auth.projectId).all()
+        : await env.DB.prepare("SELECT id, project_id, name, role, status, last_seen_at, metadata_json, created_at, updated_at FROM agent WHERE id = ?").bind(auth.agentId).all();
     return json({ agents: rows.results });
   }
   if (!isAdmin(auth)) return json({ error: "admin authorization required" }, 403);
@@ -1405,6 +1545,35 @@ async function agents(request: Request, env: Env, auth: Auth): Promise<Response>
     token,
     token_warning: "Store this token now; it will never be returned again.",
   }, 201);
+}
+
+async function rotateAgentToken(request: Request, env: Env, auth: Auth, agentId: string): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const row = await env.DB.prepare("SELECT id, project_id, name, role FROM agent WHERE id = ?")
+    .bind(agentId).first<{ id: string; project_id: string; name: string; role: string }>();
+  if (!row) return json({ error: "agent not found" }, 404);
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  if (!projectAllowed(auth, row.project_id)) return json({ error: "agent belongs to another project" }, 403);
+  const token = randomToken();
+  const timestamp = now();
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE agent SET token_hash = ?, token_issued_at = ?, token_revoked_at = NULL, updated_at = ? WHERE id = ? AND project_id = ?",
+    ).bind(await sha256(token), timestamp, timestamp, agentId, row.project_id),
+    env.DB.prepare(
+      "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'agent_token_rotated', ?, ?)",
+    ).bind(id(), agentId, row.project_id, JSON.stringify({ actor_agent_id: actor(auth) }), timestamp),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "agent token rotation failed" }, 409);
+  return json({
+    id: row.id,
+    project_id: row.project_id,
+    name: row.name,
+    role: row.role,
+    token,
+    token_issued_at: timestamp,
+    token_warning: "Store this token now; it will never be returned again.",
+  });
 }
 
 async function heartbeat(request: Request, env: Env, auth: Auth, agentId: string): Promise<Response> {
@@ -1446,21 +1615,25 @@ async function lifecycle(
   if (!isAdmin(auth) && auth.kind === "agent" && auth.projectId !== row.project_id) {
     return json({ error: "agent belongs to another project" }, 403);
   }
+  const body = transition === "shutdown" ? await parseBody(request) : {};
+  const revokeToken = transition === "shutdown" && body.revoke_token === true;
   const timestamp = now();
+  const tokenValues = revokeToken ? [timestamp] : [];
+  const tokenClause = revokeToken ? ", token_revoked_at = ?" : "";
   const result = await env.DB.batch([
     env.DB.prepare(
-      "UPDATE agent SET status = ?, last_seen_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
-    ).bind(transition, timestamp, timestamp, agentId, row.project_id),
+      `UPDATE agent SET status = ?, last_seen_at = ?, updated_at = ?${tokenClause} WHERE id = ? AND project_id = ?`,
+    ).bind(transition, timestamp, timestamp, ...tokenValues, agentId, row.project_id),
     env.DB.prepare(
       "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind(id(), agentId, row.project_id, `agent_${transition}`, JSON.stringify({ actor_agent_id: actor(auth) }), timestamp),
+    ).bind(id(), agentId, row.project_id, `agent_${transition}`, JSON.stringify({ actor_agent_id: actor(auth), token_revoked: revokeToken }), timestamp),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "agent lifecycle transition failed" }, 409);
   const releasedProjects = transition === "shutdown" ? await releaseAgentLeases(env.DB, agentId) : [];
   if (transition === "shutdown") {
-    dispatchHooks(ctx, env, row.project_id, "agent_shutdown", "post", { agent_id: agentId, actor_agent_id: actor(auth), released_leases: releasedProjects.length });
+    dispatchHooks(ctx, env, row.project_id, "agent_shutdown", "post", { agent_id: agentId, actor_agent_id: actor(auth), released_leases: releasedProjects.length, token_revoked: revokeToken });
   }
-  return json({ id: agentId, project_id: row.project_id, status: transition, released_leases: releasedProjects.length });
+  return json({ id: agentId, project_id: row.project_id, status: transition, released_leases: releasedProjects.length, token_revoked: revokeToken });
 }
 
 async function hooks(request: Request, env: Env, auth: Auth): Promise<Response> {
@@ -1610,6 +1783,9 @@ export default {
       if (request.method === "GET" && url.pathname === "/") return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       return json({ error: "unauthorized" }, 401);
     }
+    if (isShare(auth) && request.method !== "GET") {
+      return json({ error: "share tokens are read-only" }, 403);
+    }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);
     const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|renew|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events))?)?$/);
     if (taskMatch) {
@@ -1635,8 +1811,10 @@ export default {
       return handleTask(request, env, auth, taskId);
     }
     if (url.pathname === "/api/board/projects") return projects(request, env, auth);
+    if (url.pathname === "/api/board/briefing") return briefing(request, env, auth);
+    if (url.pathname === "/api/board/share-token") return issueShareToken(request, env, auth);
     if (url.pathname === "/api/board/team" && request.method === "GET") return teamSnapshot(request, env, auth);
-    const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/(heartbeat|join|idle|shutdown))?$/);
+    const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/(heartbeat|join|idle|shutdown|rotate-token))?$/);
     if (agentMatch) {
       return agentMatch[1] && url.pathname.endsWith("/heartbeat")
         ? heartbeat(request, env, auth, agentMatch[1])
@@ -1646,6 +1824,8 @@ export default {
             ? lifecycle(request, env, auth, ctx, agentMatch[1], "idle")
             : agentMatch[1] && url.pathname.endsWith("/shutdown")
               ? lifecycle(request, env, auth, ctx, agentMatch[1], "shutdown")
+              : agentMatch[1] && url.pathname.endsWith("/rotate-token")
+                ? rotateAgentToken(request, env, auth, agentMatch[1])
         : agents(request, env, auth);
     }
     if (url.pathname === "/api/board/hooks" || url.pathname.startsWith("/api/board/hooks/")) {
