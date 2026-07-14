@@ -1,6 +1,8 @@
 export interface Env {
   DB: D1Database;
   BOARD_TOKEN: string;
+  BACKUP_ACCOUNT_MASTER_KEY?: string;
+  BOARD_BASE_URL?: string;
 }
 
 type Phase = "pending" | "ready" | "in_progress" | "done";
@@ -29,6 +31,10 @@ const DEFAULT_LEASE_SECONDS = 300;
 const MIN_LEASE_SECONDS = 10;
 const MAX_LEASE_SECONDS = 24 * 60 * 60;
 const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 60 * 1000;
+const BACKUP_ACCOUNT_KEY_VERSION = "v1";
+const DEFAULT_FAILOVER_MAX_REPLACEMENTS = 4;
+const DEFAULT_FAILOVER_COOLDOWN_SECONDS = 15 * 60;
+const DEFAULT_FAILOVER_STALE_GRACE_SECONDS = 10 * 60;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -134,6 +140,51 @@ function dispatchHooks(
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function base64(bytes: Uint8Array): string {
+  let value = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    value += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(value);
+}
+
+function fromBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function cryptoBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.slice().buffer as ArrayBuffer;
+}
+
+async function backupCryptoKey(env: Env): Promise<CryptoKey> {
+  const encoded = env.BACKUP_ACCOUNT_MASTER_KEY?.trim();
+  if (!encoded) throw new Error("backup account encryption key is not configured");
+  const raw = fromBase64(encoded);
+  if (raw.byteLength !== 32) throw new Error("backup account encryption key must be 32 bytes");
+  return crypto.subtle.importKey("raw", cryptoBuffer(raw), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptBackupCredential(env: Env, credential: string): Promise<{ ciphertext: string; iv: string }> {
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: cryptoBuffer(iv) },
+    await backupCryptoKey(env),
+    cryptoBuffer(new TextEncoder().encode(credential)),
+  );
+  return { ciphertext: base64(new Uint8Array(encrypted)), iv: base64(iv) };
+}
+
+async function decryptBackupCredential(env: Env, ciphertext: string, iv: string): Promise<string> {
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: cryptoBuffer(fromBase64(iv)) },
+    await backupCryptoKey(env),
+    cryptoBuffer(fromBase64(ciphertext)),
+  );
+  return new TextDecoder().decode(decrypted);
 }
 
 function randomToken(): string {
@@ -354,12 +405,231 @@ async function releaseAgentLeases(
   return rows.results.map((row) => row.board_id);
 }
 
-async function sweepLeases(db: D1Database): Promise<void> {
+type StaleFailoverCandidate = {
+  task_id: string;
+  project_id: string;
+  agent_id: string;
+  role: string;
+  lease_generation: number;
+  lease_owner: string | null;
+  assignee_agent_id: string | null;
+};
+
+async function reserveBackupAccount(
+  db: D1Database,
+  projectId: string,
+  roleTag: string,
+  timestamp: string,
+): Promise<Record<string, unknown> | null> {
+  await db.prepare(
+    "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE project_id = ? AND status = 'active' AND cooldown_until IS NOT NULL AND cooldown_until <= ?",
+  ).bind(timestamp, projectId, timestamp).run();
+  const candidates = await db.prepare(
+    `SELECT * FROM backup_account
+     WHERE project_id = ? AND role_tag = ? AND enabled = 1 AND status = 'idle'
+       AND (cooldown_until IS NULL OR cooldown_until <= ?)
+     ORDER BY last_used_at IS NOT NULL, last_used_at, id`,
+  ).bind(projectId, roleTag, timestamp).all<Record<string, unknown>>();
+  for (const candidate of candidates.results) {
+    const result = await db.prepare(
+      `UPDATE backup_account SET status = 'reserved', updated_at = ?
+       WHERE id = ? AND project_id = ? AND enabled = 1 AND status = 'idle'
+         AND (cooldown_until IS NULL OR cooldown_until <= ?)`,
+    ).bind(timestamp, candidate.id, projectId, timestamp).run();
+    if ((result.meta.changes ?? 0) === 1) return { ...candidate, status: "reserved", updated_at: timestamp };
+  }
+  return null;
+}
+
+function failoverBoardUrl(env: Env): string {
+  return env.BOARD_BASE_URL?.trim() || "https://coord-board.ideading.workers.dev";
+}
+
+async function registerFailoverAgent(
+  db: D1Database,
+  candidate: StaleFailoverCandidate,
+  backup: Record<string, unknown>,
+): Promise<{ id: string; token: string }> {
+  const agentId = `failover-${candidate.task_id.slice(0, 8)}-${id().slice(0, 8)}`;
+  const token = randomToken();
+  const timestamp = now();
+  const metadata = JSON.stringify({
+    cloud_failover: true,
+    backup_account_id: String(backup.id),
+    replacement_for_agent_id: candidate.agent_id,
+    replacement_for_task_id: candidate.task_id,
+  });
+  await db.batch([
+    db.prepare(
+      `INSERT INTO agent(
+         id, project_id, name, role, status, last_seen_at, metadata_json,
+         token_hash, token_issued_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      agentId, candidate.project_id, `Replacement for ${candidate.agent_id}`, candidate.role,
+      timestamp, metadata, await sha256(token), timestamp, timestamp, timestamp,
+    ),
+    db.prepare(
+      "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'agent_failover_registered', ?, ?)",
+    ).bind(id(), agentId, candidate.project_id, JSON.stringify({
+      replacement_for_agent_id: candidate.agent_id,
+      task_id: candidate.task_id,
+      backup_account_id: String(backup.id),
+    }), timestamp),
+  ]);
+  return { id: agentId, token };
+}
+
+async function createFailoverSession(
+  env: Env,
+  candidate: StaleFailoverCandidate,
+  backup: Record<string, unknown>,
+  agent: { id: string; token: string },
+): Promise<string> {
+  const credential = await decryptBackupCredential(
+    env,
+    String(backup.credential_ciphertext),
+    String(backup.credential_iv),
+  );
+  const roleBriefing = briefingMarkdown(candidate.role);
+  const prompt = [
+    `You are the cloud replacement worker for role "${candidate.role}".`,
+    `The previous worker "${candidate.agent_id}" became unhealthy; continue task "${candidate.task_id}" from the Board.`,
+    `Board URL: ${failoverBoardUrl(env)}`,
+    `Board project: ${candidate.project_id}`,
+    `Your new Board agent id: ${agent.id}`,
+    `Your per-agent Board bearer token: ${agent.token}`,
+    roleBriefing,
+    `Claim task ${candidate.task_id} using the Board API, then continue the task. Do not rely on the desktop client.`,
+  ].join("\n\n");
+  const response = await fetch(
+    `https://api.devin.ai/v3/organizations/${encodeURIComponent(String(backup.org_id))}/sessions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credential}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ prompt }),
+    },
+  );
+  if (!response.ok) throw new Error(`Devin session creation failed (${response.status})`);
+  const data = await response.json() as { session_id?: string; devin_id?: string };
+  const sessionId = data.session_id || data.devin_id;
+  if (!sessionId) throw new Error("Devin session creation returned no session id");
+  return sessionId;
+}
+
+async function runCloudFailover(
+  db: D1Database,
+  env: Env,
+  timestamp: string,
+): Promise<void> {
+  const projects = await db.prepare(
+    `SELECT id, failover_max_replacements, failover_cooldown_seconds, failover_stale_grace_seconds
+     FROM project WHERE failover_enabled = 1`,
+  ).all<{ id: string; failover_max_replacements: number; failover_cooldown_seconds: number; failover_stale_grace_seconds: number }>();
+  for (const project of projects.results) {
+    const staleBefore = new Date(
+      Date.now() - (Number(project.failover_stale_grace_seconds) || DEFAULT_FAILOVER_STALE_GRACE_SECONDS) * 1000,
+    ).toISOString();
+    const candidates = await db.prepare(
+      `SELECT t.id AS task_id, t.board_id AS project_id, t.lease_owner,
+              t.assignee_agent_id, t.lease_generation, a.id AS agent_id, a.role
+       FROM task_item t
+       JOIN agent a ON a.id = COALESCE(t.lease_owner, t.assignee_agent_id)
+       WHERE t.board_id = ? AND t.phase = 'in_progress' AND t.deleted_at IS NULL
+         AND a.project_id = ? AND a.last_seen_at IS NOT NULL AND a.last_seen_at <= ?
+         AND a.status NOT IN ('shutdown')`,
+    ).bind(project.id, project.id, staleBefore).all<StaleFailoverCandidate>();
+    const seenAgents = new Set<string>();
+    let replacements = 0;
+    for (const candidate of candidates.results) {
+      if (replacements >= (Number(project.failover_max_replacements) || DEFAULT_FAILOVER_MAX_REPLACEMENTS)) break;
+      if (seenAgents.has(candidate.agent_id)) continue;
+      seenAgents.add(candidate.agent_id);
+      const backup = await reserveBackupAccount(db, project.id, candidate.role, timestamp);
+      if (!backup) continue;
+      let replacement: { id: string; token: string } | null = null;
+      try {
+        replacement = await registerFailoverAgent(db, candidate, backup);
+        const sessionId = await createFailoverSession(env, candidate, backup, replacement);
+        await db.prepare(
+          "UPDATE agent SET metadata_json = json_set(metadata_json, '$.session_id', ?), updated_at = ? WHERE id = ? AND project_id = ?",
+        ).bind(sessionId, timestamp, replacement.id, project.id).run();
+        const generation = Number(candidate.lease_generation) + 1;
+        const leaseUpdate = await db.prepare(
+          `UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, lease_generation = ?,
+             updated_at = ? WHERE id = ? AND board_id = ? AND phase = 'in_progress'
+             AND (lease_owner = ? OR (lease_owner IS NULL AND assignee_agent_id = ?))`,
+        ).bind(generation, timestamp, candidate.task_id, project.id, candidate.agent_id, candidate.agent_id).run();
+        if ((leaseUpdate.meta.changes ?? 0) !== 1) throw new Error("stale task lease changed before failover");
+        const cooldownUntil = new Date(
+          Date.now() + (Number(project.failover_cooldown_seconds) || DEFAULT_FAILOVER_COOLDOWN_SECONDS) * 1000,
+        ).toISOString();
+        const old = await db.prepare("SELECT metadata_json FROM agent WHERE id = ?").bind(candidate.agent_id).first<{ metadata_json: string }>();
+        let oldBackupId = "";
+        try {
+          oldBackupId = String((JSON.parse(old?.metadata_json || "{}") as Json).backup_account_id || "");
+        } catch {
+          oldBackupId = "";
+        }
+        await db.batch([
+          db.prepare(
+            "UPDATE backup_account SET status = 'active', cooldown_until = ?, last_used_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+          ).bind(cooldownUntil, timestamp, timestamp, backup.id, project.id),
+          ...(oldBackupId && oldBackupId !== String(backup.id) ? [db.prepare(
+            "UPDATE backup_account SET status = 'active', cooldown_until = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+          ).bind(cooldownUntil, timestamp, oldBackupId, project.id)] : []),
+          db.prepare(
+            "UPDATE agent SET status = 'shutdown', token_revoked_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+          ).bind(timestamp, timestamp, candidate.agent_id, project.id),
+          db.prepare(
+            "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'agent_failover', ?, ?)",
+          ).bind(id(), candidate.agent_id, project.id, JSON.stringify({
+            replacement_agent_id: replacement.id,
+            task_id: candidate.task_id,
+            backup_account_id: String(backup.id),
+          }), timestamp),
+          event(db, candidate.task_id, "agent_failover", replacement.id, {
+            project_id: project.id,
+            previous_agent_id: candidate.agent_id,
+            replacement_agent_id: replacement.id,
+            lease_generation: generation,
+            backup_account_id: String(backup.id),
+          }),
+        ]);
+        replacements += 1;
+      } catch (error) {
+        if (replacement) {
+          await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(replacement.id, project.id).run();
+        }
+        await db.batch([
+          db.prepare(
+            "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+          ).bind(timestamp, backup.id, project.id),
+          event(db, candidate.task_id, "agent_failover_failed", candidate.agent_id, {
+            project_id: project.id,
+            failed_agent_id: candidate.agent_id,
+            backup_account_id: String(backup.id),
+            reason: error instanceof Error ? error.message : "session creation failed",
+          }),
+        ]);
+      }
+    }
+  }
+}
+
+async function sweepLeases(db: D1Database, env?: Env): Promise<void> {
   const timestamp = now();
   const staleIdempotencyBefore = new Date(Date.now() - IDEMPOTENCY_IN_PROGRESS_TTL_MS).toISOString();
   await db.prepare(
     "DELETE FROM idempotency_key WHERE response_status IS NULL AND created_at <= ?",
   ).bind(staleIdempotencyBefore).run();
+  await db.prepare(
+    "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE status = 'reserved' AND updated_at <= ?",
+  ).bind(timestamp, new Date(Date.now() - 10 * 60 * 1000).toISOString()).run().catch(() => undefined);
+  if (env) await runCloudFailover(db, env, timestamp);
   await db.prepare(
     "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= ? AND phase = 'in_progress'",
   ).bind(timestamp, timestamp).run();
@@ -1576,6 +1846,192 @@ async function rotateAgentToken(request: Request, env: Env, auth: Auth, agentId:
   });
 }
 
+type BackupAccountMetadata = {
+  id: string;
+  project_id: string;
+  role_tag: string;
+  label: string;
+  org_id: string;
+  credential_type: "apikey" | "service_user";
+  enabled: number;
+  status: string;
+  cooldown_until: string | null;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function backupAccountMetadata(row: Record<string, unknown>): BackupAccountMetadata {
+  return {
+    id: String(row.id),
+    project_id: String(row.project_id),
+    role_tag: String(row.role_tag),
+    label: String(row.label ?? ""),
+    org_id: String(row.org_id),
+    credential_type: String(row.credential_type) as "apikey" | "service_user",
+    enabled: Number(row.enabled ?? 0),
+    status: String(row.status),
+    cooldown_until: row.cooldown_until ? String(row.cooldown_until) : null,
+    last_used_at: row.last_used_at ? String(row.last_used_at) : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function backupProjectId(request: Request, body: Json, auth: Auth): string {
+  const url = new URL(request.url);
+  const requested = typeof body.project_id === "string"
+    ? body.project_id.trim()
+    : (url.searchParams.get("project") || url.searchParams.get("project_id") || "").trim();
+  return requested || (isAdmin(auth) ? "" : auth.projectId);
+}
+
+async function backupAccounts(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET") {
+    const projectId = (url.searchParams.get("project") || url.searchParams.get("project_id") || "").trim();
+    if (!projectId) return json({ error: "project is required" }, 400);
+    if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+    if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+    const rows = await env.DB.prepare(
+      `SELECT id, project_id, role_tag, label, org_id, credential_type, enabled, status,
+              cooldown_until, last_used_at, created_at, updated_at
+       FROM backup_account WHERE project_id = ? ORDER BY role_tag, label, id`,
+    ).bind(projectId).all<Record<string, unknown>>();
+    return json({ backup_accounts: rows.results.map(backupAccountMetadata) });
+  }
+  if (request.method === "DELETE") {
+    const accountId = url.pathname.split("/").pop() || "";
+    if (!accountId) return json({ error: "backup account id is required" }, 400);
+    const row = await env.DB.prepare("SELECT project_id FROM backup_account WHERE id = ?")
+      .bind(accountId).first<{ project_id: string }>();
+    if (!row) return json({ error: "backup account not found" }, 404);
+    if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+    if (!projectAllowed(auth, row.project_id)) return json({ error: "project access denied" }, 403);
+    const result = await env.DB.prepare("DELETE FROM backup_account WHERE id = ? AND project_id = ?")
+      .bind(accountId, row.project_id).run();
+    return (result.meta.changes ?? 0) === 1 ? json({ ok: true }) : json({ error: "backup account not found" }, 404);
+  }
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const body = await parseBody(request);
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  const projectId = backupProjectId(request, body, auth);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 404);
+  const entries = Array.isArray(body.accounts) ? body.accounts : [body];
+  if (entries.length === 0) return json({ error: "at least one backup account is required" }, 400);
+  const timestamp = now();
+  const statements: D1PreparedStatement[] = [];
+  const ids: string[] = [];
+  try {
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") throw new Error("each backup account must be an object");
+      const item = entry as Json;
+      const accountId = String(item.id || "").trim();
+      const roleTag = String(item.role_tag || "").trim();
+      const label = String(item.label || "").trim();
+      const orgId = String(item.org_id || "").trim();
+      const credential = String(item.credential || item.credential_value || "").trim();
+      const credentialType = item.credential_type === "service_user"
+        ? "service_user"
+        : item.credential_type === "apikey" || item.credential_type === undefined
+          ? "apikey"
+          : "";
+      if (!accountId || !roleTag || !orgId || !credential) {
+        throw new Error("id, role_tag, org_id, and credential are required");
+      }
+      if (!credentialType) throw new Error("credential_type must be apikey or service_user");
+      const encrypted = await encryptBackupCredential(env, credential);
+      ids.push(accountId);
+      statements.push(env.DB.prepare(
+        `INSERT INTO backup_account(
+           id, project_id, role_tag, label, org_id, credential_type, credential_ciphertext,
+           credential_iv, key_version, enabled, status, cooldown_until, last_used_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           project_id = excluded.project_id, role_tag = excluded.role_tag, label = excluded.label,
+           org_id = excluded.org_id, credential_type = excluded.credential_type,
+           credential_ciphertext = excluded.credential_ciphertext, credential_iv = excluded.credential_iv,
+           key_version = excluded.key_version, enabled = excluded.enabled, updated_at = excluded.updated_at`,
+      ).bind(
+        accountId, projectId, roleTag, label, orgId, credentialType, encrypted.ciphertext,
+        encrypted.iv, BACKUP_ACCOUNT_KEY_VERSION, flag(item.enabled ?? true), timestamp, timestamp,
+      ));
+    }
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "invalid backup account" }, 400);
+  }
+  if (statements.length > 0) await env.DB.batch(statements);
+  const rows = await env.DB.prepare(
+    `SELECT id, project_id, role_tag, label, org_id, credential_type, enabled, status,
+            cooldown_until, last_used_at, created_at, updated_at
+     FROM backup_account WHERE project_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
+  ).bind(projectId, ...ids).all<Record<string, unknown>>();
+  return json({ backup_accounts: rows.results.map(backupAccountMetadata) });
+}
+
+function boundedFailoverNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.floor(parsed))) : fallback;
+}
+
+async function failoverConfig(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const body = request.method === "POST" ? await parseBody(request) : {};
+  const projectId = backupProjectId(request, body, auth);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare(
+    "SELECT id, failover_enabled, failover_max_replacements, failover_cooldown_seconds, failover_stale_grace_seconds FROM project WHERE id = ?",
+  ).bind(projectId).first<Record<string, unknown>>();
+  if (!project) return json({ error: "project not found" }, 404);
+  if (request.method === "GET") {
+    return json({
+      project_id: projectId,
+      failover_enabled: Number(project.failover_enabled) === 1,
+      max_replacements: Number(project.failover_max_replacements),
+      cooldown_seconds: Number(project.failover_cooldown_seconds),
+      stale_grace_seconds: Number(project.failover_stale_grace_seconds),
+    });
+  }
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const enabled = body.failover_enabled === undefined
+    ? Number(project.failover_enabled) === 1
+    : flag(body.failover_enabled);
+  const maxReplacements = boundedFailoverNumber(
+    body.max_replacements ?? body.failover_max_replacements,
+    Number(project.failover_max_replacements) || DEFAULT_FAILOVER_MAX_REPLACEMENTS,
+    1,
+    100,
+  );
+  const cooldownSeconds = boundedFailoverNumber(
+    body.cooldown_seconds ?? body.failover_cooldown_seconds,
+    Number(project.failover_cooldown_seconds) || DEFAULT_FAILOVER_COOLDOWN_SECONDS,
+    60,
+    24 * 60 * 60,
+  );
+  const staleGraceSeconds = boundedFailoverNumber(
+    body.stale_grace_seconds ?? body.failover_stale_grace_seconds,
+    Number(project.failover_stale_grace_seconds) || DEFAULT_FAILOVER_STALE_GRACE_SECONDS,
+    60,
+    24 * 60 * 60,
+  );
+  const timestamp = now();
+  await env.DB.prepare(
+    `UPDATE project SET failover_enabled = ?, failover_max_replacements = ?,
+       failover_cooldown_seconds = ?, failover_stale_grace_seconds = ?, updated_at = ? WHERE id = ?`,
+  ).bind(enabled, maxReplacements, cooldownSeconds, staleGraceSeconds, timestamp, projectId).run();
+  return json({
+    project_id: projectId,
+    failover_enabled: Boolean(enabled),
+    max_replacements: maxReplacements,
+    cooldown_seconds: cooldownSeconds,
+    stale_grace_seconds: staleGraceSeconds,
+  });
+}
+
 async function heartbeat(request: Request, env: Env, auth: Auth, agentId: string): Promise<Response> {
   if (!isAdmin(auth) && auth.agentId !== agentId) return json({ error: "agent access denied" }, 403);
   const row = await env.DB.prepare("SELECT project_id, last_seen_at FROM agent WHERE id = ?").bind(agentId).first<{ project_id: string; last_seen_at: string | null }>();
@@ -1813,6 +2269,10 @@ export default {
     if (url.pathname === "/api/board/projects") return projects(request, env, auth);
     if (url.pathname === "/api/board/briefing") return briefing(request, env, auth);
     if (url.pathname === "/api/board/share-token") return issueShareToken(request, env, auth);
+    if (url.pathname === "/api/board/backup-accounts" || url.pathname.startsWith("/api/board/backup-accounts/")) {
+      return backupAccounts(request, env, auth);
+    }
+    if (url.pathname === "/api/board/failover-config") return failoverConfig(request, env, auth);
     if (url.pathname === "/api/board/team" && request.method === "GET") return teamSnapshot(request, env, auth);
     const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/(heartbeat|join|idle|shutdown|rotate-token))?$/);
     if (agentMatch) {
@@ -1834,6 +2294,6 @@ export default {
     return json({ error: "not found" }, 404);
   },
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    await sweepLeases(env.DB);
+    await sweepLeases(env.DB, env);
   },
 };

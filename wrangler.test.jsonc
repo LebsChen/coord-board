@@ -3,5 +3,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-01-01",
   "d1_databases": [{ "binding": "DB", "database_name": "coord-board-test", "database_id": "local", "migrations_dir": "migrations" }],
-  "vars": { "BOARD_TOKEN": "test-token" }
+  "vars": {
+    "BOARD_TOKEN": "test-token",
+    "BACKUP_ACCOUNT_MASTER_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  }
 }
