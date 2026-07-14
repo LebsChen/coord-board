@@ -120,6 +120,71 @@ describe("coord board", () => {
     ).bind("reservation-project", "reservation-agent").first<{ count: number }>();
     expect(accounts?.status).toBe("active");
     expect(Number(replacements?.count)).toBe(1);
+    expect(Number((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM failover_replacement WHERE project_id = ? AND status = 'created'",
+    ).bind("reservation-project").first<{ count: number }>())?.count)).toBe(1);
+  });
+
+  it("does not create a second Devin session when concurrent failover loses the lease CAS", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "failover-cas-project", name: "Failover CAS" }),
+    });
+    expect(project.response.status).toBe(201);
+    for (const id of ["failover-cas-a", "failover-cas-b"]) {
+      await call("/api/board/backup-accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "failover-cas-project",
+          id,
+          role_tag: "worker",
+          org_id: "org-failover-cas",
+          credential: `api-secret-${id}`,
+        }),
+      });
+    }
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "failover-cas-project", failover_enabled: true }),
+    });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "cas-agent", project_id: "failover-cas-project", name: "Failover Agent", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "failover-cas-project", title: "CAS task", assignee_agent_id: "cas-agent" }),
+    });
+    await env.DB.prepare(
+      "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ?, lease_generation = 2 WHERE id = ?",
+    ).bind("cas-agent", "2099-01-01T00:00:00.000Z", task.body.id).run();
+    await env.DB.prepare("UPDATE agent SET last_seen_at = ?, status = 'online' WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "cas-agent").run();
+    let releaseSession!: () => void;
+    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
+    const methods: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      methods.push(String(init?.method ?? "GET"));
+      await sessionGate;
+      return new Response(JSON.stringify({ session_id: "devin-cas" }), { status: 200 });
+    });
+    const first = worker.scheduled({} as ScheduledEvent, env);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = worker.scheduled({} as ScheduledEvent, env);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseSession();
+    await Promise.all([first, second]);
+    expect(methods.filter((method) => method === "POST")).toHaveLength(1);
+    fetchMock.mockRestore();
+    expect(Number((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id LIKE 'failover-%'",
+    ).bind("failover-cas-project").first<{ count: number }>())?.count)).toBe(1);
+    expect(Number((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM failover_replacement WHERE project_id = ? AND status = 'created'",
+    ).bind("failover-cas-project").first<{ count: number }>())?.count)).toBe(1);
+    expect((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM backup_account WHERE project_id = ? AND status = 'idle'",
+    ).bind("failover-cas-project").first<{ count: number }>())?.count).toBe(1);
   });
 
   it("leaves disabled failover unchanged and replaces one stale agent when enabled", async () => {
@@ -217,6 +282,112 @@ describe("coord board", () => {
     expect((await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?").bind("failure-a").first<{ status: string }>())?.status).toBe("idle");
     expect((await env.DB.prepare("SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id LIKE 'failover-%'")
       .bind("failure-project").first<{ count: number }>())?.count).toBe(0);
+    expect((await env.DB.prepare("SELECT lease_owner FROM task_item WHERE id = ?")
+      .bind(task.body.id).first<{ lease_owner: string | null }>())?.lease_owner).toBe("failure-agent");
+  });
+
+  it("terminates a created session when failover finalization loses the task race", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "failover-cleanup-project", name: "Failover Cleanup" }),
+    });
+    expect(project.response.status).toBe(201);
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "failover-cleanup-project",
+        id: "failover-cleanup-a",
+        role_tag: "worker",
+        org_id: "org-failover-cleanup",
+        credential: "api-secret-failover-cleanup",
+      }),
+    });
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "failover-cleanup-project", name: "ignored", failover_enabled: true }),
+    });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "cleanup-agent", project_id: "failover-cleanup-project", name: "Failover Agent", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "failover-cleanup-project", title: "Cleanup task", assignee_agent_id: "cleanup-agent" }),
+    });
+    await env.DB.prepare(
+      "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_generation = 3 WHERE id = ?",
+    ).bind("cleanup-agent", task.body.id).run();
+    await env.DB.prepare("UPDATE agent SET last_seen_at = ?, status = 'online' WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "cleanup-agent").run();
+    const methods: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const method = init?.method || "GET";
+      methods.push(method);
+      if (method === "POST") {
+        await env.DB.prepare("UPDATE task_item SET lease_owner = 'racer', lease_generation = 99 WHERE id = ?")
+          .bind(task.body.id).run();
+        return new Response(JSON.stringify({ session_id: "devin-cleanup" }), { status: 200 });
+      }
+      return new Response(null, { status: 204 });
+    });
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    expect(methods).toEqual(["POST", "DELETE"]);
+    expect((await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?")
+      .bind("failover-cleanup-a").first<{ status: string }>())?.status).toBe("idle");
+    expect((await env.DB.prepare("SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id LIKE 'failover-%'")
+      .bind("failover-cleanup-project").first<{ count: number }>())?.count).toBe(0);
+    const failureEvent = await env.DB.prepare(
+      "SELECT payload_json FROM task_event WHERE task_id = ? AND event_type = 'agent_failover_failed' ORDER BY created_at DESC LIMIT 1",
+    ).bind(task.body.id).first<{ payload_json: string }>();
+    expect(failureEvent?.payload_json).toContain("devin-cleanup");
+  });
+
+  it("enforces failover replacements over a rolling quota across cron runs", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "failover-quota-project", name: "Failover Quota" }),
+    });
+    expect(project.response.status).toBe(201);
+    for (const suffix of ["a", "b"]) {
+      await call("/api/board/backup-accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "failover-quota-project",
+          id: `failover-quota-${suffix}`,
+          role_tag: "worker",
+          org_id: "org-failover-quota",
+          credential: `api-secret-quota-${suffix}`,
+        }),
+      });
+      await call("/api/board/agents", {
+        method: "POST",
+        body: JSON.stringify({ id: `failover-quota-agent-${suffix}`, project_id: "failover-quota-project", name: `Agent ${suffix}`, role: "worker" }),
+      });
+      const task = await call("/api/board/tasks", {
+        method: "POST",
+        body: JSON.stringify({ board_id: "failover-quota-project", title: `Quota task ${suffix}`, assignee_agent_id: `failover-quota-agent-${suffix}` }),
+      });
+      await env.DB.prepare(
+        "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_generation = 1 WHERE id = ?",
+      ).bind(`failover-quota-agent-${suffix}`, task.body.id).run();
+      await env.DB.prepare("UPDATE agent SET last_seen_at = ?, status = 'online' WHERE id = ?")
+        .bind("2000-01-01T00:00:00.000Z", `failover-quota-agent-${suffix}`).run();
+    }
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "failover-quota-project", failover_enabled: true, max_replacements: 1 }),
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ session_id: "devin-quota" }), { status: 200 }),
+    );
+    await worker.scheduled({} as ScheduledEvent, env);
+    await worker.scheduled({} as ScheduledEvent, env);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockRestore();
+    expect(Number((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM failover_replacement WHERE project_id = ? AND status = 'created'",
+    ).bind("failover-quota-project").first<{ count: number }>())?.count)).toBe(1);
   });
 
   it("atomically permits one claimant", async () => {
