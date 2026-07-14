@@ -37,6 +37,8 @@ const BACKUP_ACCOUNT_KEY_VERSION = "v1";
 const DEFAULT_FAILOVER_MAX_REPLACEMENTS = 4;
 const DEFAULT_FAILOVER_COOLDOWN_SECONDS = 15 * 60;
 const DEFAULT_FAILOVER_STALE_GRACE_SECONDS = 10 * 60;
+const FAILOVER_REPLACEMENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const FAILOVER_REPLACEMENT_RESERVATION_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS = 5 * 60;
 const MIN_ACCOUNT_CLAIM_TTL_SECONDS = 30;
 const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
@@ -490,6 +492,7 @@ type StaleFailoverCandidate = {
   role: string;
   lease_generation: number;
   lease_owner: string | null;
+  lease_expires_at: string | null;
   assignee_agent_id: string | null;
 };
 
@@ -598,6 +601,62 @@ async function createFailoverSession(
   return sessionId;
 }
 
+async function terminateFailoverSession(
+  env: Env,
+  backup: Record<string, unknown>,
+  sessionId: string,
+): Promise<boolean> {
+  try {
+    const credential = await decryptBackupCredential(
+      env,
+      String(backup.credential_ciphertext),
+      String(backup.credential_iv),
+    );
+    const response = await fetch(
+      `https://api.devin.ai/v3/organizations/${encodeURIComponent(String(backup.org_id))}/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${credential}` },
+      },
+    );
+    return response.ok || response.status === 404;
+  } catch {
+    return false;
+  }
+}
+
+async function reserveFailoverQuota(
+  db: D1Database,
+  projectId: string,
+  taskId: string,
+  backupAccountId: string,
+  maxReplacements: number,
+  timestamp: string,
+): Promise<string | null> {
+  const reservationId = id();
+  const windowStart = new Date(Date.now() - FAILOVER_REPLACEMENT_WINDOW_MS).toISOString();
+  const result = await db.prepare(
+    `INSERT INTO failover_replacement
+       (id, project_id, task_id, backup_account_id, status, created_at, updated_at)
+     SELECT ?, ?, ?, ?, 'reserved', ?, ?
+     WHERE (
+       SELECT COUNT(*) FROM failover_replacement
+       WHERE project_id = ? AND status IN ('reserved', 'created') AND created_at > ?
+     ) < ?`,
+  ).bind(
+    reservationId,
+    projectId,
+    taskId,
+    backupAccountId,
+    timestamp,
+    timestamp,
+    projectId,
+    windowStart,
+    maxReplacements,
+  ).run();
+  return (result.meta.changes ?? 0) === 1 ? reservationId : null;
+}
+
 async function runCloudFailover(
   db: D1Database,
   env: Env,
@@ -612,7 +671,7 @@ async function runCloudFailover(
       Date.now() - (Number(project.failover_stale_grace_seconds) || DEFAULT_FAILOVER_STALE_GRACE_SECONDS) * 1000,
     ).toISOString();
     const candidates = await db.prepare(
-      `SELECT t.id AS task_id, t.board_id AS project_id, t.lease_owner,
+    `SELECT t.id AS task_id, t.board_id AS project_id, t.lease_owner, t.lease_expires_at,
               t.assignee_agent_id, t.lease_generation, a.id AS agent_id, a.role
        FROM task_item t
        JOIN agent a ON a.id = COALESCE(t.lease_owner, t.assignee_agent_id)
@@ -621,27 +680,81 @@ async function runCloudFailover(
          AND a.status NOT IN ('shutdown')`,
     ).bind(project.id, project.id, staleBefore).all<StaleFailoverCandidate>();
     const seenAgents = new Set<string>();
-    let replacements = 0;
     for (const candidate of candidates.results) {
-      if (replacements >= (Number(project.failover_max_replacements) || DEFAULT_FAILOVER_MAX_REPLACEMENTS)) break;
       if (seenAgents.has(candidate.agent_id)) continue;
       seenAgents.add(candidate.agent_id);
+      const maxReplacements = Math.max(
+        1,
+        Number(project.failover_max_replacements) || DEFAULT_FAILOVER_MAX_REPLACEMENTS,
+      );
       const backup = await reserveBackupAccount(db, project.id, candidate.role, timestamp);
       if (!backup) continue;
+      const quotaReservation = await reserveFailoverQuota(
+        db,
+        project.id,
+        candidate.task_id,
+        String(backup.id),
+        maxReplacements,
+        timestamp,
+      );
+      if (!quotaReservation) {
+        await db.prepare(
+          "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+        ).bind(timestamp, backup.id, project.id).run();
+        break;
+      }
+      const generation = Number(candidate.lease_generation) + 1;
+      const reservationLeaseOwner = `failover-reservation-${quotaReservation}`;
+      const leaseOwnerCondition = candidate.lease_owner
+        ? "lease_owner = ?"
+        : "lease_owner IS NULL AND assignee_agent_id = ?";
+      const leaseUpdate = await db.prepare(
+        `UPDATE task_item SET lease_owner = ?, lease_expires_at = NULL, lease_generation = ?,
+           updated_at = ? WHERE id = ? AND board_id = ? AND phase = 'in_progress'
+           AND lease_generation = ?
+           AND ${leaseOwnerCondition}`,
+      ).bind(
+        reservationLeaseOwner,
+        generation,
+        timestamp,
+        candidate.task_id,
+        project.id,
+        candidate.lease_generation,
+        candidate.agent_id,
+      ).run();
+      if ((leaseUpdate.meta.changes ?? 0) !== 1) {
+        await db.batch([
+          db.prepare(
+            "DELETE FROM failover_replacement WHERE id = ? AND status = 'reserved'",
+          ).bind(quotaReservation),
+          db.prepare(
+            "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+          ).bind(timestamp, backup.id, project.id),
+        ]);
+        continue;
+      }
       let replacement: { id: string; token: string } | null = null;
+      let sessionId: string | null = null;
       try {
         replacement = await registerFailoverAgent(db, candidate, backup);
-        const sessionId = await createFailoverSession(env, candidate, backup, replacement);
+        await db.prepare(
+          "UPDATE failover_replacement SET replacement_agent_id = ?, updated_at = ? WHERE id = ? AND status = 'reserved'",
+        ).bind(replacement.id, timestamp, quotaReservation).run();
+        sessionId = await createFailoverSession(env, candidate, backup, replacement);
+        const leaseCheck = await db.prepare(
+          "SELECT id FROM task_item WHERE id = ? AND board_id = ? AND phase = 'in_progress' AND lease_owner = ? AND lease_generation = ?",
+        ).bind(candidate.task_id, project.id, reservationLeaseOwner, generation).first();
+        if (!leaseCheck) throw new Error("task lease changed after failover session creation");
+        await db.prepare(
+          "UPDATE failover_replacement SET session_id = ?, status = 'created', updated_at = ? WHERE id = ? AND status = 'reserved'",
+        ).bind(sessionId, timestamp, quotaReservation).run();
+        const releaseReservationLease = await db.prepare(
+          "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND lease_owner = ? AND lease_generation = ?",
+        ).bind(timestamp, candidate.task_id, project.id, reservationLeaseOwner, generation).run();
+        if ((releaseReservationLease.meta.changes ?? 0) !== 1) throw new Error("task lease changed while finalizing failover");
         await db.prepare(
           "UPDATE agent SET metadata_json = json_set(metadata_json, '$.session_id', ?), updated_at = ? WHERE id = ? AND project_id = ?",
         ).bind(sessionId, timestamp, replacement.id, project.id).run();
-        const generation = Number(candidate.lease_generation) + 1;
-        const leaseUpdate = await db.prepare(
-          `UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, lease_generation = ?,
-             updated_at = ? WHERE id = ? AND board_id = ? AND phase = 'in_progress'
-             AND (lease_owner = ? OR (lease_owner IS NULL AND assignee_agent_id = ?))`,
-        ).bind(generation, timestamp, candidate.task_id, project.id, candidate.agent_id, candidate.agent_id).run();
-        if ((leaseUpdate.meta.changes ?? 0) !== 1) throw new Error("stale task lease changed before failover");
         const cooldownUntil = new Date(
           Date.now() + (Number(project.failover_cooldown_seconds) || DEFAULT_FAILOVER_COOLDOWN_SECONDS) * 1000,
         ).toISOString();
@@ -677,19 +790,41 @@ async function runCloudFailover(
             backup_account_id: String(backup.id),
           }),
         ]);
-        replacements += 1;
       } catch (error) {
+        let sessionTerminated = false;
+        if (sessionId) {
+          sessionTerminated = await terminateFailoverSession(env, backup, sessionId);
+        }
         if (replacement) {
           await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(replacement.id, project.id).run();
         }
         await db.batch([
           db.prepare(
+            "DELETE FROM failover_replacement WHERE id = ? AND status IN ('reserved', 'created')",
+          ).bind(quotaReservation),
+          db.prepare(
             "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
           ).bind(timestamp, backup.id, project.id),
+          db.prepare(
+            `UPDATE task_item SET lease_owner = ?, lease_expires_at = ?, lease_generation = ?, updated_at = ?
+             WHERE id = ? AND board_id = ? AND phase = 'in_progress'
+               AND lease_owner = ? AND lease_generation = ?`,
+          ).bind(
+            candidate.lease_owner,
+            candidate.lease_expires_at,
+            candidate.lease_generation,
+            timestamp,
+            candidate.task_id,
+            project.id,
+            reservationLeaseOwner,
+            generation,
+          ),
           event(db, candidate.task_id, "agent_failover_failed", candidate.agent_id, {
             project_id: project.id,
             failed_agent_id: candidate.agent_id,
             backup_account_id: String(backup.id),
+            session_id: sessionId,
+            session_terminated: sessionTerminated,
             reason: error instanceof Error ? error.message : "session creation failed",
           }),
         ]);
@@ -715,6 +850,9 @@ async function sweepLeases(db: D1Database, env?: Env): Promise<void> {
   await db.prepare(
     "UPDATE account_claim SET status = 'released', expires_at = ? WHERE status = 'claimed' AND expires_at <= ?",
   ).bind(timestamp, timestamp).run().catch(() => undefined);
+  await db.prepare(
+    "DELETE FROM failover_replacement WHERE status = 'reserved' AND updated_at <= ?",
+  ).bind(new Date(Date.now() - FAILOVER_REPLACEMENT_RESERVATION_TIMEOUT_MS).toISOString()).run().catch(() => undefined);
   if (env) await runCloudFailover(db, env, timestamp);
   await db.prepare(
     "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= ? AND phase = 'in_progress'",
