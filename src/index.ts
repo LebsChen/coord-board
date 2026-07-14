@@ -5,7 +5,7 @@ export interface Env {
 
 type Phase = "pending" | "ready" | "in_progress" | "done";
 type Json = Record<string, unknown>;
-type Capability = "manage" | "claim" | "release" | "complete" | "review" | "verify" | "plan_submit" | "plan_review" | "accept";
+type Capability = "manage" | "claim" | "release" | "complete" | "review" | "verify" | "plan_submit" | "plan_review" | "accept" | "gate";
 type Decision = "allow" | "ask" | "deny";
 type TaskRow = Record<string, unknown>;
 type MailboxStatus = "unread" | "seen" | "acked" | "nacked" | "dead";
@@ -14,13 +14,13 @@ type Auth =
   | { kind: "agent"; agentId: string; projectId: string; role: string };
 
 const ALL_CAPABILITIES: readonly Capability[] = [
-  "manage", "claim", "release", "complete", "review", "verify", "plan_submit", "plan_review", "accept",
+  "manage", "claim", "release", "complete", "review", "verify", "plan_submit", "plan_review", "accept", "gate",
 ];
 const ROLE_CAPABILITY_DEFAULTS: Record<string, readonly Capability[]> = {
   lead: ALL_CAPABILITIES,
   developer: ["claim", "release", "complete", "plan_submit"],
-  reviewer: ["claim", "release", "complete", "review", "plan_submit"],
-  tester: ["claim", "release", "complete", "verify", "plan_submit"],
+  reviewer: ["claim", "release", "complete", "review", "plan_submit", "gate"],
+  tester: ["claim", "release", "complete", "verify", "plan_submit", "gate"],
   worker: ["claim", "release", "complete", "plan_submit"],
 };
 const MAILBOX_MAX_ATTEMPTS = 3;
@@ -45,6 +45,79 @@ const parseBody = async (request: Request): Promise<Json> => {
 
 function flag(value: unknown): number {
   return value === true || value === 1 || value === "1" || value === "true" ? 1 : 0;
+}
+
+function gateNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(String).map((name) => name.trim()).filter(Boolean))];
+}
+
+function requiredGates(row: TaskRow): string[] {
+  try {
+    return gateNames(JSON.parse(String(row.required_gates ?? "[]")));
+  } catch {
+    return [];
+  }
+}
+
+async function qualityGatesSatisfied(db: D1Database, row: TaskRow): Promise<boolean> {
+  const gates = requiredGates(row);
+  if (gates.length === 0) return true;
+  const placeholders = gates.map(() => "?").join(",");
+  const passed = await db.prepare(
+    `SELECT COUNT(*) AS count FROM task_gate WHERE task_id = ? AND gate_name IN (${placeholders}) AND status = 'passed'`,
+  ).bind(String(row.id), ...gates).first<{ count: number }>();
+  return Number(passed?.count ?? 0) === gates.length;
+}
+
+async function hmacSha256(secret: string, body: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hookEvents(value: unknown): string[] {
+  if (Array.isArray(value)) return [...new Set(value.map(String).map((eventType) => eventType.trim()).filter(Boolean))];
+  return typeof value === "string" ? [...new Set(value.split(",").map((eventType) => eventType.trim()).filter(Boolean))] : [];
+}
+
+function dispatchHooks(
+  ctx: ExecutionContext,
+  env: Env,
+  projectId: string,
+  eventType: string,
+  phase: "post" | "failure",
+  payload: Json,
+): void {
+  ctx.waitUntil((async () => {
+    const rows = await env.DB.prepare(
+      "SELECT id, event_types_json, url, secret FROM hook WHERE project_id = ? AND phase = ? AND active = 1",
+    ).bind(projectId, phase).all<{ id: string; event_types_json: string; url: string; secret: string | null }>();
+    const body = JSON.stringify({ event_type: eventType, phase, project_id: projectId, payload });
+    await Promise.all(rows.results.filter((hook) => {
+      try {
+        return hookEvents(JSON.parse(hook.event_types_json)).includes(eventType);
+      } catch {
+        return false;
+      }
+    }).map(async (hook) => {
+      try {
+        const headers: HeadersInit = { "content-type": "application/json" };
+        if (hook.secret) headers["x-coord-board-signature"] = `sha256=${await hmacSha256(hook.secret, body)}`;
+        await fetch(hook.url, { method: "POST", headers, body });
+      } catch {
+        // Hook failures are intentionally isolated from the main request.
+      }
+    }));
+  })().catch(() => {
+    // Hook lookup and dispatch are best effort.
+  }));
 }
 
 async function sha256(value: string): Promise<string> {
@@ -160,11 +233,36 @@ async function saveIdempotentResponse(db: D1Database, scope: string, key: string
   return response;
 }
 
+async function releaseAgentLeases(db: D1Database, agentId: string): Promise<string[]> {
+  const rows = await db.prepare(
+    "SELECT id, board_id FROM task_item WHERE lease_owner = ? AND phase = 'in_progress' AND deleted_at IS NULL",
+  ).bind(agentId).all<{ id: string; board_id: string }>();
+  if (rows.results.length === 0) return [];
+  const timestamp = now();
+  await db.batch(rows.results.flatMap((row) => [
+    db.prepare(
+      "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ? AND phase = 'in_progress'",
+    ).bind(timestamp, row.id, agentId),
+    event(db, row.id, "agent_lease_released", agentId, { reason: "agent lifecycle transition", project_id: row.board_id }),
+  ]));
+  return rows.results.map((row) => row.board_id);
+}
+
 async function sweepLeases(db: D1Database): Promise<void> {
   const timestamp = now();
   await db.prepare(
     "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= ? AND phase = 'in_progress'",
   ).bind(timestamp, timestamp).run();
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const stale = await db.prepare(
+    "SELECT id, project_id FROM agent WHERE last_seen_at IS NOT NULL AND last_seen_at <= ? AND status NOT IN ('idle', 'shutdown')",
+  ).bind(staleBefore).all<{ id: string; project_id: string }>();
+  for (const agent of stale.results) {
+    await db.prepare(
+      "UPDATE agent SET status = 'idle', updated_at = ? WHERE id = ? AND status NOT IN ('idle', 'shutdown')",
+    ).bind(timestamp, agent.id).run();
+    await releaseAgentLeases(db, agent.id);
+  }
 }
 
 function event(db: D1Database, taskId: string, type: string, actorId: string | null, payload: Json = {}): D1PreparedStatement {
@@ -199,8 +297,20 @@ async function listDependencies(db: D1Database, taskId: string): Promise<string[
   return result.results.map((row) => row.depends_on_id);
 }
 
+async function listGates(db: D1Database, taskId: string): Promise<Record<string, unknown>[]> {
+  const result = await db.prepare(
+    "SELECT gate_name, status, by_agent, note, created_at, updated_at FROM task_gate WHERE task_id = ? ORDER BY gate_name",
+  ).bind(taskId).all<Record<string, unknown>>();
+  return result.results;
+}
+
 async function taskView(db: D1Database, row: Record<string, unknown>) {
-  return { ...row, dependencies: await listDependencies(db, String(row.id)) };
+  return {
+    ...row,
+    required_gates: requiredGates(row),
+    dependencies: await listDependencies(db, String(row.id)),
+    gates: await listGates(db, String(row.id)),
+  };
 }
 
 async function authorizeTask(
@@ -256,6 +366,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const phase: Phase = body.phase === "ready" ? "ready" : "pending";
     const requirePlan = flag(body.require_plan);
     const requireAcceptance = flag(body.require_acceptance);
+    const requiredGateNames = gateNames(body.required_gates);
     const responseBody = {
       id: taskIdNew,
       board_id: boardId,
@@ -275,6 +386,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       acceptance_agent_id: null,
       acceptance_note: null,
       acceptance_at: null,
+      required_gates: JSON.stringify(requiredGateNames),
       priority: Number(body.priority ?? 5),
       assignee_agent_id: assignee,
       sort_order: Number(body.sort_order ?? 0),
@@ -286,12 +398,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     await db.batch([
       db.prepare(
         `INSERT INTO task_item(
-          id, board_id, title, description, phase, require_plan, require_acceptance, priority,
+          id, board_id, title, description, phase, require_plan, require_acceptance, required_gates, priority,
           assignee_agent_id, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         taskIdNew, responseBody.board_id, responseBody.title, responseBody.description, phase,
-        requirePlan, requireAcceptance, responseBody.priority, responseBody.assignee_agent_id,
+        requirePlan, requireAcceptance, responseBody.required_gates, responseBody.priority, responseBody.assignee_agent_id,
         responseBody.sort_order, timestamp, timestamp,
       ),
       event(db, taskIdNew, "created", actor(auth), { title: responseBody.title }),
@@ -320,6 +432,9 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const phase = body.phase === undefined ? current.phase : String(body.phase);
     const requirePlan = body.require_plan === undefined ? Number(current.require_plan ?? 0) : flag(body.require_plan);
     const requireAcceptance = body.require_acceptance === undefined ? Number(current.require_acceptance ?? 0) : flag(body.require_acceptance);
+    const requiredGateNames = body.required_gates === undefined
+      ? requiredGates(current)
+      : gateNames(body.required_gates);
     if (!["pending", "ready", "in_progress", "done"].includes(String(phase))) {
       return json({ error: "invalid phase" }, 422);
     }
@@ -327,13 +442,13 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       return json({ error: "acceptance-required tasks must be accepted before done" }, 422);
     }
     const timestamp = now();
-    const responseBody = { ...current, title, description, priority, phase, require_plan: requirePlan, require_acceptance: requireAcceptance, updated_at: timestamp };
+    const responseBody = { ...current, title, description, priority, phase, require_plan: requirePlan, require_acceptance: requireAcceptance, required_gates: JSON.stringify(requiredGateNames), updated_at: timestamp };
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, updated_at = ?
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase }),
     ]);
     return saveIdempotentResponse(db, `task:update:${taskId}`, key, json(await taskView(db, responseBody)));
@@ -352,7 +467,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
   return json({ error: "method not allowed" }, 405);
 }
 
-async function claimTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
   await sweepLeases(env.DB);
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
@@ -409,6 +524,7 @@ async function claimTask(request: Request, env: Env, auth: Auth, taskId: string)
     return json({ error: "task is unclaimable or dependencies are unmet", task: await taskView(env.DB, row) }, 422);
   }
   const claimed = await task(env.DB, taskId);
+  dispatchHooks(ctx, env, projectId, "task_claimed", "post", { task_id: taskId, actor_agent_id: owner, lease_expires_at: expires });
   const response = json(await taskView(env.DB, claimed as Record<string, unknown>), 200);
   return saveIdempotentResponse(env.DB, `task:claim:${taskId}`, key, response);
 }
@@ -437,7 +553,7 @@ async function releaseTask(request: Request, env: Env, auth: Auth, taskId: strin
   return saveIdempotentResponse(env.DB, `task:release:${taskId}`, key, json({ ok: true }));
 }
 
-async function completeTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+async function completeTask(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
   const denied = capabilityDenied(auth, "complete", access.row);
@@ -449,6 +565,9 @@ async function completeTask(request: Request, env: Env, auth: Auth, taskId: stri
   const current = access.row as Record<string, unknown>;
   if (Number(current.require_plan ?? 0) === 1 && current.plan_status !== "approved") {
     return json({ error: "plan approval required before completion" }, 409);
+  }
+  if (!(await qualityGatesSatisfied(env.DB, current))) {
+    return json({ error: "required quality gates must pass before completion" }, 409);
   }
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:complete:${taskId}`, key);
@@ -481,10 +600,11 @@ async function completeTask(request: Request, env: Env, auth: Auth, taskId: stri
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "task not found or lease not owned" }, 409);
   const completed = await task(env.DB, taskId);
+  dispatchHooks(ctx, env, projectId, requiresAcceptance ? "task_completion_submitted" : "task_completed", "post", { task_id: taskId, actor_agent_id: owner, result: body.result ?? null });
   return saveIdempotentResponse(env.DB, `task:complete:${taskId}`, key, json(await taskView(env.DB, completed as Record<string, unknown>)));
 }
 
-async function submitPlan(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+async function submitPlan(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
   const denied = capabilityDenied(auth, "plan_submit", access.row);
@@ -520,10 +640,11 @@ async function submitPlan(request: Request, env: Env, auth: Auth, taskId: string
   if ((result[0].meta.changes ?? 0) !== 1) {
     return json({ error: "plan requires an active lease owned by the submitting agent" }, 409);
   }
+  dispatchHooks(ctx, env, projectId, "plan_submitted", "post", { task_id: taskId, actor_agent_id: owner });
   return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
 }
 
-async function reviewPlan(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+async function reviewPlan(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
   const denied = capabilityDenied(auth, "plan_review", access.row);
@@ -553,10 +674,11 @@ async function reviewPlan(request: Request, env: Env, auth: Auth, taskId: string
     ),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "plan changed; retry" }, 409);
+  dispatchHooks(ctx, env, projectId, "plan_reviewed", decision === "reject" ? "failure" : "post", { task_id: taskId, actor_agent_id: actor(auth), decision, note });
   return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
 }
 
-async function acceptance(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+async function acceptance(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
   const denied = capabilityDenied(auth, "accept", access.row);
@@ -567,6 +689,9 @@ async function acceptance(request: Request, env: Env, auth: Auth, taskId: string
   const current = access.row as Record<string, unknown>;
   if (Number(current.require_acceptance ?? 0) !== 1) return json({ error: "acceptance is not required for this task" }, 422);
   if (current.acceptance_status !== "submitted") return json({ error: "task is not awaiting acceptance" }, 409);
+  if (!(await qualityGatesSatisfied(env.DB, current))) {
+    return json({ error: "required quality gates must pass before acceptance" }, 409);
+  }
   const note = body.note === undefined ? null : String(body.note);
   const timestamp = now();
   const projectId = String(current.board_id);
@@ -592,7 +717,59 @@ async function acceptance(request: Request, env: Env, auth: Auth, taskId: string
     ),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "acceptance changed; retry" }, 409);
+  dispatchHooks(ctx, env, projectId, accepted ? "task_accepted" : "task_acceptance_rejected", accepted ? "post" : "failure", { task_id: taskId, actor_agent_id: actor(auth), decision, note });
   return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
+}
+
+async function recordGate(
+  request: Request,
+  env: Env,
+  auth: Auth,
+  ctx: ExecutionContext,
+  taskId: string,
+): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "gate", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const gate = typeof body.gate === "string" ? body.gate.trim() : "";
+  const decision = body.decision === "pass" || body.decision === "fail" ? body.decision : null;
+  if (!gate || !decision) return json({ error: "gate and decision must be provided" }, 400);
+  const current = access.row as TaskRow;
+  if (!requiredGates(current).includes(gate)) return json({ error: "gate is not required by this task" }, 422);
+  if (current.phase !== "in_progress" && current.phase !== "done") {
+    return json({ error: "gate requires an in_progress or done task" }, 422);
+  }
+  const timestamp = now();
+  const note = body.note === undefined ? null : String(body.note);
+  const projectId = String(current.board_id);
+  const gateId = id();
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO task_gate(id, task_id, gate_name, status, by_agent, note, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(task_id, gate_name) DO UPDATE SET
+         status = excluded.status, by_agent = excluded.by_agent, note = excluded.note, updated_at = excluded.updated_at`,
+    ).bind(gateId, taskId, gate, decision === "pass" ? "passed" : "failed", actor(auth), note, timestamp, timestamp),
+    event(
+      env.DB,
+      taskId,
+      decision === "pass" ? "gate_passed" : "gate_failed",
+      actor(auth),
+      { gate, note, project_id: projectId },
+    ),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "gate update failed" }, 409);
+  dispatchHooks(ctx, env, projectId, decision === "pass" ? "gate_passed" : "gate_failed", decision === "fail" ? "failure" : "post", {
+    task_id: taskId,
+    gate,
+    decision,
+    note,
+    actor_agent_id: actor(auth),
+  });
+  const gateRow = await env.DB.prepare("SELECT * FROM task_gate WHERE task_id = ? AND gate_name = ?").bind(taskId, gate).first();
+  return json({ gate: gateRow, task: await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>) });
 }
 
 async function dependencies(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
@@ -898,6 +1075,7 @@ async function transitionMailboxDelivery(
   request: Request,
   env: Env,
   auth: Auth,
+  ctx: ExecutionContext,
   deliveryId: string,
   action: "seen" | "ack" | "nack",
 ): Promise<Response> {
@@ -941,10 +1119,13 @@ async function transitionMailboxDelivery(
     }
     return json({ error: action === "nack" ? "delivery cannot be nacked" : `delivery cannot be marked ${action}` }, 409);
   }
+  if (action === "nack" && Number((await mailboxDeliveryView(env.DB, deliveryId))?.attempt_count ?? 0) >= MAILBOX_MAX_ATTEMPTS) {
+    dispatchHooks(ctx, env, projectId, "delivery_dead_lettered", "failure", { delivery_id: deliveryId, message_id: row.message_id, recipient_agent_id: row.recipient_agent_id });
+  }
   return json({ delivery: await mailboxDeliveryView(env.DB, deliveryId) });
 }
 
-async function mailbox(request: Request, env: Env, auth: Auth): Promise<Response> {
+async function mailbox(request: Request, env: Env, auth: Auth, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const sendMatch = url.pathname === "/api/mailbox/messages" && request.method === "POST";
   if (sendMatch) return sendMailboxMessage(request, env, auth);
@@ -961,7 +1142,7 @@ async function mailbox(request: Request, env: Env, auth: Auth): Promise<Response
   if (messageMatch && request.method === "GET") return getMailboxMessage(env, auth, messageMatch[1]);
   const deliveryMatch = url.pathname.match(/^\/api\/mailbox\/deliveries\/([^/]+)\/(seen|ack|nack)$/);
   if (deliveryMatch && request.method === "POST") {
-    return transitionMailboxDelivery(request, env, auth, deliveryMatch[1], deliveryMatch[2] as "seen" | "ack" | "nack");
+    return transitionMailboxDelivery(request, env, auth, ctx, deliveryMatch[1], deliveryMatch[2] as "seen" | "ack" | "nack");
   }
   return json({ error: "not found" }, 404);
 }
@@ -1034,11 +1215,95 @@ async function heartbeat(request: Request, env: Env, auth: Auth, agentId: string
   if (!isAdmin(auth) && row.last_seen_at && Date.now() - Date.parse(row.last_seen_at) < 30_000) {
     return json({ error: "heartbeat interval must be at least 30 seconds" }, 429, { "retry-after": "30" });
   }
-  const result = await env.DB.prepare(
-    "UPDATE agent SET status = 'online', last_seen_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
-  ).bind(timestamp, timestamp, agentId, row.project_id).run();
-  if ((result.meta.changes ?? 0) !== 1) return json({ error: "agent not found" }, 404);
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE agent SET status = 'online', last_seen_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+    ).bind(timestamp, timestamp, agentId, row.project_id),
+    env.DB.prepare(
+      "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'agent_active', ?, ?)",
+    ).bind(id(), agentId, row.project_id, JSON.stringify({ actor_agent_id: actor(auth), source: "heartbeat" }), timestamp),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "agent not found" }, 404);
   return json({ id: agentId, project_id: row.project_id, status: "online", last_seen_at: timestamp });
+}
+
+async function lifecycle(
+  request: Request,
+  env: Env,
+  auth: Auth,
+  ctx: ExecutionContext,
+  agentId: string,
+  transition: "active" | "idle" | "shutdown",
+): Promise<Response> {
+  const row = await env.DB.prepare("SELECT id, project_id, role, status FROM agent WHERE id = ?").bind(agentId)
+    .first<{ id: string; project_id: string; role: string; status: string }>();
+  if (!row) return json({ error: "agent not found" }, 404);
+  const own = !isAdmin(auth) && auth.agentId === agentId;
+  if (!own && !isAdmin(auth)) {
+    const denied = capabilityDenied(auth, "manage", { board_id: row.project_id });
+    if (denied) return denied;
+  }
+  if (!isAdmin(auth) && auth.kind === "agent" && auth.projectId !== row.project_id) {
+    return json({ error: "agent belongs to another project" }, 403);
+  }
+  const timestamp = now();
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE agent SET status = ?, last_seen_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+    ).bind(transition, timestamp, timestamp, agentId, row.project_id),
+    env.DB.prepare(
+      "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).bind(id(), agentId, row.project_id, `agent_${transition}`, JSON.stringify({ actor_agent_id: actor(auth) }), timestamp),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "agent lifecycle transition failed" }, 409);
+  const releasedProjects = transition === "shutdown" ? await releaseAgentLeases(env.DB, agentId) : [];
+  if (transition === "shutdown") {
+    dispatchHooks(ctx, env, row.project_id, "agent_shutdown", "post", { agent_id: agentId, actor_agent_id: actor(auth), released_leases: releasedProjects.length });
+  }
+  return json({ id: agentId, project_id: row.project_id, status: transition, released_leases: releasedProjects.length });
+}
+
+async function hooks(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const body = request.method === "POST" ? await parseBody(request) : {};
+  const path = new URL(request.url).pathname;
+  const hookId = path.startsWith("/api/board/hooks/") ? path.split("/").pop() || "" : "";
+  const existingHook = hookId
+    ? await env.DB.prepare("SELECT project_id FROM hook WHERE id = ?").bind(hookId).first<{ project_id: string }>()
+    : null;
+  const requestedProject = typeof body.project_id === "string"
+    ? body.project_id
+    : new URL(request.url).searchParams.get("project_id") || existingHook?.project_id;
+  const projectId = requestedProject || (isAdmin(auth) ? null : auth.projectId);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  const denied = capabilityDenied(auth, "manage", { board_id: projectId });
+  if (denied) return denied;
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  if (request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT id, project_id, event_types_json, url, phase, active, created_at, updated_at FROM hook WHERE project_id = ? ORDER BY created_at").bind(projectId).all<Record<string, unknown>>();
+    return json({ hooks: rows.results.map((row) => ({ ...row, event_types: hookEvents(JSON.parse(String(row.event_types_json))) })) });
+  }
+  if (request.method === "DELETE") {
+    const result = await env.DB.prepare("DELETE FROM hook WHERE id = ? AND project_id = ?").bind(hookId, projectId).run();
+    if ((result.meta.changes ?? 0) !== 1) return json({ error: "hook not found" }, 404);
+    return json({ ok: true });
+  }
+  if (request.method !== "POST" || path !== "/api/board/hooks") return json({ error: "method not allowed" }, 405);
+  const events = hookEvents(body.event_types ?? body.event_type);
+  const url = typeof body.url === "string" ? body.url.trim() : "";
+  const phase = body.phase === "failure" ? "failure" : "post";
+  if (events.length === 0 || !url) return json({ error: "event_type(s) and url are required" }, 400);
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid protocol");
+  } catch {
+    return json({ error: "url must be http or https" }, 400);
+  }
+  const timestamp = now();
+  const newHookId = id();
+  await env.DB.prepare(
+    "INSERT INTO hook(id, project_id, event_types_json, url, secret, phase, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+  ).bind(newHookId, projectId, JSON.stringify(events), url, typeof body.secret === "string" ? body.secret : null, phase, timestamp, timestamp).run();
+  return json({ id: newHookId, project_id: projectId, event_types: events, url, phase, active: 1, created_at: timestamp }, 201);
 }
 
 const html = `<!doctype html><meta charset="utf-8"><title>Coord Board</title>
@@ -1054,7 +1319,7 @@ async function claim(id){const agent=document.querySelector('#agent').value;awai
 </script>`;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, service: "coord-board" });
     if (request.method === "OPTIONS") {
@@ -1070,19 +1335,20 @@ export default {
       if (request.method === "GET" && url.pathname === "/") return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       return json({ error: "unauthorized" }, 401);
     }
-    if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth);
-    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|plan|plan-review|acceptance|dependencies|events))?)?$/);
+    if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);
+    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|plan|plan-review|acceptance|gate|dependencies|events))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];
       const action = taskMatch[2];
-      if (action === "claim" && taskId) return claimTask(request, env, auth, taskId);
+      if (action === "claim" && taskId) return claimTask(request, env, auth, ctx, taskId);
       if (action === "release" && taskId) return releaseTask(request, env, auth, taskId);
-      if (action === "complete" && taskId) return completeTask(request, env, auth, taskId);
+      if (action === "complete" && taskId) return completeTask(request, env, auth, ctx, taskId);
       if (action === "review" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "review");
       if (action === "verify" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "verify");
-      if (action === "plan" && taskId && request.method === "POST") return submitPlan(request, env, auth, taskId);
-      if (action === "plan-review" && taskId && request.method === "POST") return reviewPlan(request, env, auth, taskId);
-      if (action === "acceptance" && taskId && request.method === "POST") return acceptance(request, env, auth, taskId);
+      if (action === "plan" && taskId && request.method === "POST") return submitPlan(request, env, auth, ctx, taskId);
+      if (action === "plan-review" && taskId && request.method === "POST") return reviewPlan(request, env, auth, ctx, taskId);
+      if (action === "acceptance" && taskId && request.method === "POST") return acceptance(request, env, auth, ctx, taskId);
+      if (action === "gate" && taskId && request.method === "POST") return recordGate(request, env, auth, ctx, taskId);
       if (action === "dependencies" && taskId && request.method === "PUT") return dependencies(request, env, auth, taskId);
       if (action === "events" && taskId && request.method === "GET") {
         const access = await authorizeTask(env.DB, auth, taskId);
@@ -1092,11 +1358,20 @@ export default {
       return handleTask(request, env, auth, taskId);
     }
     if (url.pathname === "/api/board/projects") return projects(request, env, auth);
-    const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/heartbeat)?$/);
+    const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/(heartbeat|join|idle|shutdown))?$/);
     if (agentMatch) {
       return agentMatch[1] && url.pathname.endsWith("/heartbeat")
         ? heartbeat(request, env, auth, agentMatch[1])
+        : agentMatch[1] && url.pathname.endsWith("/join")
+          ? lifecycle(request, env, auth, ctx, agentMatch[1], "active")
+          : agentMatch[1] && url.pathname.endsWith("/idle")
+            ? lifecycle(request, env, auth, ctx, agentMatch[1], "idle")
+            : agentMatch[1] && url.pathname.endsWith("/shutdown")
+              ? lifecycle(request, env, auth, ctx, agentMatch[1], "shutdown")
         : agents(request, env, auth);
+    }
+    if (url.pathname === "/api/board/hooks" || url.pathname.startsWith("/api/board/hooks/")) {
+      return hooks(request, env, auth);
     }
     return json({ error: "not found" }, 404);
   },

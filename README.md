@@ -137,11 +137,11 @@ Authorization uses an explicit capability set:
 | Admin `BOARD_TOKEN` | All capabilities across all projects |
 | Lead / orchestrator / `编排` | All capabilities within its project |
 | Developer / `开发` | `claim`, `release`, `complete`, `plan_submit` |
-| Reviewer / `审查` | `claim`, `release`, `complete`, `review`, `plan_submit` |
-| Tester / `测试` | `claim`, `release`, `complete`, `verify`, `plan_submit` |
+| Reviewer / `审查` | `claim`, `release`, `complete`, `review`, `plan_submit`, `gate` |
+| Tester / `测试` | `claim`, `release`, `complete`, `verify`, `plan_submit`, `gate` |
 | Other worker roles | `claim`, `release`, `complete`, `plan_submit` |
 
-The `manage` capability covers task create, update, delete, and dependency changes. `plan_submit` is available to workers; `plan_review` and `accept` are lead/admin capabilities. Every decision is modeled as `allow`, `ask`, or `deny`, following an OpenOPC-style authorization shape. Currently, role capabilities either allow or deny; no default policy emits `ask` yet. General approval hooks for `ask` decisions remain reserved for future work.
+The `manage` capability covers task create, update, delete, and dependency changes. `plan_submit` is available to workers; `plan_review`, `accept`, and arbitrary management are lead/admin capabilities. `gate` is available to lead, reviewer, and tester roles. Every decision is modeled as `allow`, `ask`, or `deny`, following an OpenOPC-style authorization shape. Currently, role capabilities either allow or deny; no default policy emits `ask` yet. General approval hooks for `ask` decisions remain reserved for future work.
 
 Review and verification are annotations only. `POST /api/board/tasks/:id/review` and `POST /api/board/tasks/:id/verify` accept `{ "decision": "pass"|"reject", "note": "..." }`, record the acting agent in the task fields and `task_event`, and require the task to be `in_progress` or `done`. They do not auto-unlock dependencies or alter completion semantics.
 
@@ -154,6 +154,20 @@ Plan approval and three-layer completion are opt-in per task. Leaders can set `r
 - `POST /api/board/tasks/:id/acceptance` — a lead/admin submits `{ "decision": "accept"|"reject", "note": "..." }`. With `require_acceptance`, worker completion records `acceptance_status=submitted` while the phase remains `in_progress`; dependents remain blocked. Acceptance promotes the task to `done`, while rejection returns it to `in_progress` for another attempt.
 
 Dependencies continue to unlock only when the dependency phase is exactly `done`. Self-reported completion never unlocks an acceptance-gated dependent.
+
+### Agent lifecycle, quality gates, and hooks
+
+Agent registration starts an agent online. Agents can explicitly transition their own lifecycle with `POST /api/board/agents/:id/join`, `/idle`, and `/shutdown`; leads/admins can transition agents in their project. Shutdown releases all leases held by that agent so work becomes claimable again. The five-minute scheduled sweep marks stale agents idle and releases their held leases. Heartbeats restore the active/online state.
+
+Tasks may opt into quality gates with `required_gates: ["tests", "review"]`; the default is an empty list. `POST /api/board/tasks/:id/gate` accepts `{ "gate": "tests", "decision": "pass"|"fail", "note": "..." }`. Lead, reviewer, and tester roles can record gates. Completion and acceptance return `409` until every required gate has passed; a failed gate remains recorded and blocks progress.
+
+Project leads/admins can register post-event or failure webhooks:
+
+- `POST /api/board/hooks` — `{ "event_type(s)": ..., "url": "...", "phase": "post"|"failure", "secret": "..." }`
+- `GET /api/board/hooks?project_id=<project-id>`
+- `DELETE /api/board/hooks/:id`
+
+Hooks run out-of-band through `waitUntil`; delivery errors never fail the originating API request. Configured secrets produce an HMAC-SHA256 `x-coord-board-signature` header. Post hooks cover task, plan, gate, acceptance, lifecycle, and dead-letter events; failure hooks cover failed gates, rejected plans/acceptance, and dead-letter notifications. Blocking pre-event semantics are provided by the plan, acceptance, and quality-gate checks rather than webhooks.
 
 ## Mailbox
 
@@ -201,6 +215,7 @@ Send operations accept `Idempotency-Key` and replay the original response withou
 - `POST /api/board/tasks/:id/plan`
 - `POST /api/board/tasks/:id/plan-review`
 - `POST /api/board/tasks/:id/acceptance`
+- `POST /api/board/tasks/:id/gate`
 - `GET /api/board/tasks/:id/events`
 
 ### Mailbox
@@ -219,6 +234,15 @@ Send operations accept `Idempotency-Key` and replay the original response withou
 - `GET /api/board/agents`
 - `POST /api/board/agents` — administrator registration; returns the per-agent token once.
 - `POST /api/board/agents/:id/heartbeat`
+- `POST /api/board/agents/:id/join`
+- `POST /api/board/agents/:id/idle`
+- `POST /api/board/agents/:id/shutdown`
+
+### Hooks
+
+- `POST /api/board/hooks`
+- `GET /api/board/hooks`
+- `DELETE /api/board/hooks/:id`
 
 Claim behavior:
 

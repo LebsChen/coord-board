@@ -1,5 +1,5 @@
 import { env, SELF } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 const request = (path: string, init: RequestInit = {}, token = "test-token") =>
   new Request(`https://coord-board.test${path}`, {
@@ -646,5 +646,90 @@ describe("coord board", () => {
     expect(accepted.body.phase).toBe("done");
     expect(accepted.body.acceptance_status).toBe("accepted");
     expect((await call(`/api/board/tasks/${acceptanceChildId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+  });
+
+  it("supports agent lifecycle, quality gates, and isolated hook delivery", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase4-project", name: "Phase 4 Project" }),
+    });
+    expect(project.response.status).toBe(201);
+    const developer = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase4-developer", project_id: "phase4-project", name: "Developer", role: "开发" }),
+    });
+    const tester = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase4-tester", project_id: "phase4-project", name: "Tester", role: "测试" }),
+    });
+    const lead = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase4-lead", project_id: "phase4-project", name: "Lead", role: "编排" }),
+    });
+    const developerToken = String(developer.body.token);
+    const testerToken = String(tester.body.token);
+    const leadToken = String(lead.body.token);
+
+    const lifecycleTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "phase4-project", title: "Lifecycle task" }),
+    });
+    const lifecycleTaskId = String(lifecycleTask.body.id);
+    expect((await call(`/api/board/tasks/${lifecycleTaskId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    expect((await call("/api/board/agents/phase4-developer/idle", { method: "POST" }, developerToken)).response.status).toBe(200);
+    const deniedLifecycle = await call("/api/board/agents/phase4-tester/shutdown", { method: "POST" }, developerToken);
+    expect(deniedLifecycle.response.status).toBe(403);
+    const shutdown = await call("/api/board/agents/phase4-developer/shutdown", { method: "POST" }, developerToken);
+    expect(shutdown.response.status).toBe(200);
+    expect(shutdown.body.released_leases).toBe(1);
+    expect((await call(`/api/board/tasks/${lifecycleTaskId}/claim`, { method: "POST" }, testerToken)).response.status).toBe(200);
+    expect((await call("/api/board/agents/phase4-tester/shutdown", { method: "POST" }, leadToken)).response.status).toBe(200);
+
+    const hookDenied = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "phase4-project", event_type: "gate_passed", url: "https://example.com/hook", secret: "local-secret" }),
+    }, developerToken);
+    expect(hookDenied.response.status).toBe(403);
+    const hook = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "phase4-project", event_type: "gate_passed", url: "https://example.com/hook", secret: "local-secret" }),
+    }, leadToken);
+    expect(hook.response.status).toBe(201);
+    expect((await call(`/api/board/hooks/${hook.body.id}`, { method: "DELETE" }, leadToken)).response.status).toBe(200);
+    const hookAgain = await call("/api/board/hooks", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "phase4-project", event_type: "gate_passed", url: "https://example.com/hook", secret: "local-secret" }),
+    }, leadToken);
+    expect(hookAgain.response.status).toBe(201);
+
+    const gated = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "phase4-project", title: "Quality gated", required_gates: ["tests"] }),
+    });
+    const gatedId = String(gated.body.id);
+    expect((await call(`/api/board/tasks/${gatedId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    const blocked = await call(`/api/board/tasks/${gatedId}/complete`, { method: "POST" }, developerToken);
+    expect(blocked.response.status).toBe(409);
+    const deniedGate = await call(`/api/board/tasks/${gatedId}/gate`, {
+      method: "POST",
+      body: JSON.stringify({ gate: "tests", decision: "pass" }),
+    }, developerToken);
+    expect(deniedGate.response.status).toBe(403);
+    const unchangedGate = await env.DB.prepare("SELECT status FROM task_gate WHERE task_id = ?").bind(gatedId).first<{ status: string }>();
+    expect(unchangedGate).toBeNull();
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"));
+    const passed = await call(`/api/board/tasks/${gatedId}/gate`, {
+      method: "POST",
+      body: JSON.stringify({ gate: "tests", decision: "pass", note: "All tests pass." }),
+    }, testerToken);
+    expect(passed.response.status).toBe(200);
+    expect((await call(`/api/board/tasks/${gatedId}/complete`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(fetchSpy).toHaveBeenCalled();
+    const hookCall = fetchSpy.mock.calls[0];
+    expect(hookCall).toBeTruthy();
+    const headers = hookCall?.[0] instanceof Request ? hookCall[0].headers : (hookCall?.[1] as RequestInit | undefined)?.headers;
+    expect(new Headers(headers).get("x-coord-board-signature")).toMatch(/^sha256=/);
+    fetchSpy.mockRestore();
   });
 });
