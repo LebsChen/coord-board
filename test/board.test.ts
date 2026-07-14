@@ -17,6 +17,7 @@ const sha256ForTest = async (value: string) => {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 };
+const nowForTest = () => new Date().toISOString();
 
 describe("coord board", () => {
   beforeAll(async () => {
@@ -246,7 +247,7 @@ describe("coord board", () => {
     expect(first.body.id).toBe(second.body.id);
   });
 
-  it("reclaims expired leases", async () => {
+  it("reclaims expired leases without a claim-time sweep", async () => {
     const created = await call("/api/board/tasks", { method: "POST", body: JSON.stringify({ title: "lease" }) });
     const first = await call(`/api/board/tasks/${created.body.id}/claim`, { method: "POST", body: JSON.stringify({ agent_id: "dead", lease_seconds: 10 }) });
     expect(first.response.status).toBe(200);
@@ -637,6 +638,15 @@ describe("coord board", () => {
     expect(direct.body.deliveries).toHaveLength(1);
     const directMessageId = String(direct.body.message.id);
     const directDeliveryId = String(direct.body.deliveries[0].id);
+    const blankKeyA = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ to: ["mailbox-carol"], body: "blank key" }),
+    }, aliceToken);
+    const blankKeyB = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ to: ["mailbox-carol"], body: "blank key" }),
+    }, aliceToken);
+    expect(blankKeyA.body.message.id).not.toBe(blankKeyB.body.message.id);
     const aliceInbox = await call("/api/mailbox/inbox", {}, aliceToken);
     const bobInbox = await call("/api/mailbox/inbox", {}, bobToken);
     const carolInbox = await call("/api/mailbox/inbox", {}, carolToken);
@@ -690,6 +700,14 @@ describe("coord board", () => {
     const idempotencyAfter = await env.DB.prepare("SELECT COUNT(*) AS count FROM message WHERE project_id = ?")
       .bind("mailbox-project").first<{ count: number }>();
     expect(Number(idempotencyAfter?.count) - Number(idempotencyBefore?.count)).toBe(1);
+    await env.DB.prepare("DELETE FROM idempotency_key WHERE scope = ? AND key = ?")
+      .bind("mailbox:send:mailbox-project", "mailbox-same-message").run();
+    const mailboxAfterCleanup = await call("/api/mailbox/messages", idempotentInit, aliceToken);
+    expect(mailboxAfterCleanup.body.message.id).toBe(idempotentFirst.body.message.id);
+    const mailboxMessageCount = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM message WHERE project_id = ? AND idempotency_key = ?",
+    ).bind("mailbox-project", "mailbox-same-message").first<{ count: number }>();
+    expect(Number(mailboxMessageCount?.count)).toBe(1);
 
     const reply = await call("/api/mailbox/messages", {
       method: "POST",
@@ -1193,6 +1211,58 @@ describe("coord board", () => {
     });
     expect(acceptancePatch.response.status).toBe(422);
     expect((await call(`/api/board/tasks/${acceptance.body.id}`)).body.phase).toBe("pending");
+    const removableGate = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "remove stale gate", required_gates: ["old-gate"] }),
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+      ).bind("lead", new Date(Date.now() + 60_000).toISOString(), removableGate.body.id),
+      env.DB.prepare(
+        "INSERT INTO task_gate(id, task_id, gate_name, status, created_at, updated_at) VALUES (?, ?, ?, 'failed', ?, ?)",
+      ).bind("stale-gate", removableGate.body.id, "old-gate", nowForTest(), nowForTest()),
+    ]);
+    const completed = await call(`/api/board/tasks/${removableGate.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ required_gates: [], phase: "done" }),
+    });
+    expect(completed.response.status).toBe(200);
+    expect(completed.body.phase).toBe("done");
+    expect(completed.body.lease_owner).toBeNull();
+    expect(completed.body.lease_expires_at).toBeNull();
+    const teamAfterDone = await call("/api/board/team?project=default");
+    expect(teamAfterDone.body.agents.find((agent: { id: string }) => agent.id === "lead").current_task).toBeNull();
+    const gateChange = await env.DB.prepare(
+      "SELECT event_type, payload_json FROM task_event WHERE task_id = ? AND event_type = 'done_gate_requirements_changed'",
+    ).bind(removableGate.body.id).first<{ event_type: string; payload_json: string }>();
+    expect(gateChange?.event_type).toBe("done_gate_requirements_changed");
+    expect(gateChange?.payload_json).toContain("old-gate");
+    const plan = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "patch plan", require_plan: true }),
+    });
+    const planPatch = await call(`/api/board/tasks/${plan.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ phase: "done", require_plan: false }),
+    });
+    expect(planPatch.response.status).toBe(409);
+    const acceptanceDone = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "accepted terminal lease", require_acceptance: true }),
+    });
+    const acceptanceExpiry = new Date(Date.now() + 60_000).toISOString();
+    await env.DB.prepare(
+      "UPDATE task_item SET phase = 'in_progress', acceptance_status = 'submitted', lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+    ).bind("lead", acceptanceExpiry, acceptanceDone.body.id).run();
+    const accepted = await call(`/api/board/tasks/${acceptanceDone.body.id}/acceptance`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "accept" }),
+    });
+    expect(accepted.response.status).toBe(200);
+    expect(accepted.body.phase).toBe("done");
+    expect(accepted.body.lease_owner).toBeNull();
+    expect(accepted.body.lease_expires_at).toBeNull();
   });
 
   it("serves the unauthenticated API health alias", async () => {
@@ -1214,6 +1284,7 @@ describe("coord board", () => {
     await env.DB.prepare(
       "INSERT OR REPLACE INTO idempotency_key(scope, key, response_status, response_body, created_at) VALUES (?, ?, NULL, NULL, ?)",
     ).bind("task:create:default", "orphaned-key", "2000-01-01T00:00:00.000Z").run();
+    await worker.scheduled({} as ScheduledEvent, env);
     const sweep = await call(`/api/board/tasks/${trigger.body.id}/claim`, {
       method: "POST",
       body: JSON.stringify({ agent_id: "b" }),
@@ -1225,6 +1296,13 @@ describe("coord board", () => {
       body: JSON.stringify({ title: "reused after cleanup" }),
     });
     expect(reused.response.status).toBe(201);
+    const retried = await call("/api/board/tasks", {
+      method: "POST",
+      headers: { "idempotency-key": "orphaned-key" },
+      body: JSON.stringify({ title: "reused after cleanup" }),
+    });
+    expect(retried.response.status).toBe(201);
+    expect(retried.body.id).toBe(reused.body.id);
   });
 
   it("rotates agent tokens and rejects revoked credentials", async () => {

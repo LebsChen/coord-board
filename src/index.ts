@@ -30,7 +30,7 @@ const MAILBOX_MAX_ATTEMPTS = 3;
 const DEFAULT_LEASE_SECONDS = 300;
 const MIN_LEASE_SECONDS = 10;
 const MAX_LEASE_SECONDS = 24 * 60 * 60;
-const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 60 * 1000;
+const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 15 * 60 * 1000;
 const BACKUP_ACCOUNT_KEY_VERSION = "v1";
 const DEFAULT_FAILOVER_MAX_REPLACEMENTS = 4;
 const DEFAULT_FAILOVER_COOLDOWN_SECONDS = 15 * 60;
@@ -381,8 +381,11 @@ async function saveIdempotentResponse(db: D1Database, scope: string, key: string
   if (!key) return response;
   const body = await response.clone().text();
   await db.prepare(
-    "UPDATE idempotency_key SET response_status = ?, response_body = ? WHERE scope = ? AND key = ?",
-  ).bind(response.status, body, scope, key).run();
+    `INSERT INTO idempotency_key(scope, key, response_status, response_body, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(scope, key) DO UPDATE SET response_status = excluded.response_status,
+       response_body = excluded.response_body`,
+  ).bind(scope, key, response.status, body, now()).run();
   return response;
 }
 
@@ -863,10 +866,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     if (phase === "done" && (requirePlan || currentRequiresPlan) && current.plan_status !== "approved") {
       return json({ error: "plan approval required before setting task done" }, 409);
     }
-    if (phase === "done" && (
-      !(await qualityGatesSatisfied(db, current)) ||
-      !(await qualityGatesSatisfied(db, nextRow))
-    )) {
+    if (phase === "done" && !(await qualityGatesSatisfied(db, nextRow))) {
       return json({ error: "required quality gates must pass before setting task done" }, 409);
     }
     const key = idempotencyKey(request, body);
@@ -883,15 +883,28 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       require_acceptance: requireAcceptance,
       required_gates: JSON.stringify(requiredGateNames),
       assignee_agent_id: assignee,
+      lease_owner: phase === "done" ? null : current.lease_owner ?? null,
+      lease_expires_at: phase === "done" ? null : current.lease_expires_at ?? null,
       updated_at: timestamp,
     };
+    const gateRequirementsChanged = JSON.stringify(requiredGates(current)) !== responseBody.required_gates;
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, updated_at = ?
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?,
+             lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
+             lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
+             updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, phase, phase, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
+      ...(phase === "done" && gateRequirementsChanged
+        ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
+          project_id: String(current.board_id),
+          previous_required_gates: requiredGates(current),
+          required_gates: requiredGateNames,
+        })]
+        : []),
     ]);
     return saveIdempotentResponse(db, `task:update:${taskId}`, key, json(await taskView(db, responseBody)));
   }
@@ -910,7 +923,6 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
 }
 
 async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
-  await sweepLeases(env.DB);
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
   const denied = capabilityDenied(auth, "claim", access.row);
@@ -1248,10 +1260,22 @@ async function acceptance(request: Request, env: Env, auth: Auth, ctx: Execution
     env.DB.prepare(
       `UPDATE task_item
        SET phase = ?, acceptance_status = ?, acceptance_agent_id = ?, acceptance_note = ?,
-           acceptance_at = ?, updated_at = ?
+           acceptance_at = ?, lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
+           lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END, updated_at = ?
        WHERE id = ? AND board_id = ? AND deleted_at IS NULL
          AND require_acceptance = 1 AND acceptance_status = 'submitted' AND phase = 'in_progress'`,
-    ).bind(accepted ? "done" : "in_progress", accepted ? "accepted" : "rejected", actor(auth), note, timestamp, timestamp, taskId, projectId),
+    ).bind(
+      accepted ? "done" : "in_progress",
+      accepted ? "accepted" : "rejected",
+      actor(auth),
+      note,
+      timestamp,
+      accepted ? "done" : "in_progress",
+      accepted ? "done" : "in_progress",
+      timestamp,
+      taskId,
+      projectId,
+    ),
     conditionalEvent(
       env.DB,
       taskId,
@@ -1515,6 +1539,7 @@ async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promi
     subject,
     payload_json: payloadJson,
     reply_to: replyTo,
+    idempotency_key: key || null,
     created_at: timestamp,
   };
   const deliveries = recipients.map((recipientAgentId) => ({
@@ -1528,10 +1553,29 @@ async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promi
     attempt_count: 0,
     updated_at: timestamp,
   }));
+  const inserted = await env.DB.prepare(
+    `INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+  ).bind(
+    message.id, message.project_id, message.sender_agent_id, message.kind, message.subject,
+    message.payload_json, message.reply_to, message.idempotency_key, message.created_at,
+  ).run();
+  if ((inserted.meta.changes ?? 0) === 0 && key) {
+    const existing = await env.DB.prepare(
+      "SELECT * FROM message WHERE project_id = ? AND idempotency_key = ?",
+    ).bind(projectId, key).first<Record<string, unknown>>();
+    if (existing) {
+      const existingDeliveries = await env.DB.prepare(
+        "SELECT * FROM message_delivery WHERE message_id = ? ORDER BY id",
+      ).bind(String(existing.id)).all<Record<string, unknown>>();
+      return json({
+        message: { ...existing, payload: mailboxPayload(existing) },
+        deliveries: existingDeliveries.results,
+      }, 201);
+    }
+  }
   await env.DB.batch([
-    env.DB.prepare(
-      "INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).bind(message.id, message.project_id, message.sender_agent_id, message.kind, message.subject, message.payload_json, message.reply_to, message.created_at),
     ...deliveries.map((delivery) => env.DB.prepare(
       "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, seen_at, acked_at, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).bind(delivery.id, delivery.message_id, delivery.project_id, delivery.recipient_agent_id, delivery.status, delivery.seen_at, delivery.acked_at, delivery.attempt_count, delivery.updated_at)),
