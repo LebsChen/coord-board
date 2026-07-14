@@ -265,4 +265,135 @@ describe("coord board", () => {
     const workerComplete = await call(`/api/board/tasks/${taskId}/complete`, { method: "POST" }, workerToken);
     expect(workerComplete.response.status).toBe(200);
   });
+
+  it("enforces the role capability matrix and records assessments", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "capability-project", name: "Capability Project" }),
+    });
+    expect(project.response.status).toBe(201);
+    const registrations = await Promise.all([
+      ["capability-developer", "开发"],
+      ["capability-reviewer", "审查"],
+      ["capability-tester", "测试"],
+      ["capability-worker", "worker"],
+      ["capability-lead", "lead"],
+    ].map(([id, role]) => call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id, project_id: "capability-project", name: id, role }),
+    })));
+    for (const registration of registrations) expect(registration.response.status).toBe(201);
+    const [developerToken, reviewerToken, testerToken, workerToken, leadToken] =
+      registrations.map((registration) => String(registration.body.token));
+
+    const managementTarget = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "capability-project", title: "Management target" }),
+    });
+    expect(managementTarget.response.status).toBe(201);
+    const targetId = String(managementTarget.body.id);
+    await call(`/api/board/tasks/${targetId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ phase: "in_progress" }),
+    });
+    const beforeDenied = await call(`/api/board/tasks/${targetId}`, {}, developerToken);
+
+    const deniedManagement = await Promise.all([
+      call("/api/board/tasks", {
+        method: "POST",
+        body: JSON.stringify({ board_id: "capability-project", title: "Denied create" }),
+      }, developerToken),
+      call(`/api/board/tasks/${targetId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: "Denied update" }),
+      }, developerToken),
+      call(`/api/board/tasks/${targetId}`, { method: "DELETE" }, developerToken),
+      call(`/api/board/tasks/${targetId}/dependencies`, {
+        method: "PUT",
+        body: JSON.stringify({ depends_on: [] }),
+      }, developerToken),
+      call(`/api/board/tasks/${targetId}/review`, {
+        method: "POST",
+        body: JSON.stringify({ decision: "pass", note: "not allowed" }),
+      }, developerToken),
+      call(`/api/board/tasks/${targetId}/verify`, {
+        method: "POST",
+        body: JSON.stringify({ decision: "pass", note: "not allowed" }),
+      }, developerToken),
+    ]);
+    expect(deniedManagement.map((result) => result.response.status)).toEqual([403, 403, 403, 403, 403, 403]);
+    const afterDenied = await call(`/api/board/tasks/${targetId}`, {}, developerToken);
+    expect(afterDenied.body.title).toBe(beforeDenied.body.title);
+    expect(afterDenied.body.deleted_at).toBe(beforeDenied.body.deleted_at);
+    expect(afterDenied.body.review_status).toBeNull();
+    expect(afterDenied.body.verify_status).toBeNull();
+
+    const leadCreated = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "capability-project", title: "Lead-managed task" }),
+    }, leadToken);
+    expect(leadCreated.response.status).toBe(201);
+    const leadTaskId = String(leadCreated.body.id);
+    const leadUpdated = await call(`/api/board/tasks/${leadTaskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ description: "managed by lead" }),
+    }, leadToken);
+    expect(leadUpdated.response.status).toBe(200);
+    const leadDependencies = await call(`/api/board/tasks/${leadTaskId}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [targetId] }),
+    }, leadToken);
+    expect(leadDependencies.response.status).toBe(200);
+    const adminCreated = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "capability-project", title: "Admin-managed task" }),
+    });
+    expect(adminCreated.response.status).toBe(201);
+
+    const reviewPass = await call(`/api/board/tasks/${targetId}/review`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "pass", note: "looks good" }),
+    }, reviewerToken);
+    expect(reviewPass.response.status).toBe(200);
+    expect(reviewPass.body.review_status).toBe("pass");
+    expect(reviewPass.body.review_agent_id).toBe("capability-reviewer");
+    const reviewReject = await call(`/api/board/tasks/${targetId}/review`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "reject", note: "needs changes" }),
+    }, reviewerToken);
+    expect(reviewReject.response.status).toBe(200);
+    expect(reviewReject.body.review_status).toBe("reject");
+    expect(reviewReject.body.review_note).toBe("needs changes");
+
+    const verifyTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "capability-project", title: "Verification target" }),
+    });
+    const verifyTaskId = String(verifyTask.body.id);
+    await call(`/api/board/tasks/${verifyTaskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ phase: "in_progress" }),
+    });
+    const verifyResult = await call(`/api/board/tasks/${verifyTaskId}/verify`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "pass", note: "tests pass" }),
+    }, testerToken);
+    expect(verifyResult.response.status).toBe(200);
+    expect(verifyResult.body.verify_status).toBe("pass");
+    expect(verifyResult.body.verify_agent_id).toBe("capability-tester");
+
+    const workerTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "capability-project", title: "Worker task" }),
+    });
+    const workerTaskId = String(workerTask.body.id);
+    const workerClaim = await call(`/api/board/tasks/${workerTaskId}/claim`, { method: "POST" }, workerToken);
+    expect(workerClaim.response.status).toBe(200);
+    const workerComplete = await call(`/api/board/tasks/${workerTaskId}/complete`, { method: "POST" }, workerToken);
+    expect(workerComplete.response.status).toBe(200);
+
+    const events = await call(`/api/board/tasks/${targetId}/events`);
+    expect(events.body.events.some((event: { event_type: string; actor_agent_id: string }) =>
+      event.event_type === "reviewed" && event.actor_agent_id === "capability-reviewer")).toBe(true);
+  });
 });

@@ -5,9 +5,21 @@ export interface Env {
 
 type Phase = "pending" | "ready" | "in_progress" | "done";
 type Json = Record<string, unknown>;
+type Capability = "manage" | "claim" | "release" | "complete" | "review" | "verify";
+type Decision = "allow" | "ask" | "deny";
+type TaskRow = Record<string, unknown>;
 type Auth =
   | { kind: "admin"; agentId: string | null }
   | { kind: "agent"; agentId: string; projectId: string; role: string };
+
+const ALL_CAPABILITIES: readonly Capability[] = ["manage", "claim", "release", "complete", "review", "verify"];
+const ROLE_CAPABILITY_DEFAULTS: Record<string, readonly Capability[]> = {
+  lead: ALL_CAPABILITIES,
+  developer: ["claim", "release", "complete"],
+  reviewer: ["claim", "release", "complete", "review"],
+  tester: ["claim", "release", "complete", "verify"],
+  worker: ["claim", "release", "complete"],
+};
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -58,12 +70,32 @@ function isAdmin(auth: Auth): auth is Extract<Auth, { kind: "admin" }> {
   return auth.kind === "admin";
 }
 
-function isLead(auth: Auth): boolean {
-  return auth.kind === "agent" && /lead|orchestrator|编排/i.test(auth.role);
+function roleCapabilities(role: string): readonly Capability[] {
+  if (/lead|orchestrator|编排/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.lead;
+  if (/审查|review/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.reviewer;
+  if (/测试|test/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.tester;
+  if (/开发|developer|dev/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.developer;
+  return ROLE_CAPABILITY_DEFAULTS.worker;
 }
 
-function managementDenied(auth: Auth): Response | null {
-  return isAdmin(auth) || isLead(auth) ? null : json({ error: "leader authorization required" }, 403);
+function capabilityDecision(auth: Auth, capability: Capability, task: TaskRow | null): { decision: Decision; reason: string } {
+  if (isAdmin(auth)) return { decision: "allow", reason: "admin token has all capabilities" };
+  if (!task || auth.projectId !== String(task.board_id)) {
+    return { decision: "deny", reason: "task belongs to another project" };
+  }
+  if (roleCapabilities(auth.role).includes(capability)) {
+    return { decision: "allow", reason: `role ${auth.role} allows ${capability}` };
+  }
+  return { decision: "deny", reason: `role ${auth.role} does not allow ${capability}` };
+}
+
+function capabilityDenied(auth: Auth, capability: Capability, task: TaskRow | null): Response | null {
+  const result = capabilityDecision(auth, capability, task);
+  if (result.decision === "allow") return null;
+  if (result.decision === "ask") {
+    return json({ error: "capability approval required", capability, authorization: result.decision }, 403);
+  }
+  return json({ error: "capability denied", capability, reason: result.reason, authorization: result.decision }, 403);
 }
 
 function actor(auth: Auth): string | null {
@@ -189,10 +221,10 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     return json({ tasks: await Promise.all(rows.map((row) => taskView(db, row))) });
   }
   if (!taskId && method === "POST") {
-    const denied = managementDenied(auth);
-    if (denied) return denied;
     const body = await parseBody(request);
     const boardId = String(body.board_id || "default");
+    const denied = capabilityDenied(auth, "manage", { board_id: boardId });
+    if (denied) return denied;
     if (!projectAllowed(auth, boardId)) return json({ error: "project access denied" }, 403);
     const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(boardId).first();
     if (!project) return json({ error: "project not found" }, 422);
@@ -238,7 +270,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
   const current = access.row as Record<string, unknown>;
   if (method === "GET") return json(await taskView(db, current));
   if (method === "PATCH" || method === "DELETE") {
-    const denied = managementDenied(auth);
+    const denied = capabilityDenied(auth, "manage", current);
     if (denied) return denied;
   }
   const body = await parseBody(request);
@@ -283,6 +315,8 @@ async function claimTask(request: Request, env: Env, auth: Auth, taskId: string)
   await sweepLeases(env.DB);
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "claim", access.row);
+  if (denied) return denied;
   const body = await parseBody(request);
   const identityError = checkAgentIdentity(body, auth);
   if (identityError) return identityError;
@@ -341,6 +375,8 @@ async function claimTask(request: Request, env: Env, auth: Auth, taskId: string)
 async function releaseTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "release", access.row);
+  if (denied) return denied;
   const body = await parseBody(request);
   const identityError = checkAgentIdentity(body, auth);
   if (identityError) return identityError;
@@ -363,6 +399,8 @@ async function releaseTask(request: Request, env: Env, auth: Auth, taskId: strin
 async function completeTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "complete", access.row);
+  if (denied) return denied;
   const body = await parseBody(request);
   const identityError = checkAgentIdentity(body, auth);
   if (identityError) return identityError;
@@ -384,10 +422,10 @@ async function completeTask(request: Request, env: Env, auth: Auth, taskId: stri
 }
 
 async function dependencies(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
-  const denied = managementDenied(auth);
-  if (denied) return denied;
   const access = await authorizeTask(env.DB, auth, taskId);
   if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "manage", access.row);
+  if (denied) return denied;
   const body = await parseBody(request);
   const ids = Array.isArray(body.depends_on) ? body.depends_on.map(String) : [];
   if (ids.includes(taskId)) return json({ error: "dependency cycle" }, 422);
@@ -408,6 +446,52 @@ async function dependencies(request: Request, env: Env, auth: Auth, taskId: stri
   ];
   await env.DB.batch(statements);
   return json({ task_id: taskId, depends_on: ids, updated_at: timestamp });
+}
+
+async function assessTask(
+  request: Request,
+  env: Env,
+  auth: Auth,
+  taskId: string,
+  capability: "review" | "verify",
+): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, capability, access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const decision = body.decision === "pass" || body.decision === "reject" ? body.decision : null;
+  if (!decision) return json({ error: "decision must be pass or reject" }, 400);
+  const current = access.row as TaskRow;
+  if (current.phase !== "in_progress" && current.phase !== "done") {
+    return json({ error: `${capability} requires an in_progress or done task` }, 422);
+  }
+  const note = body.note === undefined ? null : String(body.note);
+  const timestamp = now();
+  const statusColumn = capability === "review" ? "review_status" : "verify_status";
+  const agentColumn = capability === "review" ? "review_agent_id" : "verify_agent_id";
+  const noteColumn = capability === "review" ? "review_note" : "verify_note";
+  const timeColumn = capability === "review" ? "reviewed_at" : "verified_at";
+  const eventType = capability === "review" ? "reviewed" : "verified";
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE task_item
+       SET ${statusColumn} = ?, ${agentColumn} = ?, ${noteColumn} = ?, ${timeColumn} = ?, updated_at = ?
+       WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND phase IN ('in_progress', 'done')`,
+    ).bind(decision, actor(auth), note, timestamp, timestamp, taskId, String(current.board_id)),
+    conditionalEvent(
+      env.DB,
+      taskId,
+      eventType,
+      actor(auth),
+      { decision, note, capability, project_id: String(current.board_id) },
+      "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND updated_at = ? AND phase IN ('in_progress', 'done'))",
+      [taskId, String(current.board_id), timestamp],
+    ),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: `${capability} task phase changed; retry` }, 422);
+  const updated = await task(env.DB, taskId);
+  return json(await taskView(env.DB, updated as TaskRow));
 }
 
 async function projects(request: Request, env: Env, auth: Auth): Promise<Response> {
@@ -514,13 +598,15 @@ export default {
       if (request.method === "GET" && url.pathname === "/") return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       return json({ error: "unauthorized" }, 401);
     }
-    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|dependencies|events))?)?$/);
+    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|dependencies|events))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];
       const action = taskMatch[2];
       if (action === "claim" && taskId) return claimTask(request, env, auth, taskId);
       if (action === "release" && taskId) return releaseTask(request, env, auth, taskId);
       if (action === "complete" && taskId) return completeTask(request, env, auth, taskId);
+      if (action === "review" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "review");
+      if (action === "verify" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "verify");
       if (action === "dependencies" && taskId && request.method === "PUT") return dependencies(request, env, auth, taskId);
       if (action === "events" && taskId && request.method === "GET") {
         const access = await authorizeTask(env.DB, auth, taskId);
