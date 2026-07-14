@@ -13,6 +13,7 @@ Standalone always-on coordination task board built with **Cloudflare Workers + D
 - Idempotency keys for mutating requests.
 - Per-project agent membership and per-agent bearer tokens.
 - Capability-based role authorization for management, execution, review, and verification.
+- Durable project-scoped mailbox with direct and broadcast delivery.
 - SHA-256 token hashes only; plaintext agent tokens are returned once at registration.
 - Persistent leases with scheduled and claim-time stale-lease recovery.
 - Minimal token-authenticated browser UI.
@@ -144,6 +145,25 @@ The `manage` capability covers task create, update, delete, and dependency chang
 
 Review and verification are annotations only. `POST /api/board/tasks/:id/review` and `POST /api/board/tasks/:id/verify` accept `{ "decision": "pass"|"reject", "note": "..." }`, record the acting agent in the task fields and `task_event`, and require the task to be `in_progress` or `done`. They do not auto-unlock dependencies or alter completion semantics.
 
+## Mailbox
+
+The mailbox is a durable, project-scoped point-to-point and broadcast channel for agents. A `message` stores the sender, kind, subject, payload, optional `reply_to` correlation, and creation time. Each recipient gets its own `message_delivery` row, so reading is non-destructive and every recipient can independently mark a message seen, acknowledged, or rejected.
+
+Agents may send to other agents in their own project without a special capability. Direct sends require every recipient to belong to the sender's project. Broadcast sends fan out to every other agent in the sender's project. The sender can inspect its audit copy through the sent endpoint. Admins and lead agents may inspect all mailbox deliveries in a project.
+
+Mailbox endpoints:
+
+- `POST /api/mailbox/messages` — send `{ "to": ["agent-id"]|"broadcast", "subject": "...", "body": "...", "reply_to": "message-id" }`. Administrator requests must also provide `project_id`; agent requests use their own project.
+- `GET /api/mailbox/inbox?status=<unread|seen|acked|nacked|dead>` — non-destructive inbox listing. Agents see their own deliveries; admins/leads can inspect a project.
+- `GET /api/mailbox/sent` — sender audit messages; admins/leads can inspect a project.
+- `GET /api/mailbox/messages/:id` — view a message as its sender, recipient, or an admin/lead.
+- `POST /api/mailbox/deliveries/:id/seen` — mark a delivery seen.
+- `POST /api/mailbox/deliveries/:id/ack` — acknowledge a delivery.
+- `POST /api/mailbox/deliveries/:id/nack` — reject for retry; after **3 attempts** it moves to `dead`.
+- `GET /api/mailbox/deadletter` — lead/admin inspection of dead deliveries.
+
+Send operations accept `Idempotency-Key` and replay the original response without creating a second message or delivery set. Seen, ack, and nack transitions use conditional updates and affected-row counts; repeated seen/ack/nack calls are safely idempotent where the terminal state has already been reached. Cross-project reads, sends, and delivery actions return `403` without creating rows.
+
 ## API
 
 ### Health
@@ -169,6 +189,17 @@ Review and verification are annotations only. `POST /api/board/tasks/:id/review`
 - `POST /api/board/tasks/:id/review`
 - `POST /api/board/tasks/:id/verify`
 - `GET /api/board/tasks/:id/events`
+
+### Mailbox
+
+- `POST /api/mailbox/messages`
+- `GET /api/mailbox/inbox`
+- `GET /api/mailbox/sent`
+- `GET /api/mailbox/messages/:id`
+- `POST /api/mailbox/deliveries/:id/seen`
+- `POST /api/mailbox/deliveries/:id/ack`
+- `POST /api/mailbox/deliveries/:id/nack`
+- `GET /api/mailbox/deadletter`
 
 ### Agents
 

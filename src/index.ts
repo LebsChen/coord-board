@@ -8,6 +8,7 @@ type Json = Record<string, unknown>;
 type Capability = "manage" | "claim" | "release" | "complete" | "review" | "verify";
 type Decision = "allow" | "ask" | "deny";
 type TaskRow = Record<string, unknown>;
+type MailboxStatus = "unread" | "seen" | "acked" | "nacked" | "dead";
 type Auth =
   | { kind: "admin"; agentId: string | null }
   | { kind: "agent"; agentId: string; projectId: string; role: string };
@@ -20,6 +21,7 @@ const ROLE_CAPABILITY_DEFAULTS: Record<string, readonly Capability[]> = {
   tester: ["claim", "release", "complete", "verify"],
   worker: ["claim", "release", "complete"],
 };
+const MAILBOX_MAX_ATTEMPTS = 3;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -117,6 +119,10 @@ function checkAgentIdentity(body: Json, auth: Auth): Response | null {
 
 function projectAllowed(auth: Auth, projectId: string): boolean {
   return isAdmin(auth) || auth.projectId === projectId;
+}
+
+function isMailboxInspector(auth: Auth): boolean {
+  return isAdmin(auth) || (auth.kind === "agent" && roleCapabilities(auth.role).includes("manage"));
 }
 
 function idempotencyKey(request: Request, body: Json): string | null {
@@ -494,6 +500,304 @@ async function assessTask(
   return json(await taskView(env.DB, updated as TaskRow));
 }
 
+function mailboxPayload(row: Record<string, unknown>): unknown {
+  const value = String(row.payload_json ?? "");
+  if (!value) return "";
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function mailboxMessageView(row: Record<string, unknown>): Record<string, unknown> {
+  return { ...row, payload: mailboxPayload(row) };
+}
+
+async function mailboxDeliveryView(db: D1Database, deliveryId: string): Promise<Record<string, unknown> | null> {
+  const row = await db.prepare(
+    `SELECT d.*, m.sender_agent_id, m.kind, m.subject, m.payload_json, m.reply_to, m.created_at AS message_created_at
+     FROM message_delivery d
+     JOIN message m ON m.id = d.message_id
+     WHERE d.id = ?`,
+  ).bind(deliveryId).first<Record<string, unknown>>();
+  return row ? { ...row, payload: mailboxPayload(row) } : null;
+}
+
+async function mailboxProject(request: Request, auth: Auth, body?: Json): Promise<string | null> {
+  if (!isAdmin(auth)) {
+    const requested = new URL(request.url).searchParams.get("project_id") ||
+      (typeof body?.project_id === "string" ? body.project_id : null);
+    return requested && requested !== auth.projectId ? null : auth.projectId;
+  }
+  return (typeof body?.project_id === "string" ? body.project_id : null) ||
+    new URL(request.url).searchParams.get("project_id");
+}
+
+async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const body = await parseBody(request);
+  const projectId = await mailboxProject(request, auth, body);
+  if (!projectId) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 422);
+
+  const senderId = isAdmin(auth)
+    ? (typeof body.sender_agent_id === "string" ? body.sender_agent_id.trim() : auth.agentId || "")
+    : auth.agentId;
+  if (senderId) {
+    const sender = await env.DB.prepare("SELECT project_id FROM agent WHERE id = ?").bind(senderId).first<{ project_id: string }>();
+    if (!sender) return json({ error: "sender agent not found" }, 422);
+    if (sender.project_id !== projectId) return json({ error: "sender belongs to another project" }, 403);
+  }
+
+  const replyTo = typeof body.reply_to === "string" && body.reply_to.trim() ? body.reply_to.trim() : null;
+  if (replyTo) {
+    const parent = await env.DB.prepare("SELECT project_id FROM message WHERE id = ?").bind(replyTo).first<{ project_id: string }>();
+    if (!parent) return json({ error: "reply message not found" }, 422);
+    if (parent.project_id !== projectId) return json({ error: "reply message belongs to another project" }, 403);
+  }
+
+  const to = body.to === "broadcast"
+    ? "broadcast"
+    : Array.isArray(body.to)
+      ? [...new Set(body.to.map(String).map((value) => value.trim()).filter(Boolean))]
+      : null;
+  if (to !== "broadcast" && (!to || to.length === 0)) {
+    return json({ error: "to must be a non-empty agent id array or broadcast" }, 400);
+  }
+
+  let recipients: string[];
+  if (to === "broadcast") {
+    const rows = await env.DB.prepare(
+      "SELECT id FROM agent WHERE project_id = ? AND (? = '' OR id <> ?) ORDER BY id",
+    ).bind(projectId, senderId || "", senderId || "").all<{ id: string }>();
+    recipients = rows.results.map((row) => row.id);
+  } else {
+    const placeholders = to.map(() => "?").join(",");
+    const rows = await env.DB.prepare(
+      `SELECT id, project_id FROM agent WHERE id IN (${placeholders})`,
+    ).bind(...to).all<{ id: string; project_id: string }>();
+    if (rows.results.length !== to.length) return json({ error: "recipient agent not found" }, 422);
+    if (rows.results.some((row) => row.project_id !== projectId)) {
+      return json({ error: "recipient belongs to another project" }, 403);
+    }
+    recipients = to;
+  }
+
+  const payloadValue = body.body !== undefined ? body.body : body.payload;
+  const payloadJson = payloadValue === undefined
+    ? ""
+    : typeof payloadValue === "string"
+      ? JSON.stringify(payloadValue)
+      : JSON.stringify(payloadValue);
+  const messageId = id();
+  const timestamp = now();
+  const kind = to === "broadcast" ? "broadcast" : "direct";
+  const subject = body.subject === undefined ? null : String(body.subject);
+  const key = idempotencyKey(request, body);
+  const replay = await replayOrReserve(env.DB, `mailbox:send:${projectId}`, key);
+  if (replay) return replay;
+  const message = {
+    id: messageId,
+    project_id: projectId,
+    sender_agent_id: senderId || null,
+    kind,
+    subject,
+    payload_json: payloadJson,
+    reply_to: replyTo,
+    created_at: timestamp,
+  };
+  const deliveries = recipients.map((recipientAgentId) => ({
+    id: id(),
+    message_id: messageId,
+    project_id: projectId,
+    recipient_agent_id: recipientAgentId,
+    status: "unread" as MailboxStatus,
+    seen_at: null,
+    acked_at: null,
+    attempt_count: 0,
+    updated_at: timestamp,
+  }));
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).bind(message.id, message.project_id, message.sender_agent_id, message.kind, message.subject, message.payload_json, message.reply_to, message.created_at),
+    ...deliveries.map((delivery) => env.DB.prepare(
+      "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, seen_at, acked_at, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).bind(delivery.id, delivery.message_id, delivery.project_id, delivery.recipient_agent_id, delivery.status, delivery.seen_at, delivery.acked_at, delivery.attempt_count, delivery.updated_at)),
+  ]);
+  const response = json({
+    message: { ...message, payload: mailboxPayload(message) },
+    deliveries,
+  }, 201);
+  return saveIdempotentResponse(env.DB, `mailbox:send:${projectId}`, key, response);
+}
+
+async function listMailbox(request: Request, env: Env, auth: Auth, sent: boolean): Promise<Response> {
+  const url = new URL(request.url);
+  const requestedProject = url.searchParams.get("project_id") || url.searchParams.get("project");
+  if (!isAdmin(auth) && requestedProject && requestedProject !== auth.projectId) {
+    return json({ error: "project access denied" }, 403);
+  }
+  const projectId = requestedProject || (isAdmin(auth) ? null : auth.projectId);
+  const status = url.searchParams.get("status");
+  const validStatuses: MailboxStatus[] = ["unread", "seen", "acked", "nacked", "dead"];
+  if (!sent && status && !validStatuses.includes(status as MailboxStatus)) {
+    return json({ error: "invalid mailbox status" }, 400);
+  }
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  if (projectId) {
+    conditions.push(sent ? "m.project_id = ?" : "d.project_id = ?");
+    values.push(projectId);
+  }
+  if (sent) {
+    if (!isAdmin(auth) && !isMailboxInspector(auth)) {
+      conditions.push("m.sender_agent_id = ?");
+      values.push(auth.agentId);
+    }
+    if (isMailboxInspector(auth) && !isAdmin(auth)) {
+      conditions.push("m.project_id = ?");
+      values.push(auth.projectId);
+    }
+  } else {
+    if (!isAdmin(auth) && !isMailboxInspector(auth)) {
+      conditions.push("d.recipient_agent_id = ?");
+      values.push(auth.agentId);
+    }
+    if (isMailboxInspector(auth) && !isAdmin(auth)) {
+      conditions.push("d.project_id = ?");
+      values.push(auth.projectId);
+    }
+    if (status) {
+      conditions.push("d.status = ?");
+      values.push(status);
+    }
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const query = sent
+    ? `SELECT m.* FROM message m ${where} ORDER BY m.created_at DESC`
+    : `SELECT d.*, m.sender_agent_id, m.kind, m.subject, m.payload_json, m.reply_to, m.created_at AS message_created_at
+       FROM message_delivery d JOIN message m ON m.id = d.message_id ${where} ORDER BY d.updated_at DESC`;
+  const rows = await env.DB.prepare(query).bind(...values).all<Record<string, unknown>>();
+  return json({
+    messages: sent ? rows.results.map(mailboxMessageView) : [],
+    deliveries: sent ? [] : rows.results.map((row) => ({ ...row, payload: mailboxPayload(row) })),
+  });
+}
+
+async function getMailboxMessage(env: Env, auth: Auth, messageId: string): Promise<Response> {
+  const message = await env.DB.prepare("SELECT * FROM message WHERE id = ?").bind(messageId).first<Record<string, unknown>>();
+  if (!message) return json({ error: "message not found" }, 404);
+  const projectId = String(message.project_id);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  let allowed = isMailboxInspector(auth) || message.sender_agent_id === auth.agentId;
+  if (!isAdmin(auth) && !allowed) {
+    const delivery = await env.DB.prepare(
+      "SELECT id FROM message_delivery WHERE message_id = ? AND recipient_agent_id = ?",
+    ).bind(messageId, auth.agentId).first();
+    allowed = Boolean(delivery);
+  }
+  if (!allowed) return json({ error: "message access denied" }, 403);
+  const deliveries = await env.DB.prepare(
+    "SELECT * FROM message_delivery WHERE message_id = ? ORDER BY recipient_agent_id",
+  ).bind(messageId).all<Record<string, unknown>>();
+  return json({
+    message: mailboxMessageView(message),
+    deliveries: deliveries.results,
+  });
+}
+
+async function authorizeMailboxDelivery(
+  env: Env,
+  auth: Auth,
+  deliveryId: string,
+): Promise<{ row: Record<string, unknown> | null; error: Response | null }> {
+  const row = await env.DB.prepare(
+    "SELECT * FROM message_delivery WHERE id = ?",
+  ).bind(deliveryId).first<Record<string, unknown>>();
+  if (!row) return { row: null, error: json({ error: "delivery not found" }, 404) };
+  if (!projectAllowed(auth, String(row.project_id))) {
+    return { row: null, error: json({ error: "project access denied" }, 403) };
+  }
+  if (!isMailboxInspector(auth) && row.recipient_agent_id !== auth.agentId) {
+    return { row: null, error: json({ error: "delivery access denied" }, 403) };
+  }
+  return { row, error: null };
+}
+
+async function transitionMailboxDelivery(
+  request: Request,
+  env: Env,
+  auth: Auth,
+  deliveryId: string,
+  action: "seen" | "ack" | "nack",
+): Promise<Response> {
+  const access = await authorizeMailboxDelivery(env, auth, deliveryId);
+  if (access.error) return access.error;
+  const row = access.row as Record<string, unknown>;
+  const projectId = String(row.project_id);
+  const recipientCondition = isMailboxInspector(auth)
+    ? "project_id = ?"
+    : "project_id = ? AND recipient_agent_id = ?";
+  const recipientValues = isMailboxInspector(auth)
+    ? [projectId]
+    : [projectId, auth.agentId];
+  const timestamp = now();
+  let sql: string;
+  let values: unknown[];
+  if (action === "seen") {
+    sql = `UPDATE message_delivery SET status = 'seen', seen_at = COALESCE(seen_at, ?), updated_at = ?
+           WHERE id = ? AND ${recipientCondition} AND status IN ('unread', 'nacked')`;
+    values = [timestamp, timestamp, deliveryId, ...recipientValues];
+  } else if (action === "ack") {
+    sql = `UPDATE message_delivery SET status = 'acked', acked_at = COALESCE(acked_at, ?), updated_at = ?
+           WHERE id = ? AND ${recipientCondition} AND status IN ('unread', 'seen', 'nacked')`;
+    values = [timestamp, timestamp, deliveryId, ...recipientValues];
+  } else {
+    sql = `UPDATE message_delivery
+           SET status = CASE WHEN attempt_count + 1 >= ? THEN 'dead' ELSE 'unread' END,
+               attempt_count = attempt_count + 1, updated_at = ?
+           WHERE id = ? AND ${recipientCondition} AND status IN ('unread', 'seen', 'nacked')`;
+    values = [MAILBOX_MAX_ATTEMPTS, timestamp, deliveryId, ...recipientValues];
+  }
+  const result = await env.DB.prepare(sql).bind(...values).run();
+  if ((result.meta.changes ?? 0) === 0) {
+    const current = await mailboxDeliveryView(env.DB, deliveryId);
+    if (current && (
+      (action === "seen" && ["seen", "acked"].includes(String(current.status))) ||
+      (action === "ack" && current.status === "acked") ||
+      (action === "nack" && current.status === "dead")
+    )) {
+      return json({ delivery: current, idempotent: true });
+    }
+    return json({ error: action === "nack" ? "delivery cannot be nacked" : `delivery cannot be marked ${action}` }, 409);
+  }
+  return json({ delivery: await mailboxDeliveryView(env.DB, deliveryId) });
+}
+
+async function mailbox(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const url = new URL(request.url);
+  const sendMatch = url.pathname === "/api/mailbox/messages" && request.method === "POST";
+  if (sendMatch) return sendMailboxMessage(request, env, auth);
+  if (url.pathname === "/api/mailbox/inbox" && request.method === "GET") return listMailbox(request, env, auth, false);
+  if (url.pathname === "/api/mailbox/sent" && request.method === "GET") return listMailbox(request, env, auth, true);
+  if (url.pathname === "/api/mailbox/deadletter" && request.method === "GET") {
+    if (!isMailboxInspector(auth)) return json({ error: "leader authorization required" }, 403);
+    const inboxUrl = new URL(request.url);
+    inboxUrl.pathname = "/api/mailbox/inbox";
+    inboxUrl.searchParams.set("status", "dead");
+    return listMailbox(new Request(inboxUrl), env, auth, false);
+  }
+  const messageMatch = url.pathname.match(/^\/api\/mailbox\/messages\/([^/]+)$/);
+  if (messageMatch && request.method === "GET") return getMailboxMessage(env, auth, messageMatch[1]);
+  const deliveryMatch = url.pathname.match(/^\/api\/mailbox\/deliveries\/([^/]+)\/(seen|ack|nack)$/);
+  if (deliveryMatch && request.method === "POST") {
+    return transitionMailboxDelivery(request, env, auth, deliveryMatch[1], deliveryMatch[2] as "seen" | "ack" | "nack");
+  }
+  return json({ error: "not found" }, 404);
+}
+
 async function projects(request: Request, env: Env, auth: Auth): Promise<Response> {
   if (request.method === "GET") {
     const rows = isAdmin(auth)
@@ -598,6 +902,7 @@ export default {
       if (request.method === "GET" && url.pathname === "/") return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       return json({ error: "unauthorized" }, 401);
     }
+    if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth);
     const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|dependencies|events))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];

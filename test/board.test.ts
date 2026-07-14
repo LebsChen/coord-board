@@ -396,4 +396,131 @@ describe("coord board", () => {
     expect(events.body.events.some((event: { event_type: string; actor_agent_id: string }) =>
       event.event_type === "reviewed" && event.actor_agent_id === "capability-reviewer")).toBe(true);
   });
+
+  it("delivers direct and broadcast mailbox messages with durable recipient state", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "mailbox-project", name: "Mailbox Project" }),
+    });
+    const otherProject = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "mailbox-other", name: "Mailbox Other" }),
+    });
+    expect(project.response.status).toBe(201);
+    expect(otherProject.response.status).toBe(201);
+    const registrations = await Promise.all([
+      ["mailbox-alice", "worker"],
+      ["mailbox-bob", "worker"],
+      ["mailbox-carol", "worker"],
+      ["mailbox-lead", "lead"],
+      ["mailbox-other-agent", "worker"],
+    ].map(([id, role], index) => call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id,
+        project_id: index === 4 ? "mailbox-other" : "mailbox-project",
+        name: id,
+        role,
+      }),
+    })));
+    for (const registration of registrations) expect(registration.response.status).toBe(201);
+    const [aliceToken, bobToken, carolToken, leadToken, otherToken] =
+      registrations.map((registration) => String(registration.body.token));
+
+    const direct = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        to: ["mailbox-bob"],
+        subject: "Direct",
+        body: { text: "hello Bob" },
+      }),
+    }, aliceToken);
+    expect(direct.response.status).toBe(201);
+    expect(direct.body.message.kind).toBe("direct");
+    expect(direct.body.deliveries).toHaveLength(1);
+    const directMessageId = String(direct.body.message.id);
+    const directDeliveryId = String(direct.body.deliveries[0].id);
+    const aliceInbox = await call("/api/mailbox/inbox", {}, aliceToken);
+    const bobInbox = await call("/api/mailbox/inbox", {}, bobToken);
+    const carolInbox = await call("/api/mailbox/inbox", {}, carolToken);
+    expect(aliceInbox.body.deliveries.some((delivery: { message_id: string }) => delivery.message_id === directMessageId)).toBe(false);
+    expect(bobInbox.body.deliveries.some((delivery: { message_id: string }) => delivery.message_id === directMessageId)).toBe(true);
+    expect(carolInbox.body.deliveries.some((delivery: { message_id: string }) => delivery.message_id === directMessageId)).toBe(false);
+
+    const seen = await call(`/api/mailbox/deliveries/${directDeliveryId}/seen`, { method: "POST" }, bobToken);
+    expect(seen.response.status).toBe(200);
+    expect(seen.body.delivery.status).toBe("seen");
+    const seenAgain = await call(`/api/mailbox/deliveries/${directDeliveryId}/seen`, { method: "POST" }, bobToken);
+    expect(seenAgain.response.status).toBe(200);
+    expect(seenAgain.body.idempotent).toBe(true);
+    const acked = await call(`/api/mailbox/deliveries/${directDeliveryId}/ack`, { method: "POST" }, bobToken);
+    expect(acked.response.status).toBe(200);
+    expect(acked.body.delivery.status).toBe("acked");
+
+    const broadcast = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ to: "broadcast", subject: "Broadcast", payload: { text: "hello team" } }),
+    }, aliceToken);
+    expect(broadcast.response.status).toBe(201);
+    expect(broadcast.body.message.kind).toBe("broadcast");
+    expect(broadcast.body.deliveries.map((delivery: { recipient_agent_id: string }) => delivery.recipient_agent_id))
+      .toEqual(["mailbox-bob", "mailbox-carol", "mailbox-lead"]);
+
+    const deadMessage = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ to: ["mailbox-bob"], body: "retry me" }),
+    }, aliceToken);
+    const deadDeliveryId = String(deadMessage.body.deliveries[0].id);
+    const nack1 = await call(`/api/mailbox/deliveries/${deadDeliveryId}/nack`, { method: "POST" }, bobToken);
+    const nack2 = await call(`/api/mailbox/deliveries/${deadDeliveryId}/nack`, { method: "POST" }, bobToken);
+    const nack3 = await call(`/api/mailbox/deliveries/${deadDeliveryId}/nack`, { method: "POST" }, bobToken);
+    expect(nack1.body.delivery.status).toBe("unread");
+    expect(nack2.body.delivery.status).toBe("unread");
+    expect(nack3.body.delivery.status).toBe("dead");
+    const deadletter = await call("/api/mailbox/deadletter", {}, leadToken);
+    expect(deadletter.body.deliveries.some((delivery: { id: string }) => delivery.id === deadDeliveryId)).toBe(true);
+
+    const idempotencyBefore = await env.DB.prepare("SELECT COUNT(*) AS count FROM message WHERE project_id = ?")
+      .bind("mailbox-project").first<{ count: number }>();
+    const idempotentInit = {
+      method: "POST",
+      headers: { "idempotency-key": "mailbox-same-message" },
+      body: JSON.stringify({ to: ["mailbox-carol"], body: "once" }),
+    };
+    const idempotentFirst = await call("/api/mailbox/messages", idempotentInit, aliceToken);
+    const idempotentSecond = await call("/api/mailbox/messages", idempotentInit, aliceToken);
+    expect(idempotentFirst.body.message.id).toBe(idempotentSecond.body.message.id);
+    const idempotencyAfter = await env.DB.prepare("SELECT COUNT(*) AS count FROM message WHERE project_id = ?")
+      .bind("mailbox-project").first<{ count: number }>();
+    expect(Number(idempotencyAfter?.count) - Number(idempotencyBefore?.count)).toBe(1);
+
+    const reply = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ to: ["mailbox-alice"], reply_to: directMessageId, body: "reply" }),
+    }, bobToken);
+    expect(reply.response.status).toBe(201);
+    expect(reply.body.message.reply_to).toBe(directMessageId);
+    const sent = await call("/api/mailbox/sent", {}, aliceToken);
+    expect(sent.body.messages.some((message: { id: string }) => message.id === directMessageId)).toBe(true);
+    const viewed = await call(`/api/mailbox/messages/${directMessageId}`, {}, bobToken);
+    expect(viewed.response.status).toBe(200);
+    expect(viewed.body.message.id).toBe(directMessageId);
+
+    const crossSend = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ to: ["mailbox-other-agent"], body: "cross-project" }),
+    }, aliceToken);
+    expect(crossSend.response.status).toBe(403);
+    const otherMessage = await call("/api/mailbox/messages", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "mailbox-other", to: ["mailbox-other-agent"], body: "private" }),
+    });
+    const crossRead = await call(`/api/mailbox/messages/${otherMessage.body.message.id}`, {}, aliceToken);
+    expect(crossRead.response.status).toBe(403);
+    const crossRows = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM message WHERE project_id = ? AND payload_json = ?",
+    ).bind("mailbox-project", JSON.stringify("cross-project")).first<{ count: number }>();
+    expect(Number(crossRows?.count)).toBe(0);
+    void otherToken;
+  });
 });
