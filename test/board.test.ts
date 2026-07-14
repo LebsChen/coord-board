@@ -831,4 +831,202 @@ describe("coord board", () => {
     expect(page).toContain("history.replaceState");
     expect(page).toContain("sessionStorage.setItem('coord-board-token',sharedToken)");
   });
+
+  it("renews only a current unexpired lease holder and preserves generation", async () => {
+    const created = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "renew lease" }),
+    });
+    const taskId = String(created.body.id);
+    const claimed = await call(`/api/board/tasks/${taskId}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "a", lease_seconds: 60 }),
+    });
+    expect(claimed.response.status).toBe(200);
+    const generation = Number(claimed.body.lease_generation);
+    const renewed = await call(`/api/board/tasks/${taskId}/renew`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "a", lease_generation: generation, lease_seconds: 120 }),
+    });
+    expect(renewed.response.status).toBe(200);
+    expect(renewed.body.lease_generation).toBe(generation);
+    const denied = await call(`/api/board/tasks/${taskId}/renew`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "b", lease_generation: generation }),
+    });
+    expect(denied.response.status).toBe(409);
+    const after = await call(`/api/board/tasks/${taskId}`);
+    expect(after.body.lease_owner).toBe("a");
+    expect(after.body.lease_generation).toBe(generation);
+  });
+
+  it("does not reclaim an unexpired lease when the agent is stale", async () => {
+    const created = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "stale lease protection" }),
+    });
+    const taskId = String(created.body.id);
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ?, updated_at = ? WHERE id = ?",
+      ).bind("dead", future, future, taskId),
+      env.DB.prepare(
+        "UPDATE agent SET status = 'active', last_seen_at = ?, updated_at = ? WHERE id = ?",
+      ).bind("2000-01-01T00:00:00.000Z", future, "dead"),
+    ]);
+    const trigger = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "sweep trigger" }),
+    });
+    expect(trigger.response.status).toBe(201);
+    const after = await call(`/api/board/tasks/${taskId}`);
+    expect(after.body.lease_owner).toBe("dead");
+    expect(after.body.lease_expires_at).toBe(future);
+  });
+
+  it("supports PATCH assignee set and clear while enforcing project isolation", async () => {
+    const projectA = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-assignee-a", name: "Patch Assignee A" }),
+    });
+    const projectB = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-assignee-b", name: "Patch Assignee B" }),
+    });
+    expect(projectA.response.status).toBe(201);
+    expect(projectB.response.status).toBe(201);
+    const agentA = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-assignee-agent-a", project_id: "patch-assignee-a", name: "A", role: "worker" }),
+    });
+    const agentB = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-assignee-agent-b", project_id: "patch-assignee-b", name: "B", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "patch-assignee-a", title: "assignee patch" }),
+    });
+    const taskId = String(task.body.id);
+    const set = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ assignee_agent_id: agentA.body.id }),
+    });
+    expect(set.response.status).toBe(200);
+    expect(set.body.assignee_agent_id).toBe(agentA.body.id);
+    const clear = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ assignee_agent_id: null }),
+    });
+    expect(clear.response.status).toBe(200);
+    expect(clear.body.assignee_agent_id).toBeNull();
+    const crossProject = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ assignee_agent_id: agentB.body.id }),
+    });
+    expect(crossProject.response.status).toBe(422);
+    expect((await call(`/api/board/tasks/${taskId}`)).body.assignee_agent_id).toBeNull();
+  });
+
+  it("rejects completion without an active lease for a worker", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "complete-lease-project", name: "Complete Lease" }),
+    });
+    expect(project.response.status).toBe(201);
+    const registration = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "complete-lease-worker", project_id: "complete-lease-project", name: "Worker", role: "worker" }),
+    });
+    expect(registration.response.status).toBe(201);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "complete-lease-project", title: "must claim first" }),
+    });
+    const denied = await call(`/api/board/tasks/${task.body.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "complete-lease-worker" }),
+    }, String(registration.body.token));
+    expect(denied.response.status).toBe(409);
+    const unchanged = await call(`/api/board/tasks/${task.body.id}`);
+    expect(unchanged.body.phase).toBe("pending");
+  });
+
+  it("rejects dependency updates that would create a multi-node cycle", async () => {
+    const [a, b, c] = await Promise.all([
+      call("/api/board/tasks", { method: "POST", body: JSON.stringify({ title: "cycle A" }) }),
+      call("/api/board/tasks", { method: "POST", body: JSON.stringify({ title: "cycle B" }) }),
+      call("/api/board/tasks", { method: "POST", body: JSON.stringify({ title: "cycle C" }) }),
+    ]);
+    await call(`/api/board/tasks/${b.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [a.body.id] }),
+    });
+    await call(`/api/board/tasks/${c.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [b.body.id] }),
+    });
+    const cycle = await call(`/api/board/tasks/${a.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [c.body.id] }),
+    });
+    expect(cycle.response.status).toBe(422);
+    expect((await call(`/api/board/tasks/${a.body.id}`)).body.dependencies).toEqual([]);
+  });
+
+  it("prevents PATCH from bypassing required gates or acceptance", async () => {
+    const gated = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "patch gate", required_gates: ["qa"] }),
+    });
+    const gatedPatch = await call(`/api/board/tasks/${gated.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ phase: "done" }),
+    });
+    expect(gatedPatch.response.status).toBe(409);
+    expect((await call(`/api/board/tasks/${gated.body.id}`)).body.phase).toBe("pending");
+    const acceptance = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "patch acceptance", require_acceptance: true }),
+    });
+    const acceptancePatch = await call(`/api/board/tasks/${acceptance.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ phase: "done" }),
+    });
+    expect(acceptancePatch.response.status).toBe(422);
+    expect((await call(`/api/board/tasks/${acceptance.body.id}`)).body.phase).toBe("pending");
+  });
+
+  it("serves the unauthenticated API health alias", async () => {
+    const response = await SELF.fetch(new Request("https://coord-board.test/api/health"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, service: "coord-board" });
+  });
+
+  it("expires orphaned in-progress idempotency reservations during lease sweeps", async () => {
+    const trigger = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "idempotency sweep trigger" }),
+    });
+    const triggerClaim = await call(`/api/board/tasks/${trigger.body.id}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "a" }),
+    });
+    expect(triggerClaim.response.status).toBe(200);
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO idempotency_key(scope, key, response_status, response_body, created_at) VALUES (?, ?, NULL, NULL, ?)",
+    ).bind("task:create:default", "orphaned-key", "2000-01-01T00:00:00.000Z").run();
+    const sweep = await call(`/api/board/tasks/${trigger.body.id}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: "b" }),
+    });
+    expect(sweep.response.status).toBe(409);
+    const reused = await call("/api/board/tasks", {
+      method: "POST",
+      headers: { "idempotency-key": "orphaned-key" },
+      body: JSON.stringify({ title: "reused after cleanup" }),
+    });
+    expect(reused.response.status).toBe(201);
+  });
 });

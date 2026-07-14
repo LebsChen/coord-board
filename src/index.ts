@@ -24,6 +24,10 @@ const ROLE_CAPABILITY_DEFAULTS: Record<string, readonly Capability[]> = {
   worker: ["claim", "release", "complete", "plan_submit"],
 };
 const MAILBOX_MAX_ATTEMPTS = 3;
+const DEFAULT_LEASE_SECONDS = 300;
+const MIN_LEASE_SECONDS = 10;
+const MAX_LEASE_SECONDS = 24 * 60 * 60;
+const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 60 * 1000;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -58,6 +62,12 @@ function requiredGates(row: TaskRow): string[] {
   } catch {
     return [];
   }
+}
+
+function leaseSeconds(value: unknown): number {
+  const parsed = Number(value ?? DEFAULT_LEASE_SECONDS);
+  if (!Number.isFinite(parsed)) return DEFAULT_LEASE_SECONDS;
+  return Math.min(MAX_LEASE_SECONDS, Math.max(MIN_LEASE_SECONDS, Math.floor(parsed)));
 }
 
 async function qualityGatesSatisfied(db: D1Database, row: TaskRow): Promise<boolean> {
@@ -233,16 +243,24 @@ async function saveIdempotentResponse(db: D1Database, scope: string, key: string
   return response;
 }
 
-async function releaseAgentLeases(db: D1Database, agentId: string): Promise<string[]> {
+async function releaseAgentLeases(
+  db: D1Database,
+  agentId: string,
+  timestamp = now(),
+  expiredOnly = false,
+): Promise<string[]> {
+  const leaseCondition = expiredOnly
+    ? " AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?"
+    : "";
+  const leaseValues = expiredOnly ? [timestamp] : [];
   const rows = await db.prepare(
-    "SELECT id, board_id FROM task_item WHERE lease_owner = ? AND phase = 'in_progress' AND deleted_at IS NULL",
-  ).bind(agentId).all<{ id: string; board_id: string }>();
+    `SELECT id, board_id FROM task_item WHERE lease_owner = ? AND phase = 'in_progress' AND deleted_at IS NULL${leaseCondition}`,
+  ).bind(agentId, ...leaseValues).all<{ id: string; board_id: string }>();
   if (rows.results.length === 0) return [];
-  const timestamp = now();
   await db.batch(rows.results.flatMap((row) => [
     db.prepare(
-      "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ? AND phase = 'in_progress'",
-    ).bind(timestamp, row.id, agentId),
+      `UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ? AND phase = 'in_progress'${leaseCondition}`,
+    ).bind(timestamp, row.id, agentId, ...leaseValues),
     event(db, row.id, "agent_lease_released", agentId, { reason: "agent lifecycle transition", project_id: row.board_id }),
   ]));
   return rows.results.map((row) => row.board_id);
@@ -250,6 +268,10 @@ async function releaseAgentLeases(db: D1Database, agentId: string): Promise<stri
 
 async function sweepLeases(db: D1Database): Promise<void> {
   const timestamp = now();
+  const staleIdempotencyBefore = new Date(Date.now() - IDEMPOTENCY_IN_PROGRESS_TTL_MS).toISOString();
+  await db.prepare(
+    "DELETE FROM idempotency_key WHERE response_status IS NULL AND created_at <= ?",
+  ).bind(staleIdempotencyBefore).run();
   await db.prepare(
     "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= ? AND phase = 'in_progress'",
   ).bind(timestamp, timestamp).run();
@@ -261,7 +283,7 @@ async function sweepLeases(db: D1Database): Promise<void> {
     await db.prepare(
       "UPDATE agent SET status = 'idle', updated_at = ? WHERE id = ? AND status NOT IN ('idle', 'shutdown')",
     ).bind(timestamp, agent.id).run();
-    await releaseAgentLeases(db, agent.id);
+    await releaseAgentLeases(db, agent.id, timestamp, true);
   }
 }
 
@@ -302,6 +324,23 @@ async function listGates(db: D1Database, taskId: string): Promise<Record<string,
     "SELECT gate_name, status, by_agent, note, created_at, updated_at FROM task_gate WHERE task_id = ? ORDER BY gate_name",
   ).bind(taskId).all<Record<string, unknown>>();
   return result.results;
+}
+
+function dependencyGraphHasCycle(edges: Map<string, string[]>): boolean {
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (node: string): boolean => {
+    if (visiting.has(node)) return true;
+    if (visited.has(node)) return false;
+    visiting.add(node);
+    for (const dependency of edges.get(node) ?? []) {
+      if (visit(dependency)) return true;
+    }
+    visiting.delete(node);
+    visited.add(node);
+    return false;
+  };
+  return [...edges.keys()].some(visit);
 }
 
 async function taskView(db: D1Database, row: Record<string, unknown>) {
@@ -423,9 +462,6 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
   const identityError = checkAgentIdentity(body, auth);
   if (identityError) return identityError;
   if (method === "PATCH") {
-    const key = idempotencyKey(request, body);
-    const replay = await replayOrReserve(db, `task:update:${taskId}`, key);
-    if (replay) return replay;
     const title = body.title === undefined ? current.title : String(body.title).trim();
     const description = body.description === undefined ? current.description : String(body.description);
     const priority = body.priority === undefined ? current.priority : Number(body.priority);
@@ -435,21 +471,62 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const requiredGateNames = body.required_gates === undefined
       ? requiredGates(current)
       : gateNames(body.required_gates);
+    const assigneeSpecified = body.assignee_agent_id !== undefined;
+    const assignee = !assigneeSpecified || body.assignee_agent_id === null || body.assignee_agent_id === ""
+      ? (assigneeSpecified ? null : current.assignee_agent_id ?? null)
+      : String(body.assignee_agent_id);
     if (!["pending", "ready", "in_progress", "done"].includes(String(phase))) {
       return json({ error: "invalid phase" }, 422);
     }
-    if (requireAcceptance && phase === "done") {
+    if (assigneeSpecified && assignee !== null) {
+      const target = await db.prepare(
+        "SELECT id FROM agent WHERE id = ? AND project_id = ?",
+      ).bind(assignee, String(current.board_id)).first();
+      if (!target) return json({ error: "assignee agent not found in project" }, 422);
+    }
+    const nextRow = {
+      ...current,
+      require_plan: requirePlan,
+      require_acceptance: requireAcceptance,
+      required_gates: JSON.stringify(requiredGateNames),
+    };
+    const currentRequiresAcceptance = Number(current.require_acceptance ?? 0) === 1;
+    const currentRequiresPlan = Number(current.require_plan ?? 0) === 1;
+    if (phase === "done" && (requireAcceptance || currentRequiresAcceptance)) {
       return json({ error: "acceptance-required tasks must be accepted before done" }, 422);
     }
+    if (phase === "done" && (requirePlan || currentRequiresPlan) && current.plan_status !== "approved") {
+      return json({ error: "plan approval required before setting task done" }, 409);
+    }
+    if (phase === "done" && (
+      !(await qualityGatesSatisfied(db, current)) ||
+      !(await qualityGatesSatisfied(db, nextRow))
+    )) {
+      return json({ error: "required quality gates must pass before setting task done" }, 409);
+    }
+    const key = idempotencyKey(request, body);
+    const replay = await replayOrReserve(db, `task:update:${taskId}`, key);
+    if (replay) return replay;
     const timestamp = now();
-    const responseBody = { ...current, title, description, priority, phase, require_plan: requirePlan, require_acceptance: requireAcceptance, required_gates: JSON.stringify(requiredGateNames), updated_at: timestamp };
+    const responseBody = {
+      ...current,
+      title,
+      description,
+      priority,
+      phase,
+      require_plan: requirePlan,
+      require_acceptance: requireAcceptance,
+      required_gates: JSON.stringify(requiredGateNames),
+      assignee_agent_id: assignee,
+      updated_at: timestamp,
+    };
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, updated_at = ?
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, timestamp, taskId, String(current.board_id)),
-      event(db, taskId, "updated", actor(auth), { phase }),
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, timestamp, taskId, String(current.board_id)),
+      event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
     ]);
     return saveIdempotentResponse(db, `task:update:${taskId}`, key, json(await taskView(db, responseBody)));
   }
@@ -482,8 +559,8 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:claim:${taskId}`, key);
   if (replay) return replay;
-  const leaseSeconds = Math.max(10, Number(body.lease_seconds ?? 300));
-  const expires = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  const requestedLeaseSeconds = leaseSeconds(body.lease_seconds);
+  const expires = new Date(Date.now() + requestedLeaseSeconds * 1000).toISOString();
   const generation = Number(body.lease_generation ?? 0);
   const timestamp = now();
   const update = env.DB.prepare(
@@ -527,6 +604,60 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
   dispatchHooks(ctx, env, projectId, "task_claimed", "post", { task_id: taskId, actor_agent_id: owner, lease_expires_at: expires });
   const response = json(await taskView(env.DB, claimed as Record<string, unknown>), 200);
   return saveIdempotentResponse(env.DB, `task:claim:${taskId}`, key, response);
+}
+
+async function renewTask(request: Request, env: Env, auth: Auth, ctx: ExecutionContext, taskId: string): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "claim", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const identityError = checkAgentIdentity(body, auth);
+  if (identityError) return identityError;
+  const owner = bodyAgent(body, auth);
+  if (!owner) return json({ error: "agent_id or x-agent-id is required" }, 400);
+  const generation = Number(body.lease_generation);
+  if (!Number.isInteger(generation) || generation < 0) {
+    return json({ error: "lease_generation is required" }, 400);
+  }
+  const key = idempotencyKey(request, body);
+  const replay = await replayOrReserve(env.DB, `task:renew:${taskId}`, key);
+  if (replay) return replay;
+  const timestamp = now();
+  const expires = new Date(Date.now() + leaseSeconds(body.lease_seconds) * 1000).toISOString();
+  const projectId = String(access.row?.board_id);
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE task_item
+       SET lease_expires_at = ?, updated_at = ?
+       WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND phase = 'in_progress'
+         AND lease_owner = ? AND lease_generation = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
+    ).bind(expires, timestamp, taskId, projectId, owner, generation, timestamp),
+    conditionalEvent(
+      env.DB,
+      taskId,
+      "lease_renewed",
+      owner,
+      { lease_expires_at: expires, lease_generation: generation, project_id: projectId },
+      "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND lease_owner = ? AND lease_generation = ? AND lease_expires_at = ? AND updated_at = ?)",
+      [taskId, projectId, owner, generation, expires, timestamp],
+    ),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) {
+    return json({ error: "lease not owned or already expired" }, 409);
+  }
+  dispatchHooks(ctx, env, projectId, "task_lease_renewed", "post", {
+    task_id: taskId,
+    actor_agent_id: owner,
+    lease_expires_at: expires,
+    lease_generation: generation,
+  });
+  return saveIdempotentResponse(
+    env.DB,
+    `task:renew:${taskId}`,
+    key,
+    json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>)),
+  );
 }
 
 async function releaseTask(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
@@ -603,6 +734,15 @@ async function completeTask(request: Request, env: Env, auth: Auth, ctx: Executi
   if (identityError) return identityError;
   const owner = bodyAgent(body, auth);
   const current = access.row as Record<string, unknown>;
+  const timestamp = now();
+  const leaseOverride = isAdmin(auth) || roleCapabilities(auth.role).includes("manage");
+  if (!leaseOverride && (
+    current.lease_owner !== owner ||
+    !current.lease_expires_at ||
+    String(current.lease_expires_at) <= timestamp
+  )) {
+    return json({ error: "an active lease owned by the completing agent is required" }, 409);
+  }
   if (Number(current.require_plan ?? 0) === 1 && current.plan_status !== "approved") {
     return json({ error: "plan approval required before completion" }, 409);
   }
@@ -612,20 +752,23 @@ async function completeTask(request: Request, env: Env, auth: Auth, ctx: Executi
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:complete:${taskId}`, key);
   if (replay) return replay;
-  const timestamp = now();
   const projectId = String(access.row?.board_id);
   const requiresAcceptance = Number(current.require_acceptance ?? 0) === 1;
+  const leaseCondition = leaseOverride
+    ? ""
+    : " AND lease_owner = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?";
+  const leaseValues = leaseOverride ? [] : [owner, timestamp];
   const result = await env.DB.batch([
     requiresAcceptance
       ? env.DB.prepare(
         `UPDATE task_item
          SET acceptance_status = 'submitted', acceptance_agent_id = ?, acceptance_note = ?,
              acceptance_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND (lease_owner = ? OR lease_owner IS NULL)`,
-      ).bind(owner, body.result === undefined ? null : String(body.result), timestamp, timestamp, taskId, projectId, owner)
+         WHERE id = ? AND board_id = ? AND deleted_at IS NULL${leaseCondition}`,
+      ).bind(owner, body.result === undefined ? null : String(body.result), timestamp, timestamp, taskId, projectId, ...leaseValues)
       : env.DB.prepare(
-        "UPDATE task_item SET phase = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND (lease_owner = ? OR lease_owner IS NULL)",
-      ).bind(timestamp, taskId, projectId, owner),
+        `UPDATE task_item SET phase = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND deleted_at IS NULL${leaseCondition}`,
+      ).bind(timestamp, taskId, projectId, ...leaseValues),
     conditionalEvent(
       env.DB,
       taskId,
@@ -820,16 +963,33 @@ async function dependencies(request: Request, env: Env, auth: Auth, taskId: stri
   const body = await parseBody(request);
   const ids = Array.isArray(body.depends_on) ? body.depends_on.map(String) : [];
   if (ids.includes(taskId)) return json({ error: "dependency cycle" }, 422);
+  const projectId = String(access.row?.board_id);
   const placeholders = ids.map(() => "?").join(",") || "NULL";
   const existing = ids.length
     ? await env.DB.prepare(`SELECT id, board_id FROM task_item WHERE id IN (${placeholders}) AND deleted_at IS NULL`).bind(...ids).all<{ id: string; board_id: string }>()
     : { results: [] };
   if (existing.results.length !== ids.length) return json({ error: "dependency task not found" }, 422);
-  if (!isAdmin(auth) && existing.results.some((row) => row.board_id !== auth.projectId)) {
+  if (existing.results.some((row) => row.board_id !== projectId)) {
     return json({ error: "dependency belongs to another project" }, 403);
   }
+  const projectTasks = await env.DB.prepare(
+    "SELECT id FROM task_item WHERE board_id = ? AND deleted_at IS NULL",
+  ).bind(projectId).all<{ id: string }>();
+  const dependencyRows = await env.DB.prepare(
+    `SELECT d.task_id, d.depends_on_id
+     FROM task_dependency d
+     JOIN task_item t ON t.id = d.task_id
+     WHERE t.board_id = ? AND t.deleted_at IS NULL`,
+  ).bind(projectId).all<{ task_id: string; depends_on_id: string }>();
+  const graph = new Map<string, string[]>(
+    projectTasks.results.map((row) => [row.id, []]),
+  );
+  for (const row of dependencyRows.results) {
+    graph.set(row.task_id, [...(graph.get(row.task_id) ?? []), row.depends_on_id]);
+  }
+  graph.set(taskId, ids);
+  if (dependencyGraphHasCycle(graph)) return json({ error: "dependency cycle" }, 422);
   const timestamp = now();
-  const projectId = String(access.row?.board_id);
   const statements: D1PreparedStatement[] = [
     env.DB.prepare("DELETE FROM task_dependency WHERE task_id = ?").bind(taskId),
     ...ids.map((dependencyId) => env.DB.prepare("INSERT INTO task_dependency(task_id, depends_on_id) VALUES (?, ?)").bind(taskId, dependencyId)),
@@ -1434,7 +1594,9 @@ async function claim(id){result(await api('/tasks/'+id+'/claim',{method:'POST',b
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/health") return json({ ok: true, service: "coord-board" });
+    if (url.pathname === "/health" || url.pathname === "/api/health") {
+      return json({ ok: true, service: "coord-board" });
+    }
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -1449,11 +1611,12 @@ export default {
       return json({ error: "unauthorized" }, 401);
     }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);
-    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events))?)?$/);
+    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|renew|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];
       const action = taskMatch[2];
       if (action === "claim" && taskId) return claimTask(request, env, auth, ctx, taskId);
+      if (action === "renew" && taskId && request.method === "POST") return renewTask(request, env, auth, ctx, taskId);
       if (action === "release" && taskId) return releaseTask(request, env, auth, taskId);
       if (action === "reassign" && taskId && request.method === "POST") return reassignTask(request, env, auth, taskId);
       if (action === "complete" && taskId) return completeTask(request, env, auth, ctx, taskId);
