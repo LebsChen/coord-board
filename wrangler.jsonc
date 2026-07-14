@@ -4,6 +4,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-01-01",
   "workers_dev": true,
+  "vars": {
+    "BOARD_BASE_URL": "https://coord-board.ideading.workers.dev"
+  },
   "d1_databases": [
     {
       "binding": "DB",

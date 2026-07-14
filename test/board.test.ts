@@ -1,5 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import worker from "../src/index";
 
 const request = (path: string, init: RequestInit = {}, token = "test-token") =>
   new Request(`https://coord-board.test${path}`, {
@@ -23,6 +24,198 @@ describe("coord board", () => {
       const result = await call("/api/board/agents", { method: "POST", body: JSON.stringify({ id, name: id }) });
       expect(result.response.status).toBe(201);
     }
+  });
+
+  it("encrypts backup credentials and exposes metadata only", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "backup-project", name: "Backup Project" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    const stored = await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "backup-project",
+        id: "backup-a",
+        role_tag: "开发",
+        label: "Backup A",
+        org_id: "org-backup",
+        credential_type: "service_user",
+        credential: "cog_secret_for_test",
+      }),
+    });
+    expect(stored.response.status).toBe(200);
+    expect(JSON.stringify(stored.body)).not.toContain("cog_secret_for_test");
+    const row = await env.DB.prepare(
+      "SELECT credential_ciphertext, credential_iv FROM backup_account WHERE id = ?",
+    ).bind("backup-a").first<{ credential_ciphertext: string; credential_iv: string }>();
+    expect(row?.credential_ciphertext).toBeTruthy();
+    expect(row?.credential_ciphertext).not.toBe("cog_secret_for_test");
+    const rawKey = new Uint8Array(32);
+    const key = await crypto.subtle.importKey("raw", rawKey.buffer, { name: "AES-GCM" }, false, ["decrypt"]);
+    const decode = (value: string) => Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: decode(row!.credential_iv).buffer },
+      key,
+      decode(row!.credential_ciphertext).buffer,
+    );
+    expect(new TextDecoder().decode(plaintext)).toBe("cog_secret_for_test");
+    const listed = await call("/api/board/backup-accounts?project=backup-project");
+    expect(listed.response.status).toBe(200);
+    expect(JSON.stringify(listed.body)).not.toContain("cog_secret_for_test");
+    expect(listed.body.backup_accounts[0]).toMatchObject({
+      id: "backup-a",
+      role_tag: "开发",
+      org_id: "org-backup",
+    });
+  });
+
+  it("reserves a backup account atomically for one concurrent failover", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "reservation-project", name: "Reservation Project" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "reservation-project",
+        id: "reservation-a",
+        role_tag: "worker",
+        org_id: "org-reservation",
+        credential: "api-secret-reservation",
+      }),
+    });
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "reservation-project", failover_enabled: true }),
+    });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "reservation-agent", project_id: "reservation-project", name: "Reservation Agent", role: "worker" }),
+    });
+    expect(agent.response.status).toBe(201);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "reservation-project", title: "Reservation Task", assignee_agent_id: "reservation-agent" }),
+    });
+    await env.DB.prepare(
+      "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ?, lease_generation = 2 WHERE id = ?",
+    ).bind("reservation-agent", "2099-01-01T00:00:00.000Z", task.body.id).run();
+    await env.DB.prepare("UPDATE agent SET last_seen_at = ?, status = 'online' WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "reservation-agent").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ session_id: "devin-reservation" }), { status: 200 }),
+    );
+    await Promise.all([
+      worker.scheduled({} as ScheduledEvent, env),
+      worker.scheduled({} as ScheduledEvent, env),
+    ]);
+    fetchMock.mockRestore();
+    const accounts = await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?")
+      .bind("reservation-a").first<{ status: string }>();
+    const replacements = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id <> ?",
+    ).bind("reservation-project", "reservation-agent").first<{ count: number }>();
+    expect(accounts?.status).toBe("active");
+    expect(Number(replacements?.count)).toBe(1);
+  });
+
+  it("leaves disabled failover unchanged and replaces one stale agent when enabled", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "failover-project", name: "Failover Project" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "failover-project",
+        id: "failover-a",
+        role_tag: "worker",
+        org_id: "org-failover",
+        credential: "api-secret-failover",
+      }),
+    });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "failover-agent", project_id: "failover-project", name: "Failover Agent", role: "worker" }),
+    });
+    expect(agent.response.status).toBe(201);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "failover-project", title: "Failover Task", assignee_agent_id: "failover-agent" }),
+    });
+    await env.DB.prepare(
+      "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ?, lease_generation = 4 WHERE id = ?",
+    ).bind("failover-agent", "2099-01-01T00:00:00.000Z", task.body.id).run();
+    await env.DB.prepare("UPDATE agent SET last_seen_at = ?, status = 'online' WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "failover-agent").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ session_id: "devin-failover" }), { status: 200 }),
+    );
+    await worker.scheduled({} as ScheduledEvent, env);
+    expect((await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?").bind("failover-a").first<{ status: string }>())?.status).toBe("idle");
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "failover-project", failover_enabled: true, cooldown_seconds: 60 }),
+    });
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    const oldAgent = await env.DB.prepare("SELECT status, token_revoked_at FROM agent WHERE id = ?")
+      .bind("failover-agent").first<{ status: string; token_revoked_at: string | null }>();
+    const updatedTask = await env.DB.prepare("SELECT lease_generation, lease_owner FROM task_item WHERE id = ?")
+      .bind(task.body.id).first<{ lease_generation: number; lease_owner: string | null }>();
+    const replacement = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id <> ?",
+    ).bind("failover-project", "failover-agent").first<{ count: number }>();
+    expect(oldAgent?.status).toBe("shutdown");
+    expect(oldAgent?.token_revoked_at).toBeTruthy();
+    expect(updatedTask?.lease_generation).toBe(5);
+    expect(updatedTask?.lease_owner).toBeNull();
+    expect(Number(replacement?.count)).toBe(1);
+    expect((await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?").bind("failover-a").first<{ status: string }>())?.status).toBe("active");
+  });
+
+  it("releases a reserved account when Devin session creation fails", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "failure-project", name: "Failure Project" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "failure-project",
+        id: "failure-a",
+        role_tag: "worker",
+        org_id: "org-failure",
+        credential: "api-secret-failure",
+      }),
+    });
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "failure-project", failover_enabled: true }),
+    });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "failure-agent", project_id: "failure-project", name: "Failure Agent", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "failure-project", title: "Failure Task", assignee_agent_id: "failure-agent" }),
+    });
+    await env.DB.prepare(
+      "UPDATE task_item SET phase = 'in_progress', lease_owner = ? WHERE id = ?",
+    ).bind("failure-agent", task.body.id).run();
+    await env.DB.prepare("UPDATE agent SET last_seen_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "failure-agent").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("nope", { status: 503 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    expect((await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?").bind("failure-a").first<{ status: string }>())?.status).toBe("idle");
+    expect((await env.DB.prepare("SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id LIKE 'failover-%'")
+      .bind("failure-project").first<{ count: number }>())?.count).toBe(0);
   });
 
   it("atomically permits one claimant", async () => {
