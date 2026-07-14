@@ -179,7 +179,13 @@ Leader/admin controls include:
 - `POST /api/board/tasks/:id/release` — workers release their own lease; leads/admins may provide `{ "agent_id": "teammate-id" }` to force-release that teammate's lease.
 - `POST /api/board/agents/:id/shutdown` — force-shutdown an agent in the leader's project and release its leases.
 
-The root board at `/?project=<project-id>` is a unified dashboard showing agents, current work, task controls, gate state, and dead letters. It preserves the session-storage token flow and never places tokens in URLs. Control buttons remain visible to non-leaders but receive the normal capability `403` response.
+The root board at `/?project=<project-id>` is a unified dashboard showing agents, current work, task controls, gate state, and dead letters. For a convenient authenticated share link, append the token in the URL fragment (never the query string):
+
+```text
+/?project=<project-id>#token=<url-encoded-token>
+```
+
+`#tkn=<url-encoded-token>` is accepted as an alias. The page stores the fragment token in `sessionStorage` and immediately removes the fragment from the address bar and browser history with `history.replaceState`; fragments are not sent to the Worker or written to Cloudflare request logs. Manual password entry and the existing session-storage flow continue to work when no fragment token is present. The security tradeoff remains important: anyone who obtains the share link can use the token until it is rotated, so treat these links as sensitive and prefer rotation after sharing. Control buttons remain visible to non-leaders but receive the normal capability `403` response.
 
 ## Mailbox
 
@@ -275,7 +281,7 @@ Management, review, and verification authorization is checked before any mutatio
 
 ## Browser UI
 
-Open the deployed Worker root URL in a browser. Enter the bearer token into the password form; the UI keeps it in `sessionStorage` and never puts it in a URL. The page can list, create, claim, and complete tasks.
+Open the deployed Worker root URL in a browser. Enter the bearer token into the password form, or use a sensitive share link such as `/?project=<project-id>#token=<url-encoded-token>`. The page keeps the token in `sessionStorage` and immediately strips the fragment from the visible URL/history. Fragments avoid server-log exposure, but possession of the link grants access until the token is rotated. The page can list, create, claim, and complete tasks.
 
 ## Project layout
 

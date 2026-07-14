@@ -820,4 +820,15 @@ describe("coord board", () => {
     expect((await call(`/api/board/tasks/${releasableId}`, {}, developerToken)).body.lease_owner).toBeNull();
     expect((await call(`/api/board/team?project=team-project-b`, {}, otherToken)).response.status).toBe(200);
   });
+
+  it("serves fragment-token bootstrap without exposing it to the request", async () => {
+    const response = await SELF.fetch(new Request("https://coord-board.test/?project=fragment-project"));
+    expect(response.status).toBe(200);
+    const page = await response.text();
+    expect(page).toContain("location.hash");
+    expect(page).toContain("sharedParams.get('token')");
+    expect(page).toContain("sharedParams.get('tkn')");
+    expect(page).toContain("history.replaceState");
+    expect(page).toContain("sessionStorage.setItem('coord-board-token',sharedToken)");
+  });
 });
