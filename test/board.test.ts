@@ -1355,4 +1355,109 @@ describe("coord board", () => {
     expect(leadBriefing.body.briefing_markdown).toContain("POST /api/board/agents/:id/shutdown");
     expect(leadBriefing.body.briefing_markdown).not.toContain(leadToken);
   });
+
+  it("atomically claims accounts across owners, refreshes idempotently, and releases by project", async () => {
+    for (const id of ["claims-project", "claims-other-project"]) {
+      const project = await call("/api/board/projects", {
+        method: "POST",
+        body: JSON.stringify({ id, name: id }),
+      });
+      expect([201, 409]).toContain(project.response.status);
+    }
+    const requests = await Promise.all([
+      call("/api/board/account-claims", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "claims-project",
+          claimed_by: "spawner-a",
+          ttl_seconds: 300,
+          accounts: [{ account_ref: "account-1", role_tag: "开发" }],
+        }),
+      }),
+      call("/api/board/account-claims", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "claims-project",
+          claimed_by: "spawner-b",
+          accounts: [{ account_ref: "account-1", role_tag: "开发" }],
+        }),
+      }),
+    ]);
+    expect(requests.every((result) => result.response.status === 200)).toBe(true);
+    expect(requests.filter((result) => result.body.claims[0].granted).length).toBe(1);
+
+    const refresh = await call("/api/board/account-claims", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "claims-project",
+        claimed_by: "spawner-a",
+        accounts: [{ account_ref: "account-1", role_tag: "测试" }],
+      }),
+    });
+    expect(refresh.response.status).toBe(200);
+    expect(refresh.body.claims[0]).toMatchObject({ account_ref: "account-1", role_tag: "测试", granted: true });
+    const refreshedRow = await env.DB.prepare(
+      "SELECT claimed_by, role_tag, status FROM account_claim WHERE project_id = ? AND account_ref = ?",
+    ).bind("claims-project", "account-1").first<{ claimed_by: string; role_tag: string; status: string }>();
+    expect(refreshedRow).toEqual({ claimed_by: "spawner-a", role_tag: "测试", status: "claimed" });
+
+    await env.DB.prepare(
+      "UPDATE account_claim SET expires_at = ? WHERE project_id = ? AND account_ref = ?",
+    ).bind("2000-01-01T00:00:00.000Z", "claims-project", "account-1").run();
+    const afterExpiry = await call("/api/board/account-claims", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "claims-project",
+        claimed_by: "spawner-b",
+        accounts: [{ account_ref: "account-1", role_tag: "开发" }],
+      }),
+    });
+    expect(afterExpiry.body.claims[0].granted).toBe(true);
+
+    const otherProject = await call("/api/board/account-claims", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "claims-other-project",
+        claimed_by: "spawner-a",
+        accounts: [{ account_ref: "account-1", role_tag: "开发" }],
+      }),
+    });
+    expect(otherProject.body.claims[0].granted).toBe(true);
+    const released = await call("/api/board/account-claims/release", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "claims-project",
+        claimed_by: "spawner-b",
+        account_refs: ["account-1"],
+      }),
+    });
+    expect(released.body.released).toBe(1);
+    expect((await call("/api/board/account-claims?project=claims-other-project")).body.claims).toHaveLength(1);
+  });
+
+  it("requires manage capability and does not mutate denied account claims", async () => {
+    const worker = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "claims-worker",
+        project_id: "default",
+        name: "Claims Worker",
+        role: "worker",
+      }),
+    });
+    expect(worker.response.status).toBe(201);
+    expect(worker.body.token).toBeTruthy();
+    const denied = await call("/api/board/account-claims", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "claims-project",
+        claimed_by: "spawner-denied",
+        accounts: [{ account_ref: "account-denied", role_tag: "开发" }],
+      }),
+    }, String(worker.body.token));
+    expect(denied.response.status).toBe(403);
+    expect((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM account_claim WHERE project_id = ? AND account_ref = ?",
+    ).bind("claims-project", "account-denied").first<{ count: number }>())?.count).toBe(0);
+  });
 });

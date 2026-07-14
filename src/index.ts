@@ -35,6 +35,10 @@ const BACKUP_ACCOUNT_KEY_VERSION = "v1";
 const DEFAULT_FAILOVER_MAX_REPLACEMENTS = 4;
 const DEFAULT_FAILOVER_COOLDOWN_SECONDS = 15 * 60;
 const DEFAULT_FAILOVER_STALE_GRACE_SECONDS = 10 * 60;
+const DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS = 5 * 60;
+const MIN_ACCOUNT_CLAIM_TTL_SECONDS = 30;
+const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
+const MAX_ACCOUNT_CLAIMS_PER_REQUEST = 100;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -629,6 +633,9 @@ async function sweepLeases(db: D1Database, env?: Env): Promise<void> {
   await db.prepare(
     "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE status = 'reserved' AND updated_at <= ?",
   ).bind(timestamp, new Date(Date.now() - 10 * 60 * 1000).toISOString()).run().catch(() => undefined);
+  await db.prepare(
+    "UPDATE account_claim SET status = 'released', expires_at = ? WHERE status = 'claimed' AND expires_at <= ?",
+  ).bind(timestamp, timestamp).run().catch(() => undefined);
   if (env) await runCloudFailover(db, env, timestamp);
   await db.prepare(
     "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= ? AND phase = 'in_progress'",
@@ -1977,6 +1984,120 @@ function boundedFailoverNumber(value: unknown, fallback: number, min: number, ma
   return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.floor(parsed))) : fallback;
 }
 
+function accountClaimTtlSeconds(value: unknown): number {
+  return boundedFailoverNumber(
+    value,
+    DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS,
+    MIN_ACCOUNT_CLAIM_TTL_SECONDS,
+    MAX_ACCOUNT_CLAIM_TTL_SECONDS,
+  );
+}
+
+async function claimAccount(
+  db: D1Database,
+  projectId: string,
+  accountRef: string,
+  roleTag: string,
+  claimedBy: string,
+  claimedAt: string,
+  expiresAt: string,
+): Promise<boolean> {
+  const inserted = await db.prepare(
+    `INSERT OR IGNORE INTO account_claim(
+       project_id, account_ref, role_tag, claimed_by, status, claimed_at, expires_at
+     ) VALUES (?, ?, ?, ?, 'claimed', ?, ?)`,
+  ).bind(projectId, accountRef, roleTag, claimedBy, claimedAt, expiresAt).run();
+  if ((inserted.meta.changes ?? 0) === 1) return true;
+  const refreshed = await db.prepare(
+    `UPDATE account_claim
+     SET role_tag = ?, claimed_by = ?, status = 'claimed', claimed_at = ?, expires_at = ?
+     WHERE project_id = ? AND account_ref = ?
+       AND (status <> 'claimed' OR expires_at <= ? OR claimed_by = ?)`,
+  ).bind(roleTag, claimedBy, claimedAt, expiresAt, projectId, accountRef, claimedAt, claimedBy).run();
+  return (refreshed.meta.changes ?? 0) === 1;
+}
+
+async function accountClaims(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  const url = new URL(request.url);
+  const body = request.method === "POST" ? await parseBody(request) : {};
+  const projectId = backupProjectId(request, body, auth);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 404);
+  const timestamp = now();
+
+  if (request.method === "GET") {
+    await env.DB.prepare(
+      "UPDATE account_claim SET status = 'released', expires_at = ? WHERE project_id = ? AND status = 'claimed' AND expires_at <= ?",
+    ).bind(timestamp, projectId, timestamp).run();
+    const rows = await env.DB.prepare(
+      `SELECT account_ref, role_tag, claimed_by, claimed_at, expires_at
+       FROM account_claim
+       WHERE project_id = ? AND status = 'claimed' AND expires_at > ?
+       ORDER BY account_ref`,
+    ).bind(projectId, timestamp).all<Record<string, unknown>>();
+    return json({
+      project_id: projectId,
+      claims: rows.results.map((row) => ({
+        account_ref: String(row.account_ref),
+        role_tag: String(row.role_tag),
+        claimed_by: String(row.claimed_by),
+        claimed_at: String(row.claimed_at),
+        expires_at: String(row.expires_at),
+      })),
+    });
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/release")) {
+    const claimedBy = typeof body.claimed_by === "string" ? body.claimed_by.trim() : "";
+    const accountRefs = Array.isArray(body.account_refs)
+      ? [...new Set(body.account_refs.map(String).map((value) => value.trim()).filter(Boolean))]
+      : [];
+    if (!claimedBy) return json({ error: "claimed_by is required" }, 400);
+    if (accountRefs.length > MAX_ACCOUNT_CLAIMS_PER_REQUEST) {
+      return json({ error: `at most ${MAX_ACCOUNT_CLAIMS_PER_REQUEST} account claims may be released at once` }, 400);
+    }
+    const result = accountRefs.length === 0
+      ? await env.DB.prepare(
+        "UPDATE account_claim SET status = 'released', expires_at = ? WHERE project_id = ? AND claimed_by = ? AND status = 'claimed'",
+      ).bind(timestamp, projectId, claimedBy).run()
+      : await env.DB.prepare(
+        `UPDATE account_claim SET status = 'released', expires_at = ?
+         WHERE project_id = ? AND claimed_by = ? AND status = 'claimed'
+           AND account_ref IN (${accountRefs.map(() => "?").join(",")})`,
+      ).bind(timestamp, projectId, claimedBy, ...accountRefs).run();
+    return json({ project_id: projectId, claimed_by: claimedBy, released: result.meta.changes ?? 0 });
+  }
+
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const claimedBy = typeof body.claimed_by === "string" ? body.claimed_by.trim() : "";
+  const accounts = Array.isArray(body.accounts) ? body.accounts : [];
+  if (!claimedBy) return json({ error: "claimed_by is required" }, 400);
+  if (!accounts.length) return json({ error: "accounts are required" }, 400);
+  if (accounts.length > MAX_ACCOUNT_CLAIMS_PER_REQUEST) {
+    return json({ error: `at most ${MAX_ACCOUNT_CLAIMS_PER_REQUEST} account claims may be requested at once` }, 400);
+  }
+  const ttlSeconds = accountClaimTtlSeconds(body.ttl_seconds);
+  const expiresAt = new Date(Date.parse(timestamp) + ttlSeconds * 1000).toISOString();
+  const seen = new Set<string>();
+  const claims: Array<{ account_ref: string; role_tag: string; granted: boolean; expires_at: string | null }> = [];
+  for (const entry of accounts) {
+    if (!entry || typeof entry !== "object") return json({ error: "each account claim must be an object" }, 400);
+    const item = entry as Json;
+    const accountRef = typeof item.account_ref === "string" ? item.account_ref.trim() : "";
+    const roleTag = typeof item.role_tag === "string" ? item.role_tag.trim() : "";
+    if (!accountRef || !roleTag) return json({ error: "account_ref and role_tag are required" }, 400);
+    if (accountRef.length > 256 || roleTag.length > 128) return json({ error: "account_ref or role_tag is too long" }, 400);
+    if (seen.has(accountRef)) continue;
+    seen.add(accountRef);
+    const granted = await claimAccount(env.DB, projectId, accountRef, roleTag, claimedBy, timestamp, expiresAt);
+    claims.push({ account_ref: accountRef, role_tag: roleTag, granted, expires_at: granted ? expiresAt : null });
+  }
+  return json({ project_id: projectId, claimed_by: claimedBy, ttl_seconds: ttlSeconds, claims });
+}
+
 async function failoverConfig(request: Request, env: Env, auth: Auth): Promise<Response> {
   const body = request.method === "POST" ? await parseBody(request) : {};
   const projectId = backupProjectId(request, body, auth);
@@ -2271,6 +2392,9 @@ export default {
     if (url.pathname === "/api/board/share-token") return issueShareToken(request, env, auth);
     if (url.pathname === "/api/board/backup-accounts" || url.pathname.startsWith("/api/board/backup-accounts/")) {
       return backupAccounts(request, env, auth);
+    }
+    if (url.pathname === "/api/board/account-claims" || url.pathname === "/api/board/account-claims/release") {
+      return accountClaims(request, env, auth);
     }
     if (url.pathname === "/api/board/failover-config") return failoverConfig(request, env, auth);
     if (url.pathname === "/api/board/team" && request.method === "GET") return teamSnapshot(request, env, auth);
