@@ -5,7 +5,7 @@ export interface Env {
 
 type Phase = "pending" | "ready" | "in_progress" | "done";
 type Json = Record<string, unknown>;
-type Capability = "manage" | "claim" | "release" | "complete" | "review" | "verify";
+type Capability = "manage" | "claim" | "release" | "complete" | "review" | "verify" | "plan_submit" | "plan_review" | "accept";
 type Decision = "allow" | "ask" | "deny";
 type TaskRow = Record<string, unknown>;
 type MailboxStatus = "unread" | "seen" | "acked" | "nacked" | "dead";
@@ -13,13 +13,15 @@ type Auth =
   | { kind: "admin"; agentId: string | null }
   | { kind: "agent"; agentId: string; projectId: string; role: string };
 
-const ALL_CAPABILITIES: readonly Capability[] = ["manage", "claim", "release", "complete", "review", "verify"];
+const ALL_CAPABILITIES: readonly Capability[] = [
+  "manage", "claim", "release", "complete", "review", "verify", "plan_submit", "plan_review", "accept",
+];
 const ROLE_CAPABILITY_DEFAULTS: Record<string, readonly Capability[]> = {
   lead: ALL_CAPABILITIES,
-  developer: ["claim", "release", "complete"],
-  reviewer: ["claim", "release", "complete", "review"],
-  tester: ["claim", "release", "complete", "verify"],
-  worker: ["claim", "release", "complete"],
+  developer: ["claim", "release", "complete", "plan_submit"],
+  reviewer: ["claim", "release", "complete", "review", "plan_submit"],
+  tester: ["claim", "release", "complete", "verify", "plan_submit"],
+  worker: ["claim", "release", "complete", "plan_submit"],
 };
 const MAILBOX_MAX_ATTEMPTS = 3;
 
@@ -40,6 +42,10 @@ const parseBody = async (request: Request): Promise<Json> => {
     return {};
   }
 };
+
+function flag(value: unknown): number {
+  return value === true || value === 1 || value === "1" || value === "true" ? 1 : 0;
+}
 
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -248,12 +254,27 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const taskIdNew = id();
     const timestamp = now();
     const phase: Phase = body.phase === "ready" ? "ready" : "pending";
+    const requirePlan = flag(body.require_plan);
+    const requireAcceptance = flag(body.require_acceptance);
     const responseBody = {
       id: taskIdNew,
       board_id: boardId,
       title: String(body.title || "").trim(),
       description: String(body.description || ""),
       phase,
+      require_plan: requirePlan,
+      require_acceptance: requireAcceptance,
+      plan_text: null,
+      plan_status: null,
+      plan_agent_id: null,
+      plan_submitted_at: null,
+      plan_reviewed_by: null,
+      plan_review_note: null,
+      plan_reviewed_at: null,
+      acceptance_status: null,
+      acceptance_agent_id: null,
+      acceptance_note: null,
+      acceptance_at: null,
       priority: Number(body.priority ?? 5),
       assignee_agent_id: assignee,
       sort_order: Number(body.sort_order ?? 0),
@@ -264,8 +285,15 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     if (!responseBody.title) return json({ error: "title is required" }, 400);
     await db.batch([
       db.prepare(
-        "INSERT INTO task_item(id, board_id, title, description, phase, priority, assignee_agent_id, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(taskIdNew, responseBody.board_id, responseBody.title, responseBody.description, phase, responseBody.priority, responseBody.assignee_agent_id, responseBody.sort_order, timestamp, timestamp),
+        `INSERT INTO task_item(
+          id, board_id, title, description, phase, require_plan, require_acceptance, priority,
+          assignee_agent_id, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        taskIdNew, responseBody.board_id, responseBody.title, responseBody.description, phase,
+        requirePlan, requireAcceptance, responseBody.priority, responseBody.assignee_agent_id,
+        responseBody.sort_order, timestamp, timestamp,
+      ),
       event(db, taskIdNew, "created", actor(auth), { title: responseBody.title }),
     ]);
     return saveIdempotentResponse(db, `task:create:${boardId}`, key, json(responseBody, 201));
@@ -290,15 +318,22 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const description = body.description === undefined ? current.description : String(body.description);
     const priority = body.priority === undefined ? current.priority : Number(body.priority);
     const phase = body.phase === undefined ? current.phase : String(body.phase);
+    const requirePlan = body.require_plan === undefined ? Number(current.require_plan ?? 0) : flag(body.require_plan);
+    const requireAcceptance = body.require_acceptance === undefined ? Number(current.require_acceptance ?? 0) : flag(body.require_acceptance);
     if (!["pending", "ready", "in_progress", "done"].includes(String(phase))) {
       return json({ error: "invalid phase" }, 422);
     }
+    if (requireAcceptance && phase === "done") {
+      return json({ error: "acceptance-required tasks must be accepted before done" }, 422);
+    }
     const timestamp = now();
-    const responseBody = { ...current, title, description, priority, phase, updated_at: timestamp };
+    const responseBody = { ...current, title, description, priority, phase, require_plan: requirePlan, require_acceptance: requireAcceptance, updated_at: timestamp };
     await db.batch([
       db.prepare(
-        "UPDATE task_item SET title = ?, description = ?, priority = ?, phase = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND board_id = ?",
-      ).bind(title, description, priority, phase, timestamp, taskId, String(current.board_id)),
+        `UPDATE task_item
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase }),
     ]);
     return saveIdempotentResponse(db, `task:update:${taskId}`, key, json(await taskView(db, responseBody)));
@@ -411,20 +446,153 @@ async function completeTask(request: Request, env: Env, auth: Auth, taskId: stri
   const identityError = checkAgentIdentity(body, auth);
   if (identityError) return identityError;
   const owner = bodyAgent(body, auth);
+  const current = access.row as Record<string, unknown>;
+  if (Number(current.require_plan ?? 0) === 1 && current.plan_status !== "approved") {
+    return json({ error: "plan approval required before completion" }, 409);
+  }
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:complete:${taskId}`, key);
   if (replay) return replay;
   const timestamp = now();
   const projectId = String(access.row?.board_id);
+  const requiresAcceptance = Number(current.require_acceptance ?? 0) === 1;
   const result = await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE task_item SET phase = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND (lease_owner = ? OR lease_owner IS NULL)",
-    ).bind(timestamp, taskId, projectId, owner),
-    conditionalEvent(env.DB, taskId, "completed", owner, { result: body.result ?? null, project_id: projectId }, "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND phase = 'done' AND updated_at = ?)", [taskId, projectId, timestamp]),
+    requiresAcceptance
+      ? env.DB.prepare(
+        `UPDATE task_item
+         SET acceptance_status = 'submitted', acceptance_agent_id = ?, acceptance_note = ?,
+             acceptance_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND (lease_owner = ? OR lease_owner IS NULL)`,
+      ).bind(owner, body.result === undefined ? null : String(body.result), timestamp, timestamp, taskId, projectId, owner)
+      : env.DB.prepare(
+        "UPDATE task_item SET phase = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND (lease_owner = ? OR lease_owner IS NULL)",
+      ).bind(timestamp, taskId, projectId, owner),
+    conditionalEvent(
+      env.DB,
+      taskId,
+      requiresAcceptance ? "completion_submitted" : "completed",
+      owner,
+      { result: body.result ?? null, project_id: projectId, acceptance_required: requiresAcceptance },
+      requiresAcceptance
+        ? "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND acceptance_status = 'submitted' AND updated_at = ?)"
+        : "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND phase = 'done' AND updated_at = ?)",
+      [taskId, projectId, timestamp],
+    ),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "task not found or lease not owned" }, 409);
   const completed = await task(env.DB, taskId);
   return saveIdempotentResponse(env.DB, `task:complete:${taskId}`, key, json(await taskView(env.DB, completed as Record<string, unknown>)));
+}
+
+async function submitPlan(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "plan_submit", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const identityError = checkAgentIdentity(body, auth);
+  if (identityError) return identityError;
+  const plan = typeof body.plan === "string" ? body.plan.trim() : "";
+  if (!plan) return json({ error: "plan is required" }, 400);
+  const current = access.row as Record<string, unknown>;
+  const owner = bodyAgent(body, auth);
+  const timestamp = now();
+  const projectId = String(current.board_id);
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE task_item
+       SET plan_text = ?, plan_status = 'submitted', plan_agent_id = ?,
+           plan_submitted_at = ?, plan_reviewed_by = NULL, plan_review_note = NULL,
+           plan_reviewed_at = NULL, updated_at = ?
+       WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND phase = 'in_progress'
+         AND lease_owner = ? AND (lease_expires_at IS NULL OR lease_expires_at > ?)`,
+    ).bind(plan, owner, timestamp, timestamp, taskId, projectId, owner, timestamp),
+    conditionalEvent(
+      env.DB,
+      taskId,
+      "plan_submitted",
+      actor(auth),
+      { project_id: projectId },
+      "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND plan_status = 'submitted' AND updated_at = ?)",
+      [taskId, projectId, timestamp],
+    ),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) {
+    return json({ error: "plan requires an active lease owned by the submitting agent" }, 409);
+  }
+  return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
+}
+
+async function reviewPlan(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "plan_review", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const decision = body.decision === "approve" || body.decision === "reject" ? body.decision : null;
+  if (!decision) return json({ error: "decision must be approve or reject" }, 400);
+  const current = access.row as Record<string, unknown>;
+  if (current.plan_status !== "submitted") return json({ error: "plan is not awaiting review" }, 409);
+  const note = body.note === undefined ? null : String(body.note);
+  const timestamp = now();
+  const projectId = String(current.board_id);
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE task_item
+       SET plan_status = ?, plan_reviewed_by = ?, plan_review_note = ?, plan_reviewed_at = ?, updated_at = ?
+       WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND plan_status = 'submitted'`,
+    ).bind(decision === "approve" ? "approved" : "rejected", actor(auth), note, timestamp, timestamp, taskId, projectId),
+    conditionalEvent(
+      env.DB,
+      taskId,
+      "plan_reviewed",
+      actor(auth),
+      { decision, note, project_id: projectId },
+      "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND updated_at = ?)",
+      [taskId, projectId, timestamp],
+    ),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "plan changed; retry" }, 409);
+  return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
+}
+
+async function acceptance(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "accept", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const decision = body.decision === "accept" || body.decision === "reject" ? body.decision : null;
+  if (!decision) return json({ error: "decision must be accept or reject" }, 400);
+  const current = access.row as Record<string, unknown>;
+  if (Number(current.require_acceptance ?? 0) !== 1) return json({ error: "acceptance is not required for this task" }, 422);
+  if (current.acceptance_status !== "submitted") return json({ error: "task is not awaiting acceptance" }, 409);
+  const note = body.note === undefined ? null : String(body.note);
+  const timestamp = now();
+  const projectId = String(current.board_id);
+  const accepted = decision === "accept";
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE task_item
+       SET phase = ?, acceptance_status = ?, acceptance_agent_id = ?, acceptance_note = ?,
+           acceptance_at = ?, updated_at = ?
+       WHERE id = ? AND board_id = ? AND deleted_at IS NULL
+         AND require_acceptance = 1 AND acceptance_status = 'submitted' AND phase = 'in_progress'`,
+    ).bind(accepted ? "done" : "in_progress", accepted ? "accepted" : "rejected", actor(auth), note, timestamp, timestamp, taskId, projectId),
+    conditionalEvent(
+      env.DB,
+      taskId,
+      accepted ? "accepted" : "acceptance_rejected",
+      actor(auth),
+      { decision, note, project_id: projectId },
+      accepted
+        ? "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND phase = 'done' AND acceptance_status = 'accepted' AND updated_at = ?)"
+        : "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND phase = 'in_progress' AND acceptance_status = 'rejected' AND updated_at = ?)",
+      [taskId, projectId, timestamp],
+    ),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "acceptance changed; retry" }, 409);
+  return json(await taskView(env.DB, await task(env.DB, taskId) as Record<string, unknown>));
 }
 
 async function dependencies(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
@@ -903,7 +1071,7 @@ export default {
       return json({ error: "unauthorized" }, 401);
     }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth);
-    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|dependencies|events))?)?$/);
+    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|release|complete|review|verify|plan|plan-review|acceptance|dependencies|events))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];
       const action = taskMatch[2];
@@ -912,6 +1080,9 @@ export default {
       if (action === "complete" && taskId) return completeTask(request, env, auth, taskId);
       if (action === "review" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "review");
       if (action === "verify" && taskId && request.method === "POST") return assessTask(request, env, auth, taskId, "verify");
+      if (action === "plan" && taskId && request.method === "POST") return submitPlan(request, env, auth, taskId);
+      if (action === "plan-review" && taskId && request.method === "POST") return reviewPlan(request, env, auth, taskId);
+      if (action === "acceptance" && taskId && request.method === "POST") return acceptance(request, env, auth, taskId);
       if (action === "dependencies" && taskId && request.method === "PUT") return dependencies(request, env, auth, taskId);
       if (action === "events" && taskId && request.method === "GET") {
         const access = await authorizeTask(env.DB, auth, taskId);

@@ -523,4 +523,128 @@ describe("coord board", () => {
     expect(Number(crossRows?.count)).toBe(0);
     void otherToken;
   });
+
+  it("enforces opt-in plan approval and three-layer acceptance before dependency unlock", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase3-project", name: "Phase 3 Project" }),
+    });
+    expect(project.response.status).toBe(201);
+    const developer = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase3-developer", project_id: "phase3-project", name: "Developer", role: "开发" }),
+    });
+    const lead = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "phase3-lead", project_id: "phase3-project", name: "Lead", role: "编排" }),
+    });
+    expect(developer.response.status).toBe(201);
+    expect(lead.response.status).toBe(201);
+    const developerToken = String(developer.body.token);
+    const leadToken = String(lead.body.token);
+
+    const planTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "phase3-project", title: "Plan-gated", require_plan: true }),
+    });
+    const planChild = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "phase3-project", title: "Plan child" }),
+    });
+    await call(`/api/board/tasks/${planChild.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [planTask.body.id] }),
+    });
+    const planTaskId = String(planTask.body.id);
+    const planChildId = String(planChild.body.id);
+    expect((await call(`/api/board/tasks/${planTaskId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    const blockedComplete = await call(`/api/board/tasks/${planTaskId}/complete`, { method: "POST" }, developerToken);
+    expect(blockedComplete.response.status).toBe(409);
+    const stillClaimed = await call(`/api/board/tasks/${planTaskId}`, {}, developerToken);
+    expect(stillClaimed.body.phase).toBe("in_progress");
+    expect(stillClaimed.body.lease_owner).toBe("phase3-developer");
+
+    const deniedPlanReview = await call(`/api/board/tasks/${planTaskId}/plan-review`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "approve" }),
+    }, developerToken);
+    expect(deniedPlanReview.response.status).toBe(403);
+    expect((await call(`/api/board/tasks/${planTaskId}`, {}, developerToken)).body.plan_status).toBeNull();
+
+    const submitted = await call(`/api/board/tasks/${planTaskId}/plan`, {
+      method: "POST",
+      body: JSON.stringify({ plan: "Implement and test the change." }),
+    }, developerToken);
+    expect(submitted.response.status).toBe(200);
+    expect(submitted.body.plan_status).toBe("submitted");
+    const rejected = await call(`/api/board/tasks/${planTaskId}/plan-review`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "reject", note: "Add test coverage." }),
+    }, leadToken);
+    expect(rejected.response.status).toBe(200);
+    expect(rejected.body.plan_status).toBe("rejected");
+    const resubmitted = await call(`/api/board/tasks/${planTaskId}/plan`, {
+      method: "POST",
+      body: JSON.stringify({ plan: "Implement, test, and document the change." }),
+    }, developerToken);
+    expect(resubmitted.response.status).toBe(200);
+    const approved = await call(`/api/board/tasks/${planTaskId}/plan-review`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "approve", note: "Approved." }),
+    }, leadToken);
+    expect(approved.response.status).toBe(200);
+    expect(approved.body.plan_status).toBe("approved");
+    const completed = await call(`/api/board/tasks/${planTaskId}/complete`, { method: "POST" }, developerToken);
+    expect(completed.response.status).toBe(200);
+    expect(completed.body.phase).toBe("done");
+    expect((await call(`/api/board/tasks/${planChildId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+
+    const acceptanceTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "phase3-project", title: "Acceptance-gated", require_acceptance: true }),
+    });
+    const acceptanceChild = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "phase3-project", title: "Acceptance child" }),
+    });
+    await call(`/api/board/tasks/${acceptanceChild.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [acceptanceTask.body.id] }),
+    });
+    const acceptanceTaskId = String(acceptanceTask.body.id);
+    const acceptanceChildId = String(acceptanceChild.body.id);
+    expect((await call(`/api/board/tasks/${acceptanceTaskId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    const submittedCompletion = await call(`/api/board/tasks/${acceptanceTaskId}/complete`, { method: "POST", body: JSON.stringify({ result: "self-reported" }) }, developerToken);
+    expect(submittedCompletion.response.status).toBe(200);
+    expect(submittedCompletion.body.phase).toBe("in_progress");
+    expect(submittedCompletion.body.acceptance_status).toBe("submitted");
+    expect((await call(`/api/board/tasks/${acceptanceChildId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(422);
+
+    const deniedAcceptance = await call(`/api/board/tasks/${acceptanceTaskId}/acceptance`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "accept" }),
+    }, developerToken);
+    expect(deniedAcceptance.response.status).toBe(403);
+    const unchanged = await call(`/api/board/tasks/${acceptanceTaskId}`, {}, developerToken);
+    expect(unchanged.body.phase).toBe("in_progress");
+    expect(unchanged.body.acceptance_status).toBe("submitted");
+
+    const rejectedAcceptance = await call(`/api/board/tasks/${acceptanceTaskId}/acceptance`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "reject", note: "Please revise." }),
+    }, leadToken);
+    expect(rejectedAcceptance.response.status).toBe(200);
+    expect(rejectedAcceptance.body.phase).toBe("in_progress");
+    expect(rejectedAcceptance.body.acceptance_status).toBe("rejected");
+    expect((await call(`/api/board/tasks/${acceptanceTaskId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    expect((await call(`/api/board/tasks/${acceptanceTaskId}/complete`, { method: "POST" }, developerToken)).response.status).toBe(200);
+    const accepted = await call(`/api/board/tasks/${acceptanceTaskId}/acceptance`, {
+      method: "POST",
+      body: JSON.stringify({ decision: "accept", note: "Accepted." }),
+    }, leadToken);
+    expect(accepted.response.status).toBe(200);
+    expect(accepted.body.phase).toBe("done");
+    expect(accepted.body.acceptance_status).toBe("accepted");
+    expect((await call(`/api/board/tasks/${acceptanceChildId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
+  });
 });

@@ -1,0 +1,13 @@
+ALTER TABLE task_item ADD COLUMN require_plan INTEGER NOT NULL DEFAULT 0 CHECK (require_plan IN (0, 1));
+ALTER TABLE task_item ADD COLUMN require_acceptance INTEGER NOT NULL DEFAULT 0 CHECK (require_acceptance IN (0, 1));
+ALTER TABLE task_item ADD COLUMN plan_text TEXT;
+ALTER TABLE task_item ADD COLUMN plan_status TEXT CHECK (plan_status IN ('submitted', 'approved', 'rejected'));
+ALTER TABLE task_item ADD COLUMN plan_agent_id TEXT;
+ALTER TABLE task_item ADD COLUMN plan_submitted_at TEXT;
+ALTER TABLE task_item ADD COLUMN plan_reviewed_by TEXT;
+ALTER TABLE task_item ADD COLUMN plan_review_note TEXT;
+ALTER TABLE task_item ADD COLUMN plan_reviewed_at TEXT;
+ALTER TABLE task_item ADD COLUMN acceptance_status TEXT CHECK (acceptance_status IN ('submitted', 'accepted', 'rejected'));
+ALTER TABLE task_item ADD COLUMN acceptance_agent_id TEXT;
+ALTER TABLE task_item ADD COLUMN acceptance_note TEXT;
+ALTER TABLE task_item ADD COLUMN acceptance_at TEXT;

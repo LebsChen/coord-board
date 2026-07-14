@@ -134,16 +134,26 @@ Authorization uses an explicit capability set:
 
 | Role/token | Capabilities within its project |
 | --- | --- |
-| Admin `BOARD_TOKEN` | `manage`, `claim`, `release`, `complete`, `review`, `verify` across all projects |
-| Lead / orchestrator / `编排` | All six capabilities |
-| Developer / `开发` | `claim`, `release`, `complete` |
-| Reviewer / `审查` | `claim`, `release`, `complete`, `review` |
-| Tester / `测试` | `claim`, `release`, `complete`, `verify` |
-| Other worker roles | `claim`, `release`, `complete` |
+| Admin `BOARD_TOKEN` | All capabilities across all projects |
+| Lead / orchestrator / `编排` | All capabilities within its project |
+| Developer / `开发` | `claim`, `release`, `complete`, `plan_submit` |
+| Reviewer / `审查` | `claim`, `release`, `complete`, `review`, `plan_submit` |
+| Tester / `测试` | `claim`, `release`, `complete`, `verify`, `plan_submit` |
+| Other worker roles | `claim`, `release`, `complete`, `plan_submit` |
 
-The `manage` capability covers task create, update, delete, and dependency changes. Every decision is modeled as `allow`, `ask`, or `deny`, following an OpenOPC-style authorization shape. Currently, role capabilities either allow or deny; no default policy emits `ask` yet. Approval hooks for `ask` decisions are reserved for Phase 3.
+The `manage` capability covers task create, update, delete, and dependency changes. `plan_submit` is available to workers; `plan_review` and `accept` are lead/admin capabilities. Every decision is modeled as `allow`, `ask`, or `deny`, following an OpenOPC-style authorization shape. Currently, role capabilities either allow or deny; no default policy emits `ask` yet. General approval hooks for `ask` decisions remain reserved for future work.
 
 Review and verification are annotations only. `POST /api/board/tasks/:id/review` and `POST /api/board/tasks/:id/verify` accept `{ "decision": "pass"|"reject", "note": "..." }`, record the acting agent in the task fields and `task_event`, and require the task to be `in_progress` or `done`. They do not auto-unlock dependencies or alter completion semantics.
+
+### Plan approval and acceptance
+
+Plan approval and three-layer completion are opt-in per task. Leaders can set `require_plan` and/or `require_acceptance` to `true` when creating or updating a task; both default to `false`, preserving the normal claim → complete flow.
+
+- `POST /api/board/tasks/:id/plan` — a lease-owning worker submits `{ "plan": "..." }`; records `plan_status=submitted`.
+- `POST /api/board/tasks/:id/plan-review` — a lead/admin submits `{ "decision": "approve"|"reject", "note": "..." }`. Rejection lets the worker resubmit. When `require_plan` is enabled, completion returns `409` until the plan is approved.
+- `POST /api/board/tasks/:id/acceptance` — a lead/admin submits `{ "decision": "accept"|"reject", "note": "..." }`. With `require_acceptance`, worker completion records `acceptance_status=submitted` while the phase remains `in_progress`; dependents remain blocked. Acceptance promotes the task to `done`, while rejection returns it to `in_progress` for another attempt.
+
+Dependencies continue to unlock only when the dependency phase is exactly `done`. Self-reported completion never unlocks an acceptance-gated dependent.
 
 ## Mailbox
 
@@ -188,6 +198,9 @@ Send operations accept `Idempotency-Key` and replay the original response withou
 - `POST /api/board/tasks/:id/complete`
 - `POST /api/board/tasks/:id/review`
 - `POST /api/board/tasks/:id/verify`
+- `POST /api/board/tasks/:id/plan`
+- `POST /api/board/tasks/:id/plan-review`
+- `POST /api/board/tasks/:id/acceptance`
 - `GET /api/board/tasks/:id/events`
 
 ### Mailbox
