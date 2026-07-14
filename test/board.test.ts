@@ -1472,6 +1472,58 @@ describe("coord board", () => {
     expect((await call(`/api/board/team?project=team-project-b`, {}, otherToken)).response.status).toBe(200);
   });
 
+  it("serves project events with bounded reads and project-scoped authorization", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "events-project-a", name: "Events A" }),
+    });
+    const otherProject = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "events-project-b", name: "Events B" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    expect([201, 409]).toContain(otherProject.response.status);
+    const eventAgent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "events-agent", project_id: "events-project-a", name: "Events Agent", role: "开发" }),
+    });
+    const eventAgentToken = String(eventAgent.body.token);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "events-project-a", title: "Event task" }),
+    });
+    expect(task.response.status).toBe(201);
+    const eventTaskId = String(task.body.id);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      ).bind("dashboard-agent-event", "events-agent", "events-project-a", "agent_active", JSON.stringify({ source: "dashboard", api_key: "do-not-leak" }), "2099-01-01T00:00:02.000Z"),
+      env.DB.prepare(
+        "INSERT INTO task_event(id, task_id, actor_agent_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      ).bind("dashboard-task-event", eventTaskId, "events-agent", "updated", JSON.stringify({ title: "safe summary" }), "2099-01-01T00:00:01.000Z"),
+    ]);
+    const events = await call("/api/board/events?project=events-project-a&limit=1", {}, "test-token");
+    expect(events.response.status).toBe(200);
+    expect(events.body.project_id).toBe("events-project-a");
+    expect(events.body.events).toHaveLength(1);
+    expect(events.body.events[0]).toMatchObject({ type: "agent_active", agent_id: "events-agent", task_id: null });
+    expect(events.body.events[0].payload_summary).toContain("dashboard");
+    expect(JSON.stringify(events.body)).not.toContain("do-not-leak");
+    expect((await call("/api/board/events?project=events-project-a", {}, "test-token")).body.events.length).toBeGreaterThan(1);
+    expect((await call("/api/board/events?project=events-project-b", {}, eventAgentToken)).response.status).toBe(403);
+    expect((await call("/api/board/events?project=events-project-a", {}, "missing-token")).response.status).toBe(401);
+    const clamped = await call("/api/board/events?project=events-project-a&limit=9999", {}, "test-token");
+    expect(clamped.response.status).toBe(200);
+    expect(clamped.body.events.length).toBeLessThanOrEqual(200);
+    const share = await call("/api/board/share-token", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "events-project-a" }),
+    });
+    expect(share.response.status).toBe(201);
+    const sharedEvents = await call("/api/board/events?project=events-project-a", {}, String(share.body.token));
+    expect(sharedEvents.response.status).toBe(200);
+  });
+
   it("serves fragment-token bootstrap without exposing it to the request", async () => {
     const response = await SELF.fetch(new Request("https://coord-board.test/?project=fragment-project"));
     expect(response.status).toBe(200);
