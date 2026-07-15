@@ -41,6 +41,20 @@ const FAILOVER_REPLACEMENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const FAILOVER_REPLACEMENT_RESERVATION_TIMEOUT_MS = 10 * 60 * 1000;
 const SPAWN_STALE_GRACE_MS = 10 * 60 * 1000;
 const SPAWN_MAX_ACTIVE_PER_PROJECT = 8;
+const WATCHDOG_BATCH_SIZE = 25;
+// Re-send a wake nudge to an idle/sleeping worker session at most this often.
+const WATCHDOG_WAKE_INTERVAL_MS = 20 * 60 * 1000;
+// Keywords that make a blocked question high-risk enough to require human judgement.
+const HIGH_RISK_PATTERNS: readonly RegExp[] = [
+  /\b(delete|destroy|drop|truncate|wipe|erase|purge)\b/i,
+  /\b(prod|production|live)\b/i,
+  /\b(deploy|release|publish|rollback|revert)\b/i,
+  /\b(force[- ]?push|rm\s+-rf|drop\s+table|drop\s+database)\b/i,
+  /\b(secret|credential|password|token|api[- ]?key|private\s+key)\b/i,
+  /\b(payment|charge|refund|billing|invoice|purchase)\b/i,
+  /\b(irreversible|cannot\s+be\s+undone|permanent(?:ly)?)\b/i,
+  /(删除|销毁|清空|生产环境|上线|部署|发布|回滚|不可逆|无法撤销|密钥|凭据|密码|付款|扣费|支付)/,
+];
 const DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS = 5 * 60;
 const MIN_ACCOUNT_CLAIM_TTL_SECONDS = 30;
 const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
@@ -427,6 +441,14 @@ function briefingMarkdown(role: string): string {
       "- `GET /api/board/team?project=<project>` to inspect the team overview.",
       "- `POST /api/board/tasks/:id/release` with `{ \"agent_id\": \"<teammate-id>\" }` to force-release a teammate's lease.",
       "- `POST /api/board/agents/:id/shutdown` with `{ \"revoke_token\": true }` to force-shutdown a teammate and revoke its token.",
+      "",
+      "### Orchestration (Leader / human-in-the-loop)",
+      "- `GET /api/board/leader?project=<project>` for a read-only leader dashboard: task/phase counts plus the blocked and needs-human worklists.",
+      "- Spawned workers auto-drive themselves; the watchdog polls their Devin sessions. When a worker becomes `blocked`, its task is flagged `blocked=1` and you receive a mailbox message with the question and choices.",
+      "- `POST /api/board/tasks/:id/answer` with `{ \"message\": \"<answer or chosen option>\" }` to forward an answer to the worker's Devin session and clear the block.",
+      "- Tasks flagged `needs_human=1` require your judgement (high-risk question, or a worker session that ended or failed before completing). Reassign, re-spawn (`PATCH /api/board/tasks/:id { \"spawn\": true }`), or answer as appropriate.",
+      "- `GET /api/board/spawn-stats?project=<project>` for per-profile spawn/session metrics and budget usage.",
+      "- `POST /api/board/provision` (admin) to seed a project, worker profiles, and encrypted backup accounts in one request.",
     );
   }
   return lines.join("\n");
@@ -728,6 +750,333 @@ async function terminateFailoverSession(
     return response.ok || response.status === 404;
   } catch {
     return false;
+  }
+}
+
+type DevinSessionStatus = "running" | "blocked" | "idle" | "finished" | "failed" | "unknown";
+
+type DevinSessionView = {
+  status: DevinSessionStatus;
+  completed: boolean;
+  question: string | null;
+  choices: string[];
+};
+
+function firstString(source: Record<string, unknown>, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function normalizeDevinStatus(raw: string): DevinSessionStatus {
+  const value = raw.trim().toLowerCase();
+  if (!value) return "unknown";
+  if (/(blocked|waiting|awaiting|needs?_input|need_input|input_required|paused_for)/.test(value)) return "blocked";
+  if (/(suspend|sleep|idle|hibernat|dormant|standby|snoozed|paused)/.test(value)) return "idle";
+  if (/(finish|complete|done|succeed|success|exit|stopped|ended|terminated|expired)/.test(value)) return "finished";
+  if (/(fail|error|crash|cancel|abort)/.test(value)) return "failed";
+  if (/(run|work|active|initializ|resum|in_progress|executing|processing)/.test(value)) return "running";
+  return "unknown";
+}
+
+function hasStructuredOutput(raw: Record<string, unknown>): boolean {
+  const output = raw.structured_output ?? raw.structuredOutput;
+  if (output === undefined || output === null) return false;
+  if (typeof output === "string") return output.trim().length > 0;
+  if (Array.isArray(output)) return output.length > 0;
+  if (typeof output === "object") return Object.keys(output as Record<string, unknown>).length > 0;
+  return false;
+}
+
+function extractBlockedQuestion(raw: Record<string, unknown>): { question: string | null; choices: string[] } {
+  let question = firstString(raw, ["pending_question", "question", "blocked_reason", "blocked_question", "prompt"]);
+  const choices: string[] = [];
+  const rawChoices = raw.choices ?? raw.options;
+  if (Array.isArray(rawChoices)) {
+    for (const choice of rawChoices) {
+      if (typeof choice === "string" && choice.trim()) choices.push(choice.trim());
+      else if (choice && typeof choice === "object") {
+        const label = firstString(choice as Record<string, unknown>, ["label", "text", "value", "title"]);
+        if (label) choices.push(label);
+      }
+    }
+  }
+  if (!question && Array.isArray(raw.messages) && raw.messages.length) {
+    const last = raw.messages[raw.messages.length - 1];
+    if (last && typeof last === "object") {
+      question = firstString(last as Record<string, unknown>, ["message", "text", "content", "body"]);
+      const opts = (last as Record<string, unknown>).options ?? (last as Record<string, unknown>).choices;
+      if (Array.isArray(opts)) {
+        for (const opt of opts) {
+          if (typeof opt === "string" && opt.trim()) choices.push(opt.trim());
+        }
+      }
+    }
+  }
+  return { question: question || null, choices };
+}
+
+// Poll a spawned worker's Devin session. Returns null on any transient/transport error so the
+// watchdog simply retries on the next tick rather than escalating a temporary blip.
+async function fetchDevinSession(
+  orgId: string,
+  credential: string,
+  sessionId: string,
+): Promise<DevinSessionView | null> {
+  try {
+    const response = await fetch(
+      `https://api.devin.ai/v3/organizations/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "GET", headers: { Authorization: `Bearer ${credential}`, Accept: "application/json" } },
+    );
+    if (!response.ok) return null;
+    const raw = (await response.json()) as Record<string, unknown>;
+    const session = (raw.session && typeof raw.session === "object" ? raw.session as Record<string, unknown> : raw);
+    const status = normalizeDevinStatus(firstString(session, ["status_enum", "status", "state", "session_status"]));
+    const { question, choices } = extractBlockedQuestion(session);
+    const explicitDone = session.completed === true || session.is_complete === true || session.finished === true;
+    // A session is "really complete" when Devin reports it finished, or it produced final
+    // structured output and is no longer actively running. Idle/sleeping alone is not completion.
+    const completed = status === "finished"
+      || explicitDone
+      || (hasStructuredOutput(session) && (status === "idle" || status === "unknown"));
+    return { status, completed, question, choices };
+  } catch {
+    return null;
+  }
+}
+
+async function sendDevinSessionMessage(
+  orgId: string,
+  credential: string,
+  sessionId: string,
+  message: string,
+): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `https://api.devin.ai/v3/organizations/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${credential}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      },
+    );
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+function isHighRiskQuestion(text: string): boolean {
+  if (!text) return false;
+  return HIGH_RISK_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+// Deliver a system message to a project's leader agent (or, if none is registered, to every
+// manage-capable agent in the project). Used by the watchdog to escalate blocked/needs-human events.
+async function notifyLeader(
+  db: D1Database,
+  projectId: string,
+  subject: string,
+  payload: Json,
+): Promise<void> {
+  const project = await db.prepare("SELECT leader_agent_id FROM project WHERE id = ?")
+    .bind(projectId).first<{ leader_agent_id: string | null }>();
+  const recipients: string[] = [];
+  if (project?.leader_agent_id) {
+    const leader = await db.prepare("SELECT id FROM agent WHERE id = ? AND project_id = ?")
+      .bind(project.leader_agent_id, projectId).first<{ id: string }>();
+    if (leader) recipients.push(leader.id);
+  }
+  if (recipients.length === 0) {
+    const leads = await db.prepare(
+      "SELECT id, role FROM agent WHERE project_id = ? AND status <> 'shutdown'",
+    ).bind(projectId).all<{ id: string; role: string }>();
+    for (const agent of leads.results) {
+      if (roleCapabilities(agent.role).includes("manage")) recipients.push(agent.id);
+    }
+  }
+  if (recipients.length === 0) return;
+  const timestamp = now();
+  const messageId = id();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(
+      `INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
+       VALUES (?, ?, NULL, 'direct', ?, ?, NULL, NULL, ?)`,
+    ).bind(messageId, projectId, subject, JSON.stringify(payload), timestamp),
+  ];
+  for (const recipient of recipients) {
+    statements.push(db.prepare(
+      "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, seen_at, acked_at, attempt_count, updated_at) VALUES (?, ?, ?, ?, 'unread', NULL, NULL, 0, ?)",
+    ).bind(id(), messageId, projectId, recipient, timestamp));
+  }
+  await db.batch(statements);
+}
+
+type WatchdogCandidate = {
+  task_id: string;
+  project_id: string;
+  title: string;
+  blocked: number;
+  needs_human: number;
+  watchdog_status: string | null;
+  agent_id: string;
+  metadata_json: string;
+};
+
+// Poll spawned worker sessions and drive the human-in-the-loop loop:
+// - blocked  -> flag task.blocked, escalate the question to the Leader (needs_human when high-risk);
+// - idle     -> wake the session so it keeps working, UNLESS it has really finished the task;
+// - finished/failed without the Board task being done -> flag needs_human for the Leader.
+async function runWatchdog(db: D1Database, env: Env, timestamp: string): Promise<void> {
+  const candidates = await db.prepare(
+    `SELECT t.id AS task_id, t.board_id AS project_id, t.title, t.blocked, t.needs_human,
+            t.watchdog_status, a.id AS agent_id, a.metadata_json AS metadata_json
+     FROM task_item t
+     JOIN agent a ON a.project_id = t.board_id
+       AND json_extract(a.metadata_json, '$.cloud_spawn') = 1
+       AND json_extract(a.metadata_json, '$.task_id') = t.id
+       AND COALESCE(json_extract(a.metadata_json, '$.leader_sleep'), 0) <> 1
+     WHERE t.spawn_status = 'spawned' AND t.deleted_at IS NULL AND t.phase <> 'done'
+     ORDER BY t.updated_at
+     LIMIT ?`,
+  ).bind(WATCHDOG_BATCH_SIZE).all<WatchdogCandidate>();
+  for (const candidate of candidates.results) {
+    let meta: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(candidate.metadata_json || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) meta = parsed as Record<string, unknown>;
+    } catch {
+      meta = {};
+    }
+    const sessionId = typeof meta.session_id === "string" ? meta.session_id : "";
+    const backupAccountId = typeof meta.backup_account_id === "string" ? meta.backup_account_id : "";
+    if (!sessionId || !backupAccountId) continue;
+    const backup = await db.prepare(
+      "SELECT * FROM backup_account WHERE id = ? AND project_id = ?",
+    ).bind(backupAccountId, candidate.project_id).first<Record<string, unknown>>();
+    if (!backup) continue;
+    let credential: string;
+    try {
+      credential = await decryptBackupCredential(env, String(backup.credential_ciphertext), String(backup.credential_iv));
+    } catch {
+      continue;
+    }
+    const session = await fetchDevinSession(String(backup.org_id), credential, sessionId);
+    if (!session) continue;
+    await handleWatchdogSession(db, env, candidate, backup, credential, sessionId, session, meta, timestamp);
+  }
+}
+
+async function handleWatchdogSession(
+  db: D1Database,
+  env: Env,
+  candidate: WatchdogCandidate,
+  backup: Record<string, unknown>,
+  credential: string,
+  sessionId: string,
+  session: DevinSessionView,
+  meta: Record<string, unknown>,
+  timestamp: string,
+): Promise<void> {
+  const prevStatus = candidate.watchdog_status || "";
+  const transitioned = session.status !== prevStatus;
+  if (transitioned) {
+    await db.prepare("UPDATE task_item SET watchdog_status = ?, updated_at = ? WHERE id = ?")
+      .bind(session.status, timestamp, candidate.task_id).run();
+  }
+
+  if (session.status === "blocked") {
+    if (transitioned || candidate.blocked !== 1) {
+      const questionText = session.question || "The worker session is blocked and awaiting input.";
+      const highRisk = isHighRiskQuestion(`${questionText} ${session.choices.join(" ")}`);
+      await db.batch([
+        db.prepare("UPDATE task_item SET blocked = 1, needs_human = ?, updated_at = ? WHERE id = ?")
+          .bind(highRisk ? 1 : Number(candidate.needs_human ?? 0), timestamp, candidate.task_id),
+        event(db, candidate.task_id, highRisk ? "worker_blocked_needs_human" : "worker_blocked", candidate.agent_id, {
+          project_id: candidate.project_id,
+          session_id: sessionId,
+          question: questionText,
+          choices: session.choices,
+          high_risk: highRisk,
+        }),
+      ]);
+      await notifyLeader(db, candidate.project_id, highRisk ? "Worker blocked (needs human)" : "Worker blocked", {
+        type: highRisk ? "worker_blocked_needs_human" : "worker_blocked",
+        task_id: candidate.task_id,
+        agent_id: candidate.agent_id,
+        question: questionText,
+        choices: session.choices,
+        high_risk: highRisk,
+        answer_endpoint: `POST /api/board/tasks/${candidate.task_id}/answer`,
+      });
+    }
+    return;
+  }
+
+  if (session.status === "failed") {
+    if (transitioned || candidate.needs_human !== 1) {
+      await db.batch([
+        db.prepare("UPDATE task_item SET needs_human = 1, updated_at = ? WHERE id = ?").bind(timestamp, candidate.task_id),
+        event(db, candidate.task_id, "worker_session_failed", candidate.agent_id, {
+          project_id: candidate.project_id, session_id: sessionId,
+        }),
+      ]);
+      await notifyLeader(db, candidate.project_id, "Worker session failed", {
+        type: "worker_session_failed", task_id: candidate.task_id, agent_id: candidate.agent_id, session_id: sessionId,
+      });
+    }
+    return;
+  }
+
+  if (session.status === "finished" || session.completed) {
+    // The session ended (or reported completion) but the Board task is not marked done. Do not
+    // wake it and do not auto-complete: hand it to the Leader/human to verify and close out.
+    if (transitioned || candidate.needs_human !== 1) {
+      await db.batch([
+        db.prepare("UPDATE task_item SET needs_human = 1, updated_at = ? WHERE id = ?").bind(timestamp, candidate.task_id),
+        event(db, candidate.task_id, "worker_session_ended", candidate.agent_id, {
+          project_id: candidate.project_id, session_id: sessionId, status: session.status, completed: session.completed,
+        }),
+      ]);
+      await notifyLeader(db, candidate.project_id, "Worker session ended without completing task", {
+        type: "worker_session_ended",
+        task_id: candidate.task_id,
+        agent_id: candidate.agent_id,
+        session_id: sessionId,
+        note: "Session finished/produced output but the Board task is not done. Verify and mark done, or re-spawn.",
+      });
+    }
+    return;
+  }
+
+  // Worker resumed on its own after having been blocked: clear the block.
+  if (session.status === "running" && candidate.blocked === 1) {
+    await db.batch([
+      db.prepare("UPDATE task_item SET blocked = 0, updated_at = ? WHERE id = ?").bind(timestamp, candidate.task_id),
+      event(db, candidate.task_id, "worker_unblocked", candidate.agent_id, { project_id: candidate.project_id, session_id: sessionId }),
+    ]);
+    return;
+  }
+
+  // Idle/sleeping (e.g. the ~30-min browser-inactivity sleep) but NOT actually finished: nudge it
+  // to keep working, throttled so we do not spam an already-awake session.
+  if (session.status === "idle") {
+    const lastWakeAt = typeof meta.last_wake_at === "string" ? Date.parse(meta.last_wake_at) : NaN;
+    const dueForWake = !Number.isFinite(lastWakeAt) || Date.now() - lastWakeAt >= WATCHDOG_WAKE_INTERVAL_MS;
+    if (!dueForWake) return;
+    const woke = await sendDevinSessionMessage(
+      String(backup.org_id), credential, sessionId,
+      `Please continue working on Board task ${candidate.task_id}. If you have finished, mark it complete via the Board API; otherwise resume where you left off.`,
+    );
+    if (woke) {
+      await db.batch([
+        db.prepare("UPDATE agent SET metadata_json = json_set(metadata_json, '$.last_wake_at', ?), updated_at = ? WHERE id = ? AND project_id = ?")
+          .bind(timestamp, timestamp, candidate.agent_id, candidate.project_id),
+        event(db, candidate.task_id, "worker_wake_nudge", candidate.agent_id, { project_id: candidate.project_id, session_id: sessionId }),
+      ]);
+    }
   }
 }
 
@@ -1056,6 +1405,29 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
         event(db, candidate.task_id, "spawn_failed", null, { reason: "worker profile missing or disabled" }),
       ]);
       continue;
+    }
+    // Budget breaker: stop spawning new workers once the project has consumed its cumulative
+    // spawn budget (0 = unlimited). Counted from spawn_created events so it survives restarts.
+    const budgetRow = await db.prepare("SELECT spawn_budget_max FROM project WHERE id = ?")
+      .bind(candidate.project_id).first<{ spawn_budget_max: number }>();
+    const budgetMax = Number(budgetRow?.spawn_budget_max ?? 0);
+    if (budgetMax > 0) {
+      const usedRow = await db.prepare(
+        "SELECT COUNT(*) AS c FROM task_event WHERE event_type = 'spawn_created' AND json_extract(payload_json, '$.project_id') = ?",
+      ).bind(candidate.project_id).first<{ c: number }>();
+      if (Number(usedRow?.c ?? 0) >= budgetMax) {
+        await db.batch([
+          db.prepare("UPDATE task_item SET spawn_status = 'failed', needs_human = 1, updated_at = ? WHERE id = ? AND spawn_status = 'spawning'")
+            .bind(timestamp, candidate.task_id),
+          event(db, candidate.task_id, "spawn_budget_exceeded", null, {
+            project_id: candidate.project_id, budget_max: budgetMax, used: Number(usedRow?.c ?? 0),
+          }),
+        ]);
+        await notifyLeader(db, candidate.project_id, "Spawn budget exceeded", {
+          type: "spawn_budget_exceeded", task_id: candidate.task_id, budget_max: budgetMax, used: Number(usedRow?.c ?? 0),
+        });
+        continue;
+      }
     }
     const backup = await reserveBackupAccount(db, candidate.project_id, profile.role_tag, timestamp);
     if (!backup) {
@@ -2495,6 +2867,320 @@ async function briefing(request: Request, env: Env, auth: Auth): Promise<Respons
   });
 }
 
+type SpawnSessionContext = { agentId: string; sessionId: string; orgId: string; credential: string };
+
+// Resolve the Devin session + decrypted credential for a task's spawned worker. The credential
+// is decrypted here only to call the Devin API and is never returned to the caller.
+async function spawnSessionContext(
+  db: D1Database,
+  env: Env,
+  projectId: string,
+  taskId: string,
+): Promise<SpawnSessionContext | null> {
+  const agent = await db.prepare(
+    `SELECT id, metadata_json FROM agent
+     WHERE project_id = ? AND json_extract(metadata_json, '$.cloud_spawn') = 1
+       AND json_extract(metadata_json, '$.task_id') = ?
+     ORDER BY created_at DESC LIMIT 1`,
+  ).bind(projectId, taskId).first<{ id: string; metadata_json: string }>();
+  if (!agent) return null;
+  let meta: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(agent.metadata_json || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) meta = parsed as Record<string, unknown>;
+  } catch {
+    meta = {};
+  }
+  const sessionId = typeof meta.session_id === "string" ? meta.session_id : "";
+  const backupAccountId = typeof meta.backup_account_id === "string" ? meta.backup_account_id : "";
+  if (!sessionId || !backupAccountId) return null;
+  const backup = await db.prepare("SELECT * FROM backup_account WHERE id = ? AND project_id = ?")
+    .bind(backupAccountId, projectId).first<Record<string, unknown>>();
+  if (!backup) return null;
+  let credential: string;
+  try {
+    credential = await decryptBackupCredential(env, String(backup.credential_ciphertext), String(backup.credential_iv));
+  } catch {
+    return null;
+  }
+  return { agentId: agent.id, sessionId, orgId: String(backup.org_id), credential };
+}
+
+// M3: Leader/human forwards an answer (or a chosen option) to a blocked worker's Devin session,
+// then clears the block. Answers are passed through verbatim so a normalized choice label reaches
+// the worker exactly as selected.
+async function answerWorker(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "manage", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const message = String(body.message || body.answer || "").trim();
+  if (!message) return json({ error: "message is required" }, 400);
+  const projectId = String(access.row?.board_id);
+  const context = await spawnSessionContext(env.DB, env, projectId, taskId);
+  if (!context) return json({ error: "no active worker session for this task" }, 404);
+  const sent = await sendDevinSessionMessage(context.orgId, context.credential, context.sessionId, message);
+  if (!sent) return json({ error: "failed to deliver answer to worker session" }, 502);
+  const timestamp = now();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE task_item SET blocked = 0, needs_human = 0, updated_at = ? WHERE id = ?").bind(timestamp, taskId),
+    event(env.DB, taskId, "worker_answered", actor(auth), { project_id: projectId, agent_id: context.agentId }),
+  ]);
+  return json({ ok: true, task_id: taskId, delivered: true });
+}
+
+// New requirement: once the Leader has verified/closed out a worker and has no further work for it,
+// tell the worker to sleep and stop the watchdog from waking it again.
+async function sleepWorker(request: Request, env: Env, auth: Auth, taskId: string): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const access = await authorizeTask(env.DB, auth, taskId);
+  if (access.error) return access.error;
+  const denied = capabilityDenied(auth, "manage", access.row);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  const projectId = String(access.row?.board_id);
+  const context = await spawnSessionContext(env.DB, env, projectId, taskId);
+  if (!context) return json({ error: "no active worker session for this task" }, 404);
+  const note = String(body.message || "No further tasks are assigned. You may sleep now; you will be woken if new work arrives.").trim();
+  const sent = await sendDevinSessionMessage(context.orgId, context.credential, context.sessionId, note);
+  const timestamp = now();
+  await env.DB.batch([
+    // Mark the worker leader-slept so the watchdog stops waking it, and clear needs_human.
+    env.DB.prepare("UPDATE agent SET metadata_json = json_set(metadata_json, '$.leader_sleep', 1), updated_at = ? WHERE id = ? AND project_id = ?")
+      .bind(timestamp, context.agentId, projectId),
+    env.DB.prepare("UPDATE task_item SET needs_human = 0, updated_at = ? WHERE id = ?").bind(timestamp, taskId),
+    event(env.DB, taskId, "worker_slept", actor(auth), { project_id: projectId, agent_id: context.agentId, delivered: sent }),
+  ]);
+  return json({ ok: true, task_id: taskId, delivered: sent });
+}
+
+// M2: register (or re-link) a project's Cloud-Dev Leader session as a role=lead board agent.
+async function leader(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET") return leaderDashboard(env, auth, url);
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  if (!isAdmin(auth)) return json({ error: "admin authorization required" }, 403);
+  const body = await parseBody(request);
+  const projectId = String(body.project_id || "").trim();
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  const project = await env.DB.prepare("SELECT id, leader_agent_id FROM project WHERE id = ?")
+    .bind(projectId).first<{ id: string; leader_agent_id: string | null }>();
+  if (!project) return json({ error: "project not found" }, 404);
+  const sessionId = String(body.session_id || body.cloud_dev_session_id || "").trim();
+  const name = String(body.name || "Leader").trim();
+  const agentId = String(body.agent_id || `lead-${projectId}`).trim();
+  const timestamp = now();
+  const leaderMeta = {
+    leader: true,
+    cloud_dev: true,
+    cloud_dev_session_id: sessionId || null,
+    role_tag: "lead",
+  };
+  const existing = await env.DB.prepare("SELECT id, project_id, role FROM agent WHERE id = ?")
+    .bind(agentId).first<{ id: string; project_id: string; role: string }>();
+  if (existing && existing.project_id !== projectId) {
+    return json({ error: "agent id already registered in another project" }, 409);
+  }
+  if (existing) {
+    // Re-link an existing leader agent (e.g. a new Cloud-Dev session id). No new token is issued.
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE agent SET role = 'lead', name = ?, metadata_json = ?, status = 'online', last_seen_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+      ).bind(name, JSON.stringify(leaderMeta), timestamp, timestamp, agentId, projectId),
+      env.DB.prepare("UPDATE project SET leader_agent_id = ?, updated_at = ? WHERE id = ?").bind(agentId, timestamp, projectId),
+      env.DB.prepare(
+        "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'leader_relinked', ?, ?)",
+      ).bind(id(), agentId, projectId, JSON.stringify({ cloud_dev_session_id: sessionId || null }), timestamp),
+    ]);
+    return json({
+      id: agentId, project_id: projectId, name, role: "lead", relinked: true,
+      cloud_dev_session_id: sessionId || null,
+      briefing_markdown: briefingMarkdown("lead"),
+      capabilities: briefingCapabilities("lead"),
+    });
+  }
+  const token = randomToken();
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO agent(id, project_id, name, role, status, last_seen_at, metadata_json, token_hash, token_issued_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'lead', 'online', ?, ?, ?, ?, ?, ?)`,
+    ).bind(agentId, projectId, name, timestamp, JSON.stringify(leaderMeta), await sha256(token), timestamp, timestamp, timestamp),
+    env.DB.prepare("UPDATE project SET leader_agent_id = ?, updated_at = ? WHERE id = ?").bind(agentId, timestamp, projectId),
+    env.DB.prepare(
+      "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'leader_registered', ?, ?)",
+    ).bind(id(), agentId, projectId, JSON.stringify({ cloud_dev_session_id: sessionId || null }), timestamp),
+  ]);
+  if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "leader registration failed" }, 409);
+  return json({
+    id: agentId, project_id: projectId, name, role: "lead",
+    cloud_dev_session_id: sessionId || null,
+    token,
+    token_warning: "Store this token now; it will never be returned again.",
+    briefing_markdown: briefingMarkdown("lead"),
+    capabilities: briefingCapabilities("lead"),
+  }, 201);
+}
+
+// Read-only leader/human dashboard: task/phase counts plus the blocked and needs-human worklists,
+// and the live status of each spawned worker. No credentials are ever included.
+async function leaderDashboard(env: Env, auth: Auth, url: URL): Promise<Response> {
+  const projectId = (url.searchParams.get("project") || url.searchParams.get("project_id") || (isAdmin(auth) || isShare(auth) ? "" : auth.projectId)).trim();
+  if (!projectId) return json({ error: "project is required" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id, name, leader_agent_id, spawn_budget_max FROM project WHERE id = ?")
+    .bind(projectId).first<{ id: string; name: string; leader_agent_id: string | null; spawn_budget_max: number }>();
+  if (!project) return json({ error: "project not found" }, 404);
+  const phaseRows = await env.DB.prepare(
+    "SELECT phase, COUNT(*) AS c FROM task_item WHERE board_id = ? AND deleted_at IS NULL GROUP BY phase",
+  ).bind(projectId).all<{ phase: string; c: number }>();
+  const phases: Record<string, number> = {};
+  for (const row of phaseRows.results) phases[String(row.phase)] = Number(row.c);
+  const blocked = await env.DB.prepare(
+    "SELECT id, title, watchdog_status FROM task_item WHERE board_id = ? AND deleted_at IS NULL AND blocked = 1 ORDER BY updated_at DESC LIMIT 100",
+  ).bind(projectId).all<Record<string, unknown>>();
+  const needsHuman = await env.DB.prepare(
+    "SELECT id, title, watchdog_status FROM task_item WHERE board_id = ? AND deleted_at IS NULL AND needs_human = 1 ORDER BY updated_at DESC LIMIT 100",
+  ).bind(projectId).all<Record<string, unknown>>();
+  const workers = await env.DB.prepare(
+    "SELECT id, title, spawn_status, watchdog_status, blocked, needs_human, assignee_agent_id FROM task_item WHERE board_id = ? AND deleted_at IS NULL AND spawn_status IS NOT NULL ORDER BY updated_at DESC LIMIT 100",
+  ).bind(projectId).all<Record<string, unknown>>();
+  const usedRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM task_event WHERE event_type = 'spawn_created' AND json_extract(payload_json, '$.project_id') = ?",
+  ).bind(projectId).first<{ c: number }>();
+  return json({
+    project: { id: project.id, name: project.name, leader_agent_id: project.leader_agent_id },
+    budget: { max: Number(project.spawn_budget_max ?? 0), used: Number(usedRow?.c ?? 0) },
+    task_phase_counts: phases,
+    blocked: blocked.results,
+    needs_human: needsHuman.results,
+    workers: workers.results,
+  });
+}
+
+// M0 remaining: seed a project, its worker profiles, and encrypted backup accounts in one atomic
+// batch, optionally registering a leader. Idempotent; never returns plaintext credentials.
+async function provision(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  if (!isAdmin(auth)) return json({ error: "admin authorization required" }, 403);
+  const body = await parseBody(request);
+  const projectInput = (body.project && typeof body.project === "object" ? body.project : null) as Json | null;
+  if (!projectInput) return json({ error: "project is required" }, 400);
+  const projectId = String(projectInput.id || "").trim();
+  const projectName = String(projectInput.name || projectId).trim();
+  if (!projectId || !projectName) return json({ error: "project.id and project.name are required" }, 400);
+  const key = idempotencyKey(request, body);
+  const replay = await replayOrReserve(env.DB, "provision", key);
+  if (replay) return replay;
+  const timestamp = now();
+  const statements: D1PreparedStatement[] = [];
+  statements.push(env.DB.prepare(
+    `INSERT INTO project(id, name, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET name = excluded.name, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at`,
+  ).bind(projectId, projectName, JSON.stringify(projectInput.metadata || {}), timestamp, timestamp));
+  if (projectInput.spawn_budget_max !== undefined) {
+    const budget = Math.max(0, Math.floor(Number(projectInput.spawn_budget_max) || 0));
+    statements.push(env.DB.prepare("UPDATE project SET spawn_budget_max = ?, updated_at = ? WHERE id = ?").bind(budget, timestamp, projectId));
+  }
+  const profileIds: string[] = [];
+  const accountIds: string[] = [];
+  try {
+    const profiles = Array.isArray(body.worker_profiles) ? body.worker_profiles : [];
+    for (const entry of profiles) {
+      if (!entry || typeof entry !== "object") throw new Error("each worker profile must be an object");
+      const built = buildWorkerProfileStatement(env.DB, projectId, entry as Json, timestamp);
+      profileIds.push(built.id);
+      statements.push(built.statement);
+    }
+    const accounts = Array.isArray(body.backup_accounts) ? body.backup_accounts : [];
+    for (const entry of accounts) {
+      if (!entry || typeof entry !== "object") throw new Error("each backup account must be an object");
+      const built = await buildBackupAccountStatement(env, projectId, entry as Json, timestamp);
+      accountIds.push(built.id);
+      statements.push(built.statement);
+    }
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "invalid provisioning payload" }, 400);
+  }
+  // Single atomic batch: project + profiles + accounts either all commit or none do.
+  await env.DB.batch(statements);
+  let leaderSummary: Json | null = null;
+  const leaderInput = (body.leader && typeof body.leader === "object" ? body.leader : null) as Json | null;
+  if (leaderInput) {
+    const leaderReq = new Request(`${requestOrigin(request)}/api/board/leader`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...leaderInput, project_id: projectId }),
+    });
+    const leaderResp = await leader(leaderReq, env, auth);
+    const parsed = await leaderResp.json().catch(() => null) as Json | null;
+    // Surface only non-secret leader metadata; the token (first registration) is intentionally
+    // included so the operator can capture it once, mirroring the agent-registration contract.
+    leaderSummary = parsed;
+  }
+  const response = json({
+    ok: true,
+    project_id: projectId,
+    worker_profile_ids: profileIds,
+    backup_account_ids: accountIds,
+    leader: leaderSummary,
+  }, 201);
+  return saveIdempotentResponse(env.DB, "provision", key, response);
+}
+
+function requestOrigin(request: Request): string {
+  return new URL(request.url).origin;
+}
+
+// M4: per-profile spawn/session observability plus budget usage. Read-only, no credentials.
+async function spawnStats(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+  const url = new URL(request.url);
+  const projectId = (url.searchParams.get("project") || url.searchParams.get("project_id") || (isAdmin(auth) || isShare(auth) ? "" : auth.projectId)).trim();
+  if (!projectId) return json({ error: "project is required" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id, spawn_budget_max FROM project WHERE id = ?")
+    .bind(projectId).first<{ id: string; spawn_budget_max: number }>();
+  if (!project) return json({ error: "project not found" }, 404);
+  const rows = await env.DB.prepare(
+    `SELECT p.id AS profile_id, p.name AS name, p.role_tag AS role_tag, p.enabled AS enabled,
+            SUM(CASE WHEN t.spawn_status = 'requested' THEN 1 ELSE 0 END) AS requested,
+            SUM(CASE WHEN t.spawn_status = 'spawning' THEN 1 ELSE 0 END) AS spawning,
+            SUM(CASE WHEN t.spawn_status = 'spawned' THEN 1 ELSE 0 END) AS spawned,
+            SUM(CASE WHEN t.spawn_status = 'failed' THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN t.spawn_status IN ('spawning','spawned') AND t.phase <> 'done' THEN 1 ELSE 0 END) AS active,
+            SUM(CASE WHEN t.blocked = 1 THEN 1 ELSE 0 END) AS blocked,
+            SUM(CASE WHEN t.needs_human = 1 THEN 1 ELSE 0 END) AS needs_human
+     FROM worker_profile p
+     LEFT JOIN task_item t ON t.worker_profile_id = p.id AND t.board_id = p.project_id AND t.deleted_at IS NULL
+     WHERE p.project_id = ?
+     GROUP BY p.id, p.name, p.role_tag, p.enabled
+     ORDER BY p.name`,
+  ).bind(projectId).all<Record<string, unknown>>();
+  const usedRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM task_event WHERE event_type = 'spawn_created' AND json_extract(payload_json, '$.project_id') = ?",
+  ).bind(projectId).first<{ c: number }>();
+  const profiles = rows.results.map((row) => ({
+    worker_profile_id: String(row.profile_id),
+    name: String(row.name ?? ""),
+    role_tag: String(row.role_tag ?? ""),
+    enabled: Number(row.enabled ?? 0),
+    requested: Number(row.requested ?? 0),
+    spawning: Number(row.spawning ?? 0),
+    spawned: Number(row.spawned ?? 0),
+    failed: Number(row.failed ?? 0),
+    active: Number(row.active ?? 0),
+    blocked: Number(row.blocked ?? 0),
+    needs_human: Number(row.needs_human ?? 0),
+  }));
+  return json({
+    project_id: projectId,
+    budget: { max: Number(project.spawn_budget_max ?? 0), used: Number(usedRow?.c ?? 0) },
+    profiles,
+  });
+}
+
 function boundedShareTtl(value: unknown): number {
   const parsed = Number(value ?? 3600);
   if (!Number.isFinite(parsed)) return 3600;
@@ -2704,6 +3390,79 @@ function workerProfileView(row: Record<string, unknown>) {
   };
 }
 
+// Shared builder so single-profile POST and batch provisioning use identical, project-scoped
+// upsert SQL (the ON CONFLICT project guard prevents cross-project profile hijacking).
+function buildWorkerProfileStatement(
+  db: D1Database,
+  projectId: string,
+  item: Json,
+  timestamp: string,
+): { statement: D1PreparedStatement; id: string } {
+  const profileId = String(item.id || "").trim();
+  const name = String(item.name || "").trim();
+  const roleTag = String(item.role_tag || "").trim();
+  if (!profileId || !name || !roleTag) throw new Error("id, name, and role_tag are required");
+  const statement = db.prepare(
+    `INSERT INTO worker_profile(
+       id, project_id, name, role_tag, model, snapshot_id, system_prompt, prompt_template,
+       playbook_refs_json, knowledge_refs_json, mcp_tools_json, repo_config_json, enabled, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name, role_tag = excluded.role_tag,
+       model = excluded.model, snapshot_id = excluded.snapshot_id, system_prompt = excluded.system_prompt,
+       prompt_template = excluded.prompt_template, playbook_refs_json = excluded.playbook_refs_json,
+       knowledge_refs_json = excluded.knowledge_refs_json, mcp_tools_json = excluded.mcp_tools_json,
+       repo_config_json = excluded.repo_config_json, enabled = excluded.enabled, updated_at = excluded.updated_at
+     WHERE worker_profile.project_id = excluded.project_id`,
+  ).bind(
+    profileId, projectId, name, roleTag, optionalText(item.model), optionalText(item.snapshot_id),
+    optionalText(item.system_prompt), optionalText(item.prompt_template),
+    jsonArrayText(item.playbook_refs), jsonArrayText(item.knowledge_refs), jsonArrayText(item.mcp_tools),
+    jsonObjectText(item.repo_config), flag(item.enabled ?? true), timestamp, timestamp,
+  );
+  return { statement, id: profileId };
+}
+
+// Shared builder for backup accounts. Encrypts the credential before it ever touches the DB;
+// plaintext never appears in responses, events, or logs.
+async function buildBackupAccountStatement(
+  env: Env,
+  projectId: string,
+  item: Json,
+  timestamp: string,
+): Promise<{ statement: D1PreparedStatement; id: string }> {
+  const accountId = String(item.id || "").trim();
+  const roleTag = String(item.role_tag || "").trim();
+  const label = String(item.label || "").trim();
+  const orgId = String(item.org_id || "").trim();
+  const credential = String(item.credential || item.credential_value || "").trim();
+  const credentialType = item.credential_type === "service_user"
+    ? "service_user"
+    : item.credential_type === "apikey" || item.credential_type === undefined
+      ? "apikey"
+      : "";
+  if (!accountId || !roleTag || !orgId || !credential) {
+    throw new Error("id, role_tag, org_id, and credential are required");
+  }
+  if (!credentialType) throw new Error("credential_type must be apikey or service_user");
+  const encrypted = await encryptBackupCredential(env, credential);
+  const statement = env.DB.prepare(
+    `INSERT INTO backup_account(
+       id, project_id, role_tag, label, org_id, credential_type, credential_ciphertext,
+       credential_iv, key_version, enabled, status, cooldown_until, last_used_at, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       project_id = excluded.project_id, role_tag = excluded.role_tag, label = excluded.label,
+       org_id = excluded.org_id, credential_type = excluded.credential_type,
+       credential_ciphertext = excluded.credential_ciphertext, credential_iv = excluded.credential_iv,
+       key_version = excluded.key_version, enabled = excluded.enabled, updated_at = excluded.updated_at`,
+  ).bind(
+    accountId, projectId, roleTag, label, orgId, credentialType, encrypted.ciphertext,
+    encrypted.iv, BACKUP_ACCOUNT_KEY_VERSION, flag(item.enabled ?? true), timestamp, timestamp,
+  );
+  return { statement, id: accountId };
+}
+
 async function workerProfiles(request: Request, env: Env, auth: Auth): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "GET") {
@@ -2746,30 +3505,9 @@ async function workerProfiles(request: Request, env: Env, auth: Auth): Promise<R
   try {
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") throw new Error("each worker profile must be an object");
-      const item = entry as Json;
-      const profileId = String(item.id || "").trim();
-      const name = String(item.name || "").trim();
-      const roleTag = String(item.role_tag || "").trim();
-      if (!profileId || !name || !roleTag) throw new Error("id, name, and role_tag are required");
-      ids.push(profileId);
-      statements.push(env.DB.prepare(
-        `INSERT INTO worker_profile(
-           id, project_id, name, role_tag, model, snapshot_id, system_prompt, prompt_template,
-           playbook_refs_json, knowledge_refs_json, mcp_tools_json, repo_config_json, enabled, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           name = excluded.name, role_tag = excluded.role_tag,
-           model = excluded.model, snapshot_id = excluded.snapshot_id, system_prompt = excluded.system_prompt,
-           prompt_template = excluded.prompt_template, playbook_refs_json = excluded.playbook_refs_json,
-           knowledge_refs_json = excluded.knowledge_refs_json, mcp_tools_json = excluded.mcp_tools_json,
-           repo_config_json = excluded.repo_config_json, enabled = excluded.enabled, updated_at = excluded.updated_at
-         WHERE worker_profile.project_id = excluded.project_id`,
-      ).bind(
-        profileId, projectId, name, roleTag, optionalText(item.model), optionalText(item.snapshot_id),
-        optionalText(item.system_prompt), optionalText(item.prompt_template),
-        jsonArrayText(item.playbook_refs), jsonArrayText(item.knowledge_refs), jsonArrayText(item.mcp_tools),
-        jsonObjectText(item.repo_config), flag(item.enabled ?? true), timestamp, timestamp,
-      ));
+      const built = buildWorkerProfileStatement(env.DB, projectId, entry as Json, timestamp);
+      ids.push(built.id);
+      statements.push(built.statement);
     }
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : "invalid worker profile" }, 400);
@@ -2823,37 +3561,9 @@ async function backupAccounts(request: Request, env: Env, auth: Auth): Promise<R
   try {
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") throw new Error("each backup account must be an object");
-      const item = entry as Json;
-      const accountId = String(item.id || "").trim();
-      const roleTag = String(item.role_tag || "").trim();
-      const label = String(item.label || "").trim();
-      const orgId = String(item.org_id || "").trim();
-      const credential = String(item.credential || item.credential_value || "").trim();
-      const credentialType = item.credential_type === "service_user"
-        ? "service_user"
-        : item.credential_type === "apikey" || item.credential_type === undefined
-          ? "apikey"
-          : "";
-      if (!accountId || !roleTag || !orgId || !credential) {
-        throw new Error("id, role_tag, org_id, and credential are required");
-      }
-      if (!credentialType) throw new Error("credential_type must be apikey or service_user");
-      const encrypted = await encryptBackupCredential(env, credential);
-      ids.push(accountId);
-      statements.push(env.DB.prepare(
-        `INSERT INTO backup_account(
-           id, project_id, role_tag, label, org_id, credential_type, credential_ciphertext,
-           credential_iv, key_version, enabled, status, cooldown_until, last_used_at, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           project_id = excluded.project_id, role_tag = excluded.role_tag, label = excluded.label,
-           org_id = excluded.org_id, credential_type = excluded.credential_type,
-           credential_ciphertext = excluded.credential_ciphertext, credential_iv = excluded.credential_iv,
-           key_version = excluded.key_version, enabled = excluded.enabled, updated_at = excluded.updated_at`,
-      ).bind(
-        accountId, projectId, roleTag, label, orgId, credentialType, encrypted.ciphertext,
-        encrypted.iv, BACKUP_ACCOUNT_KEY_VERSION, flag(item.enabled ?? true), timestamp, timestamp,
-      ));
+      const built = await buildBackupAccountStatement(env, projectId, entry as Json, timestamp);
+      ids.push(built.id);
+      statements.push(built.statement);
     }
   } catch (error) {
     return json({ error: error instanceof Error ? error.message : "invalid backup account" }, 400);
@@ -3391,7 +4101,7 @@ export default {
       return json({ error: "share tokens are read-only" }, 403);
     }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);
-    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|renew|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events))?)?$/);
+    const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|renew|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events|answer|sleep))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];
       const action = taskMatch[2];
@@ -3407,6 +4117,8 @@ export default {
       if (action === "acceptance" && taskId && request.method === "POST") return acceptance(request, env, auth, ctx, taskId);
       if (action === "gate" && taskId && request.method === "POST") return recordGate(request, env, auth, ctx, taskId);
       if (action === "dependencies" && taskId && request.method === "PUT") return dependencies(request, env, auth, taskId);
+      if (action === "answer" && taskId && request.method === "POST") return answerWorker(request, env, auth, taskId);
+      if (action === "sleep" && taskId && request.method === "POST") return sleepWorker(request, env, auth, taskId);
       if (action === "events" && taskId && request.method === "GET") {
         const access = await authorizeTask(env.DB, auth, taskId);
         if (access.error) return access.error;
@@ -3416,6 +4128,9 @@ export default {
     }
     if (url.pathname === "/api/board/projects") return projects(request, env, auth);
     if (url.pathname === "/api/board/briefing") return briefing(request, env, auth);
+    if (url.pathname === "/api/board/leader") return leader(request, env, auth);
+    if (url.pathname === "/api/board/provision") return provision(request, env, auth);
+    if (url.pathname === "/api/board/spawn-stats" && request.method === "GET") return spawnStats(request, env, auth);
     if (url.pathname === "/api/board/share-token") return issueShareToken(request, env, auth);
     if (url.pathname === "/api/board/backup-accounts" || url.pathname.startsWith("/api/board/backup-accounts/")) {
       return backupAccounts(request, env, auth);
@@ -3455,5 +4170,6 @@ export default {
     await deliverHookOutbox(env.DB);
     await sweepLeases(env.DB, env);
     await runWorkerSpawn(env.DB, env, now());
+    await runWatchdog(env.DB, env, now());
   },
 };

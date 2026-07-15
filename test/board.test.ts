@@ -2365,4 +2365,291 @@ describe("coord board", () => {
     const row = await env.DB.prepare("SELECT spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string }>();
     expect(row?.spawn_status).toBe("spawned");
   });
+
+  // ---- M2/M3/M4: leader, watchdog, answer, sleep, budget, provision, observability ----
+
+  const seedSpawnedTask = async (project: string, opts: { session: string; account: string; org?: string } & Record<string, unknown>) => {
+    const taskId = `task-${project}-${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = nowForTest();
+    await env.DB.prepare(
+      "INSERT INTO task_item(id, board_id, title, description, phase, spawn_status, worker_profile_id, created_at, updated_at) VALUES (?, ?, ?, '', 'in_progress', 'spawned', NULL, ?, ?)",
+    ).bind(taskId, project, "Watchdog task", timestamp, timestamp).run();
+    await env.DB.prepare(
+      "INSERT INTO backup_account(id, project_id, role_tag, label, org_id, credential_type, credential_ciphertext, credential_iv, key_version, enabled, status, cooldown_until, last_used_at, created_at, updated_at) VALUES (?, ?, 'worker', '', ?, 'apikey', 'ct', 'iv', 'v1', 1, 'active', NULL, NULL, ?, ?)",
+    ).bind(opts.account, project, opts.org ?? `org-${project}`, timestamp, timestamp).run().catch(() => undefined);
+    const agentId = `spawn-${project}-${Math.random().toString(36).slice(2, 8)}`;
+    await env.DB.prepare(
+      "INSERT INTO agent(id, project_id, name, role, status, metadata_json, created_at, updated_at) VALUES (?, ?, 'W', 'worker', 'online', ?, ?, ?)",
+    ).bind(agentId, project, JSON.stringify({ cloud_spawn: true, task_id: taskId, backup_account_id: opts.account, session_id: opts.session }), timestamp, timestamp).run();
+    return { taskId, agentId };
+  };
+
+  // Watchdog decrypts the backup credential to poll Devin; stub decrypt so the seeded ciphertext works.
+  const withDevin = (handler: (method: string, url: string, init?: RequestInit) => Response) => {
+    const decryptSpy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async () => new TextEncoder().encode("devin-cred").buffer);
+    const seen: string[] = [];
+    const bodies: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      seen.push(`${method} ${url}`);
+      if (init?.body) bodies.push(String(init.body));
+      return handler(method, url, init);
+    });
+    return { restore: () => { fetchMock.mockRestore(); decryptSpy.mockRestore(); }, seen, bodies };
+  };
+
+  it("registers a Cloud-Dev leader agent and links it to the project", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "leader-project", name: "Leader" }) });
+    const reg = await call("/api/board/leader", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "leader-project", session_id: "cloud-dev-sess-1", name: "Chief" }),
+    });
+    expect(reg.response.status).toBe(201);
+    expect(reg.body.role).toBe("lead");
+    expect(reg.body.token).toBeTruthy();
+    expect(reg.body.briefing_markdown).toContain("Orchestration");
+    const project = await env.DB.prepare("SELECT leader_agent_id FROM project WHERE id = ?").bind("leader-project").first<{ leader_agent_id: string }>();
+    expect(project?.leader_agent_id).toBe("lead-leader-project");
+    // Re-link with a new session id: no new token issued.
+    const relink = await call("/api/board/leader", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "leader-project", session_id: "cloud-dev-sess-2" }),
+    });
+    expect(relink.response.status).toBe(200);
+    expect(relink.body.relinked).toBe(true);
+    expect(relink.body.token).toBeUndefined();
+  });
+
+  it("rejects leader registration from a non-admin agent", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "leader-authz", name: "Authz" }) });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "leader-authz-worker", name: "W", project_id: "leader-authz", role: "worker" }),
+    });
+    const token = String(agent.body.token);
+    const attempt = await call("/api/board/leader", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "leader-authz", session_id: "x" }),
+    }, token);
+    expect(attempt.response.status).toBe(403);
+  });
+
+  it("watchdog flags a blocked worker and notifies the leader with question and choices", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "wd-block", name: "WD" }) });
+    await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-block", session_id: "s" }) });
+    const { taskId } = await seedSpawnedTask("wd-block", { session: "devin-wd-block", account: "wd-block-acct" });
+    const devin = withDevin((method, url) => {
+      if (method === "GET" && url.includes("devin-wd-block")) {
+        return new Response(JSON.stringify({ status: "blocked", question: "Which port should I use?", choices: ["8080", "9090"] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    });
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    const row = await env.DB.prepare("SELECT blocked, needs_human, watchdog_status FROM task_item WHERE id = ?").bind(taskId).first<{ blocked: number; needs_human: number; watchdog_status: string }>();
+    expect(row?.blocked).toBe(1);
+    expect(row?.needs_human).toBe(0);
+    expect(row?.watchdog_status).toBe("blocked");
+    const events = await env.DB.prepare("SELECT event_type, payload_json FROM task_event WHERE task_id = ? AND event_type = 'worker_blocked'").bind(taskId).all<{ event_type: string; payload_json: string }>();
+    expect(events.results.length).toBe(1);
+    expect(events.results[0].payload_json).toContain("Which port");
+    const delivery = await env.DB.prepare(
+      "SELECT COUNT(*) AS c FROM message_delivery WHERE recipient_agent_id = 'lead-wd-block'",
+    ).first<{ c: number }>();
+    expect(Number(delivery?.c)).toBeGreaterThanOrEqual(1);
+  });
+
+  it("watchdog escalates a high-risk blocked question as needs_human", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "wd-risk", name: "Risk" }) });
+    await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-risk", session_id: "s" }) });
+    const { taskId } = await seedSpawnedTask("wd-risk", { session: "devin-wd-risk", account: "wd-risk-acct" });
+    const devin = withDevin((method, url) => {
+      if (method === "GET" && url.includes("devin-wd-risk")) {
+        return new Response(JSON.stringify({ status: "blocked", question: "Should I delete the production database?", choices: ["yes", "no"] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    });
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    const row = await env.DB.prepare("SELECT blocked, needs_human FROM task_item WHERE id = ?").bind(taskId).first<{ blocked: number; needs_human: number }>();
+    expect(row?.blocked).toBe(1);
+    expect(row?.needs_human).toBe(1);
+    const events = await env.DB.prepare("SELECT COUNT(*) AS c FROM task_event WHERE task_id = ? AND event_type = 'worker_blocked_needs_human'").bind(taskId).first<{ c: number }>();
+    expect(Number(events?.c)).toBe(1);
+  });
+
+  it("watchdog does not re-notify while the worker stays blocked", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "wd-dedupe", name: "Dedupe" }) });
+    await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-dedupe", session_id: "s" }) });
+    const { taskId } = await seedSpawnedTask("wd-dedupe", { session: "devin-wd-dedupe", account: "wd-dedupe-acct" });
+    const respond = (method: string, url: string) =>
+      method === "GET" && url.includes("devin-wd-dedupe")
+        ? new Response(JSON.stringify({ status: "blocked", question: "Pick one", choices: ["a", "b"] }), { status: 200 })
+        : new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    let devin = withDevin(respond);
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    devin = withDevin(respond);
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    const events = await env.DB.prepare("SELECT COUNT(*) AS c FROM task_event WHERE task_id = ? AND event_type = 'worker_blocked'").bind(taskId).first<{ c: number }>();
+    expect(Number(events?.c)).toBe(1);
+  });
+
+  it("answer endpoint forwards the chosen option to the worker and clears the block", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "answer-project", name: "Answer" }) });
+    const { taskId } = await seedSpawnedTask("answer-project", { session: "devin-answer", account: "answer-acct" });
+    await env.DB.prepare("UPDATE task_item SET blocked = 1, needs_human = 1 WHERE id = ?").bind(taskId).run();
+    const devin = withDevin(() => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const answered = await call(`/api/board/tasks/${taskId}/answer`, { method: "POST", body: JSON.stringify({ message: "9090" }) });
+    devin.restore();
+    expect(answered.response.status).toBe(200);
+    expect(answered.body.delivered).toBe(true);
+    expect(devin.bodies.some((b) => b.includes("9090"))).toBe(true);
+    expect(devin.bodies.every((b) => !b.includes("devin-cred"))).toBe(true);
+    const row = await env.DB.prepare("SELECT blocked, needs_human FROM task_item WHERE id = ?").bind(taskId).first<{ blocked: number; needs_human: number }>();
+    expect(row?.blocked).toBe(0);
+    expect(row?.needs_human).toBe(0);
+  });
+
+  it("watchdog wakes an idle session that has not really finished", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "wd-wake", name: "Wake" }) });
+    const { taskId, agentId } = await seedSpawnedTask("wd-wake", { session: "devin-wd-wake", account: "wd-wake-acct" });
+    const devin = withDevin((method, url) =>
+      method === "GET" && url.includes("devin-wd-wake")
+        ? new Response(JSON.stringify({ status: "suspended" }), { status: 200 })
+        : new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    expect(devin.seen.some((e) => e.startsWith("POST") && e.includes("devin-wd-wake") && e.includes("/messages"))).toBe(true);
+    const evt = await env.DB.prepare("SELECT COUNT(*) AS c FROM task_event WHERE task_id = ? AND event_type = 'worker_wake_nudge'").bind(taskId).first<{ c: number }>();
+    expect(Number(evt?.c)).toBe(1);
+    const agent = await env.DB.prepare("SELECT metadata_json FROM agent WHERE id = ?").bind(agentId).first<{ metadata_json: string }>();
+    expect(JSON.parse(agent!.metadata_json).last_wake_at).toBeTruthy();
+  });
+
+  it("watchdog does not wake a session that has really completed; it escalates for verification", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "wd-done", name: "Done" }) });
+    await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-done", session_id: "s" }) });
+    const { taskId } = await seedSpawnedTask("wd-done", { session: "devin-wd-done", account: "wd-done-acct" });
+    const devin = withDevin((method, url) =>
+      method === "GET" && url.includes("devin-wd-done")
+        ? new Response(JSON.stringify({ status: "idle", structured_output: { result: "shipped" } }), { status: 200 })
+        : new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    expect(devin.seen.some((e) => e.startsWith("POST") && e.includes("devin-wd-done") && e.includes("/messages"))).toBe(false);
+    const row = await env.DB.prepare("SELECT needs_human FROM task_item WHERE id = ?").bind(taskId).first<{ needs_human: number }>();
+    expect(row?.needs_human).toBe(1);
+    const evt = await env.DB.prepare("SELECT COUNT(*) AS c FROM task_event WHERE task_id = ? AND event_type = 'worker_session_ended'").bind(taskId).first<{ c: number }>();
+    expect(Number(evt?.c)).toBe(1);
+  });
+
+  it("sleep endpoint sleeps the worker and stops the watchdog from waking it", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "sleep-project", name: "Sleep" }) });
+    const { taskId, agentId } = await seedSpawnedTask("sleep-project", { session: "devin-sleep", account: "sleep-acct" });
+    let devin = withDevin(() => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    const slept = await call(`/api/board/tasks/${taskId}/sleep`, { method: "POST", body: JSON.stringify({}) });
+    devin.restore();
+    expect(slept.response.status).toBe(200);
+    const agent = await env.DB.prepare("SELECT metadata_json FROM agent WHERE id = ?").bind(agentId).first<{ metadata_json: string }>();
+    expect(JSON.parse(agent!.metadata_json).leader_sleep).toBe(1);
+    // The watchdog now ignores this worker even if the session looks idle.
+    devin = withDevin((method, url) =>
+      method === "GET" && url.includes("devin-sleep")
+        ? new Response(JSON.stringify({ status: "suspended" }), { status: 200 })
+        : new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    expect(devin.seen.some((e) => e.includes("devin-sleep"))).toBe(false);
+  });
+
+  it("budget breaker stops spawning once the project spawn budget is consumed", async () => {
+    await call("/api/board/provision", {
+      method: "POST",
+      body: JSON.stringify({
+        project: { id: "budget-project", name: "Budget", spawn_budget_max: 1 },
+        worker_profiles: [{ id: "budget-profile", name: "P", role_tag: "worker" }],
+        backup_accounts: [{ id: "budget-account", role_tag: "worker", org_id: "org-budget", credential: "budget-secret" }],
+      }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "budget-project", title: "Over budget", worker_profile_id: "budget-profile", spawn: true }),
+    });
+    const taskId = String(task.body.id);
+    // One spawn already consumed the budget (spawn_created events are the budget ledger).
+    await env.DB.prepare(
+      "INSERT INTO task_event(id, task_id, actor_agent_id, event_type, payload_json, created_at) VALUES (?, ?, NULL, 'spawn_created', ?, ?)",
+    ).bind(`evt-${Math.random().toString(36).slice(2)}`, taskId, JSON.stringify({ project_id: "budget-project" }), nowForTest()).run();
+    const devin = withDevin(() => new Response(JSON.stringify({ session_id: "should-not-happen" }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    devin.restore();
+    const row = await env.DB.prepare("SELECT spawn_status, needs_human FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string; needs_human: number }>();
+    expect(row?.spawn_status).toBe("failed");
+    expect(row?.needs_human).toBe(1);
+    const evt = await env.DB.prepare("SELECT COUNT(*) AS c FROM task_event WHERE task_id = ? AND event_type = 'spawn_budget_exceeded'").bind(taskId).first<{ c: number }>();
+    expect(Number(evt?.c)).toBe(1);
+  });
+
+  it("provisions a project, profiles, and encrypted accounts without leaking credentials", async () => {
+    const result = await call("/api/board/provision", {
+      method: "POST",
+      body: JSON.stringify({
+        project: { id: "prov-project", name: "Provisioned", spawn_budget_max: 5 },
+        worker_profiles: [
+          { id: "prov-dev", name: "Dev", role_tag: "developer", model: "gpt-5" },
+          { id: "prov-rev", name: "Rev", role_tag: "reviewer" },
+        ],
+        backup_accounts: [{ id: "prov-acct", role_tag: "developer", org_id: "org-prov", credential: "prov-secret-cred" }],
+        leader: { session_id: "prov-sess", name: "Prov Lead" },
+      }),
+    });
+    expect(result.response.status).toBe(201);
+    expect(JSON.stringify(result.body)).not.toContain("prov-secret-cred");
+    expect(result.body.worker_profile_ids).toEqual(expect.arrayContaining(["prov-dev", "prov-rev"]));
+    expect(result.body.backup_account_ids).toEqual(["prov-acct"]);
+    expect(result.body.leader.role).toBe("lead");
+    const stored = await env.DB.prepare("SELECT credential_ciphertext FROM backup_account WHERE id = ?").bind("prov-acct").first<{ credential_ciphertext: string }>();
+    expect(stored?.credential_ciphertext).toBeTruthy();
+    expect(stored?.credential_ciphertext).not.toContain("prov-secret-cred");
+    const project = await env.DB.prepare("SELECT spawn_budget_max, leader_agent_id FROM project WHERE id = ?").bind("prov-project").first<{ spawn_budget_max: number; leader_agent_id: string }>();
+    expect(project?.spawn_budget_max).toBe(5);
+    expect(project?.leader_agent_id).toBe("lead-prov-project");
+  });
+
+  it("spawn-stats reports per-profile metrics and budget usage", async () => {
+    await call("/api/board/provision", {
+      method: "POST",
+      body: JSON.stringify({
+        project: { id: "stats-project", name: "Stats", spawn_budget_max: 3 },
+        worker_profiles: [{ id: "stats-profile", name: "P", role_tag: "worker" }],
+      }),
+    });
+    await env.DB.prepare(
+      "INSERT INTO task_item(id, board_id, title, description, phase, spawn_status, worker_profile_id, blocked, needs_human, created_at, updated_at) VALUES (?, 'stats-project', 'T', '', 'in_progress', 'spawned', 'stats-profile', 1, 0, ?, ?)",
+    ).bind(`stats-task-${Math.random().toString(36).slice(2)}`, nowForTest(), nowForTest()).run();
+    const stats = await call("/api/board/spawn-stats?project=stats-project");
+    expect(stats.response.status).toBe(200);
+    expect(stats.body.budget).toMatchObject({ max: 3 });
+    const profile = stats.body.profiles.find((p: Record<string, unknown>) => p.worker_profile_id === "stats-profile");
+    expect(profile.spawned).toBe(1);
+    expect(profile.blocked).toBe(1);
+    expect(profile.active).toBe(1);
+  });
+
+  it("enforces project isolation on the leader dashboard", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "iso-a", name: "A" }) });
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "iso-b", name: "B" }) });
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "iso-a-lead", name: "L", project_id: "iso-a", role: "lead" }),
+    });
+    const token = String(agent.body.token);
+    const cross = await call("/api/board/leader?project=iso-b", {}, token);
+    expect(cross.response.status).toBe(403);
+    const own = await call("/api/board/leader?project=iso-a", {}, token);
+    expect(own.response.status).toBe(200);
+  });
 });

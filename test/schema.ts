@@ -33,6 +33,11 @@ CREATE INDEX IF NOT EXISTS idx_worker_profile_project ON worker_profile(project_
 ALTER TABLE task_item ADD COLUMN worker_profile_id TEXT;
 ALTER TABLE task_item ADD COLUMN spawn_status TEXT CHECK (spawn_status IN ('requested', 'spawning', 'spawned', 'failed'));
 CREATE INDEX IF NOT EXISTS idx_task_spawn ON task_item(spawn_status, phase, board_id);
+ALTER TABLE project ADD COLUMN leader_agent_id TEXT;
+ALTER TABLE project ADD COLUMN spawn_budget_max INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE task_item ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0 CHECK (needs_human IN (0, 1));
+ALTER TABLE task_item ADD COLUMN watchdog_status TEXT;
+CREATE INDEX IF NOT EXISTS idx_task_needs_human ON task_item(board_id, needs_human, deleted_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_token_hash ON agent(token_hash) WHERE token_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_agent_project ON agent(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_agent_status ON agent(status, last_seen_at);
