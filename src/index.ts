@@ -71,6 +71,22 @@ const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
     headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
 
+const CORS_HEADERS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+  "access-control-allow-headers": "authorization,content-type,idempotency-key,x-agent-id",
+  "access-control-expose-headers": "content-type,idempotency-key",
+  "access-control-max-age": "86400",
+};
+
+// Every browser-visible response (including errors) must carry CORS headers; otherwise a cross-origin
+// caller sees a generic "Failed to fetch" instead of the real status (e.g. 401 unauthorized).
+const withCors = (response: Response): Response => {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(CORS_HEADERS)) headers.set(key, value);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+};
+
 const now = () => new Date().toISOString();
 const id = () => crypto.randomUUID();
 
@@ -4141,17 +4157,27 @@ document.querySelector('#agents').addEventListener('click',e=>{const b=e.target.
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+    try {
+      return withCors(await route(request, env, ctx));
+    } catch (error) {
+      return withCors(json({ error: error instanceof Error ? error.message : "internal error" }, 500));
+    }
+  },
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await deliverHookOutbox(env.DB);
+    await sweepLeases(env.DB, env);
+    await runWorkerSpawn(env.DB, env, now());
+    await runWatchdog(env.DB, env, now());
+  },
+};
+
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health" || url.pathname === "/api/health") {
       return json({ ok: true, service: "coord-board" });
-    }
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "access-control-allow-origin": "*",
-          "access-control-allow-headers": "authorization,content-type,idempotency-key,x-agent-id",
-        },
-      });
     }
     const auth = await authenticate(request, env);
     if (!auth) {
@@ -4226,11 +4252,4 @@ export default {
       return hookDeliveries(request, env, auth);
     }
     return json({ error: "not found" }, 404);
-  },
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    await deliverHookOutbox(env.DB);
-    await sweepLeases(env.DB, env);
-    await runWorkerSpawn(env.DB, env, now());
-    await runWatchdog(env.DB, env, now());
-  },
-};
+}

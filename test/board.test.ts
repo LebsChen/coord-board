@@ -27,6 +27,17 @@ describe("coord board", () => {
     }
   });
 
+  it("returns CORS headers on OPTIONS and on error responses", async () => {
+    const preflight = await SELF.fetch(new Request("https://coord-board.test/api/board/projects", { method: "OPTIONS" }));
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("*");
+    const unauthorized = await SELF.fetch(new Request("https://coord-board.test/api/board/projects"));
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers.get("access-control-allow-origin")).toBe("*");
+    const notFound = await SELF.fetch(request("/api/board/does-not-exist"));
+    expect(notFound.status).toBe(404);
+    expect(notFound.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
   it("encrypts backup credentials and exposes metadata only", async () => {
     const project = await call("/api/board/projects", {
       method: "POST",
