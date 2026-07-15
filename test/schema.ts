@@ -28,5 +28,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_message_project_idempotency ON message(pro
 CREATE TABLE IF NOT EXISTS message_delivery (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, project_id TEXT NOT NULL, recipient_agent_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('unread', 'seen', 'acked', 'nacked', 'dead')), seen_at TEXT, acked_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, UNIQUE (message_id, recipient_agent_id), FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE, FOREIGN KEY (recipient_agent_id) REFERENCES agent(id));
 CREATE INDEX IF NOT EXISTS idx_message_delivery_recipient_updated ON message_delivery(recipient_agent_id, updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_message_created_desc ON message(created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS worker_profile (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, role_tag TEXT NOT NULL, model TEXT, snapshot_id TEXT, system_prompt TEXT, prompt_template TEXT, playbook_refs_json TEXT NOT NULL DEFAULT '[]', knowledge_refs_json TEXT NOT NULL DEFAULT '[]', mcp_tools_json TEXT NOT NULL DEFAULT '[]', repo_config_json TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS idx_worker_profile_project ON worker_profile(project_id, role_tag, enabled);
+ALTER TABLE task_item ADD COLUMN worker_profile_id TEXT;
+ALTER TABLE task_item ADD COLUMN spawn_status TEXT CHECK (spawn_status IN ('requested', 'spawning', 'spawned', 'failed'));
+CREATE INDEX IF NOT EXISTS idx_task_spawn ON task_item(board_id, spawn_status, phase, deleted_at);
 `;
 export default schema;

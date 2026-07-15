@@ -2026,4 +2026,152 @@ describe("coord board", () => {
       "SELECT COUNT(*) AS count FROM account_claim WHERE project_id = ? AND account_ref = ?",
     ).bind("claims-project", "account-denied").first<{ count: number }>())?.count).toBe(0);
   });
+
+  it("stores worker profiles and hides them from other projects", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "profile-project", name: "Profile Project" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    const created = await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "profile-project",
+        id: "profile-dev",
+        name: "Developer",
+        role_tag: "开发",
+        model: "gpt-5",
+        snapshot_id: "snap-1",
+        system_prompt: "You build features.",
+        prompt_template: "Work on {{task_title}} ({{task_id}}).",
+        playbook_refs: ["pb-1"],
+        knowledge_refs: ["kn-1"],
+        mcp_tools: ["github"],
+        repo_config: { repo: "org/app", branch: "main" },
+      }),
+    });
+    expect(created.response.status).toBe(200);
+    expect(created.body.worker_profiles[0]).toMatchObject({
+      id: "profile-dev",
+      role_tag: "开发",
+      model: "gpt-5",
+      playbook_refs: ["pb-1"],
+      repo_config: { repo: "org/app", branch: "main" },
+      enabled: 1,
+    });
+    const listed = await call("/api/board/worker-profiles?project=profile-project");
+    expect(listed.response.status).toBe(200);
+    expect(listed.body.worker_profiles).toHaveLength(1);
+
+    const worker = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "profile-worker", project_id: "profile-project", name: "PW", role: "worker" }),
+    });
+    const denied = await call(
+      "/api/board/worker-profiles?project=profile-project",
+      { method: "GET" },
+      String(worker.body.token),
+    );
+    expect(denied.response.status).toBe(403);
+
+    const deleted = await call("/api/board/worker-profiles/profile-dev", { method: "DELETE" });
+    expect(deleted.response.status).toBe(200);
+    expect((await call("/api/board/worker-profiles?project=profile-project")).body.worker_profiles).toHaveLength(0);
+  });
+
+  it("rejects task spawn without a worker profile and records requested spawn", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "spawn-project", name: "Spawn Project" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "spawn-project",
+        id: "spawn-profile",
+        name: "Spawn Dev",
+        role_tag: "worker",
+        system_prompt: "Build it.",
+      }),
+    });
+    const invalid = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "spawn-project", title: "No profile spawn", spawn: true }),
+    });
+    expect(invalid.response.status).toBe(422);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        board_id: "spawn-project",
+        title: "Spawn me",
+        worker_profile_id: "spawn-profile",
+        spawn: true,
+      }),
+    });
+    expect(task.response.status).toBe(201);
+    expect(task.body.worker_profile_id).toBe("spawn-profile");
+    expect(task.body.spawn_status).toBe("requested");
+  });
+
+  it("spawns a worker session for a requested task via the scheduled run", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "spawn-run-project", name: "Spawn Run" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "spawn-run-project",
+        id: "spawn-run-profile",
+        name: "Runner",
+        role_tag: "worker",
+        model: "gpt-5",
+      }),
+    });
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "spawn-run-project",
+        id: "spawn-run-account",
+        role_tag: "worker",
+        org_id: "org-spawn-run",
+        credential: "api-secret-spawn-run",
+      }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        board_id: "spawn-run-project",
+        title: "Cloud spawn task",
+        description: "Do the work",
+        worker_profile_id: "spawn-run-profile",
+        spawn: true,
+      }),
+    });
+    expect(task.response.status).toBe(201);
+    const taskId = String(task.body.id);
+    const capturedPrompts: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      capturedPrompts.push(String(JSON.parse(String(init?.body ?? "{}")).prompt ?? ""));
+      return new Response(JSON.stringify({ session_id: "devin-spawn-run" }), { status: 200 });
+    });
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+
+    const row = await env.DB.prepare(
+      "SELECT spawn_status, assignee_agent_id FROM task_item WHERE id = ?",
+    ).bind(taskId).first<{ spawn_status: string; assignee_agent_id: string }>();
+    expect(row?.spawn_status).toBe("spawned");
+    expect(row?.assignee_agent_id).toMatch(/^spawn-/);
+    const agent = await env.DB.prepare(
+      "SELECT metadata_json FROM agent WHERE id = ?",
+    ).bind(row!.assignee_agent_id).first<{ metadata_json: string }>();
+    expect(JSON.parse(agent!.metadata_json).session_id).toBe("devin-spawn-run");
+    expect(capturedPrompts.some((prompt) => prompt.includes("Cloud spawn task"))).toBe(true);
+    expect(capturedPrompts.every((prompt) => !prompt.includes("api-secret-spawn-run"))).toBe(true);
+    const account = await env.DB.prepare(
+      "SELECT status FROM backup_account WHERE id = ?",
+    ).bind("spawn-run-account").first<{ status: string }>();
+    expect(account?.status).toBe("active");
+  });
 });

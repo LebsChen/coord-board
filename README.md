@@ -257,6 +257,14 @@ Send operations accept `Idempotency-Key` and replay the original response withou
 - `POST /api/board/agents/:id/idle`
 - `POST /api/board/agents/:id/shutdown`
 
+### Worker profiles
+
+- `GET /api/board/worker-profiles?project=<project-id>` — list per-worker configuration for a project.
+- `POST /api/board/worker-profiles` — upsert one profile or a batch (`worker_profiles: [...]`). Requires `id`, `name`, `role_tag`; optional `model`, `snapshot_id`, `system_prompt`, `prompt_template`, `playbook_refs`, `knowledge_refs`, `mcp_tools`, `repo_config`, `enabled`.
+- `DELETE /api/board/worker-profiles/:id`
+
+A task created with `worker_profile_id` and `spawn: true` is queued (`spawn_status = requested`). The scheduled run reserves a backup account matching the profile's `role_tag`, registers a worker agent, creates a Devin session seeded from the profile (model/snapshot/system prompt/prompt template + playbook/knowledge/MCP/repo config and the role briefing), and assigns the task to that agent. This reuses the same encrypted-credential and reservation path as failover.
+
 ### Team
 
 - `GET /api/board/team?project=<project-id>`
