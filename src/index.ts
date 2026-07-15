@@ -39,6 +39,8 @@ const DEFAULT_FAILOVER_COOLDOWN_SECONDS = 15 * 60;
 const DEFAULT_FAILOVER_STALE_GRACE_SECONDS = 10 * 60;
 const FAILOVER_REPLACEMENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const FAILOVER_REPLACEMENT_RESERVATION_TIMEOUT_MS = 10 * 60 * 1000;
+const SPAWN_STALE_GRACE_MS = 10 * 60 * 1000;
+const SPAWN_MAX_ACTIVE_PER_PROJECT = 8;
 const DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS = 5 * 60;
 const MIN_ACCOUNT_CLAIM_TTL_SECONDS = 30;
 const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
@@ -561,6 +563,34 @@ async function registerFailoverAgent(
   return { id: agentId, token };
 }
 
+async function createDevinSession(
+  env: Env,
+  orgId: string,
+  credential: string,
+  prompt: string,
+  options: { snapshotId?: string | null; playbookId?: string | null } = {},
+): Promise<string> {
+  const requestBody: Json = { prompt };
+  if (options.snapshotId) requestBody.snapshot_id = options.snapshotId;
+  if (options.playbookId) requestBody.playbook_id = options.playbookId;
+  const response = await fetch(
+    `https://api.devin.ai/v3/organizations/${encodeURIComponent(orgId)}/sessions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credential}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    },
+  );
+  if (!response.ok) throw new Error(`Devin session creation failed (${response.status})`);
+  const data = await response.json() as { session_id?: string; devin_id?: string };
+  const sessionId = data.session_id || data.devin_id;
+  if (!sessionId) throw new Error("Devin session creation returned no session id");
+  return sessionId;
+}
+
 async function createFailoverSession(
   env: Env,
   candidate: StaleFailoverCandidate,
@@ -583,22 +613,98 @@ async function createFailoverSession(
     roleBriefing,
     `Claim task ${candidate.task_id} using the Board API, then continue the task. Do not rely on the desktop client.`,
   ].join("\n\n");
-  const response = await fetch(
-    `https://api.devin.ai/v3/organizations/${encodeURIComponent(String(backup.org_id))}/sessions`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${credential}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ prompt }),
-    },
+  return createDevinSession(env, String(backup.org_id), credential, prompt);
+}
+
+type WorkerProfileRow = {
+  id: string;
+  role_tag: string;
+  model: string | null;
+  snapshot_id: string | null;
+  system_prompt: string | null;
+  prompt_template: string | null;
+  playbook_refs_json: string;
+  knowledge_refs_json: string;
+  mcp_tools_json: string;
+  repo_config_json: string;
+};
+
+function buildSpawnPrompt(
+  env: Env,
+  task: { id: string; project_id: string; title: string; description: string },
+  profile: WorkerProfileRow,
+  agent: { id: string; token: string },
+): string {
+  const parseArray = (value: string): unknown[] => {
+    try {
+      const parsed = JSON.parse(value || "[]");
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  const model = profile.model ? profile.model.trim() : "";
+  const playbooks = parseArray(profile.playbook_refs_json);
+  const knowledge = parseArray(profile.knowledge_refs_json);
+  const mcpTools = parseArray(profile.mcp_tools_json);
+  let repoConfig: Json = {};
+  try {
+    const parsed = JSON.parse(profile.repo_config_json || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) repoConfig = parsed as Json;
+  } catch {
+    repoConfig = {};
+  }
+  const lines: string[] = [];
+  if (profile.system_prompt && profile.system_prompt.trim()) lines.push(profile.system_prompt.trim());
+  lines.push(`You are a cloud worker for role "${profile.role_tag}" spawned by the Coord Board.`);
+  if (model) lines.push(`Preferred model: ${model}.`);
+  const promptTemplate = profile.prompt_template && profile.prompt_template.trim()
+    ? profile.prompt_template
+      .replaceAll("{{task_id}}", task.id)
+      .replaceAll("{{task_title}}", task.title)
+      .replaceAll("{{task_description}}", task.description)
+      .replaceAll("{{project_id}}", task.project_id)
+      .replaceAll("{{agent_id}}", agent.id)
+    : `Task: ${task.title}\n\n${task.description}`.trim();
+  lines.push(promptTemplate);
+  lines.push(`Board URL: ${failoverBoardUrl(env)}`);
+  lines.push(`Board project: ${task.project_id}`);
+  lines.push(`Your Board agent id: ${agent.id}`);
+  lines.push(`Your per-agent Board bearer token: ${agent.token}`);
+  if (playbooks.length) lines.push(`Follow these playbooks: ${playbooks.map(String).join(", ")}.`);
+  if (knowledge.length) lines.push(`Apply this knowledge: ${knowledge.map(String).join(", ")}.`);
+  if (mcpTools.length) lines.push(`Use these MCP tools when available: ${mcpTools.map(String).join(", ")}.`);
+  if (Object.keys(repoConfig).length) lines.push(`Repository configuration: ${JSON.stringify(repoConfig)}.`);
+  lines.push(briefingMarkdown(profile.role_tag));
+  lines.push(`Claim task ${task.id} using the Board API, then work it to completion. Do not rely on the desktop client.`);
+  return lines.join("\n\n");
+}
+
+async function createWorkerSession(
+  env: Env,
+  task: { id: string; project_id: string; title: string; description: string },
+  profile: WorkerProfileRow,
+  backup: Record<string, unknown>,
+  agent: { id: string; token: string },
+): Promise<string> {
+  const credential = await decryptBackupCredential(
+    env,
+    String(backup.credential_ciphertext),
+    String(backup.credential_iv),
   );
-  if (!response.ok) throw new Error(`Devin session creation failed (${response.status})`);
-  const data = await response.json() as { session_id?: string; devin_id?: string };
-  const sessionId = data.session_id || data.devin_id;
-  if (!sessionId) throw new Error("Devin session creation returned no session id");
-  return sessionId;
+  const prompt = buildSpawnPrompt(env, task, profile, agent);
+  const playbooks = (() => {
+    try {
+      const parsed = JSON.parse(profile.playbook_refs_json || "[]");
+      return Array.isArray(parsed) && parsed.length ? String(parsed[0]) : null;
+    } catch {
+      return null;
+    }
+  })();
+  return createDevinSession(env, String(backup.org_id), credential, prompt, {
+    snapshotId: profile.snapshot_id,
+    playbookId: playbooks,
+  });
 }
 
 async function terminateFailoverSession(
@@ -833,6 +939,190 @@ async function runCloudFailover(
   }
 }
 
+async function registerSpawnAgent(
+  db: D1Database,
+  projectId: string,
+  taskId: string,
+  role: string,
+  backup: Record<string, unknown>,
+): Promise<{ id: string; token: string }> {
+  const agentId = `spawn-${taskId.slice(0, 8)}-${id().slice(0, 8)}`;
+  const token = randomToken();
+  const timestamp = now();
+  const metadata = JSON.stringify({ cloud_spawn: true, task_id: taskId, backup_account_id: String(backup.id) });
+  await db.batch([
+    db.prepare(
+      `INSERT INTO agent(
+         id, project_id, name, role, status, last_seen_at, metadata_json,
+         token_hash, token_issued_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      agentId, projectId, `Worker for ${taskId}`, role,
+      timestamp, metadata, await sha256(token), timestamp, timestamp, timestamp,
+    ),
+    db.prepare(
+      "INSERT INTO agent_event(id, agent_id, project_id, event_type, payload_json, created_at) VALUES (?, ?, ?, 'agent_spawn_registered', ?, ?)",
+    ).bind(id(), agentId, projectId, JSON.stringify({ task_id: taskId, backup_account_id: String(backup.id) }), timestamp),
+  ]);
+  return { id: agentId, token };
+}
+
+async function releaseSpawnResources(
+  db: D1Database,
+  env: Env,
+  projectId: string,
+  backup: Record<string, unknown>,
+  agent: { id: string; token: string } | null,
+  sessionId: string | null,
+  timestamp: string,
+): Promise<void> {
+  if (sessionId) await terminateFailoverSession(env, backup, sessionId);
+  if (agent) {
+    await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(agent.id, projectId).run();
+  }
+  await db.prepare(
+    "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+  ).bind(timestamp, backup.id, projectId).run();
+}
+
+async function reconcileStaleSpawns(db: D1Database, env: Env, timestamp: string): Promise<void> {
+  // Recover tasks whose spawn was claimed but never finished (e.g. isolate died mid-spawn).
+  // If a Devin session was already created before the isolate died, its id was persisted onto
+  // the spawn agent; terminate that orphaned session and release its account before re-queuing.
+  const cutoff = new Date(Date.now() - SPAWN_STALE_GRACE_MS).toISOString();
+  const stale = await db.prepare(
+    "SELECT id, board_id FROM task_item WHERE spawn_status = 'spawning' AND updated_at <= ?",
+  ).bind(cutoff).all<{ id: string; board_id: string }>();
+  for (const stuck of stale.results) {
+    const orphans = await db.prepare(
+      `SELECT id, metadata_json FROM agent
+       WHERE project_id = ? AND json_extract(metadata_json, '$.cloud_spawn') = 1
+         AND json_extract(metadata_json, '$.task_id') = ?`,
+    ).bind(stuck.board_id, stuck.id).all<{ id: string; metadata_json: string }>();
+    for (const orphan of orphans.results) {
+      let meta: Record<string, unknown> = {};
+      try { meta = JSON.parse(orphan.metadata_json || "{}"); } catch { meta = {}; }
+      const backupId = meta.backup_account_id ? String(meta.backup_account_id) : null;
+      const sessionId = meta.session_id ? String(meta.session_id) : null;
+      if (backupId) {
+        if (sessionId) {
+          const backup = await db.prepare(
+            "SELECT * FROM backup_account WHERE id = ? AND project_id = ?",
+          ).bind(backupId, stuck.board_id).first<Record<string, unknown>>();
+          if (backup) await terminateFailoverSession(env, backup, sessionId).catch(() => undefined);
+        }
+        await db.prepare(
+          "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+        ).bind(timestamp, backupId, stuck.board_id).run().catch(() => undefined);
+      }
+      await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(orphan.id, stuck.board_id).run();
+    }
+    await db.prepare(
+      "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
+    ).bind(timestamp, stuck.id).run();
+  }
+}
+
+async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Promise<void> {
+  await reconcileStaleSpawns(db, env, timestamp);
+  const pending = await db.prepare(
+    `SELECT t.id AS task_id, t.board_id AS project_id, t.title, t.description, t.worker_profile_id
+     FROM task_item t
+     WHERE t.spawn_status = 'requested' AND t.deleted_at IS NULL
+       AND t.phase IN ('pending', 'ready') AND t.worker_profile_id IS NOT NULL
+     ORDER BY t.priority, t.sort_order, t.created_at
+     LIMIT 25`,
+  ).all<{ task_id: string; project_id: string; title: string; description: string; worker_profile_id: string }>();
+  for (const candidate of pending.results) {
+    // Atomically claim the task AND enforce the per-project concurrency cap in one
+    // statement: D1 serializes writes, so folding the count into the CAS predicate makes
+    // the quota race-free (unlike a separate count-then-act check).
+    const claim = await db.prepare(
+      `UPDATE task_item SET spawn_status = 'spawning', updated_at = ?
+       WHERE id = ? AND spawn_status = 'requested'
+         AND (
+           SELECT COUNT(*) FROM task_item active
+           WHERE active.board_id = ? AND active.deleted_at IS NULL AND active.id <> ?
+             AND active.spawn_status IN ('spawning', 'spawned') AND active.phase <> 'done'
+         ) < ?`,
+    ).bind(timestamp, candidate.task_id, candidate.project_id, candidate.task_id, SPAWN_MAX_ACTIVE_PER_PROJECT).run();
+    if ((claim.meta.changes ?? 0) !== 1) continue;
+    const profile = await db.prepare(
+      "SELECT * FROM worker_profile WHERE id = ? AND project_id = ? AND enabled = 1",
+    ).bind(candidate.worker_profile_id, candidate.project_id).first<WorkerProfileRow>();
+    if (!profile) {
+      await db.batch([
+        db.prepare("UPDATE task_item SET spawn_status = 'failed', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'").bind(timestamp, candidate.task_id),
+        event(db, candidate.task_id, "spawn_failed", null, { reason: "worker profile missing or disabled" }),
+      ]);
+      continue;
+    }
+    const backup = await reserveBackupAccount(db, candidate.project_id, profile.role_tag, timestamp);
+    if (!backup) {
+      await db.prepare(
+        "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
+      ).bind(timestamp, candidate.task_id).run();
+      continue;
+    }
+    const taskForSession = {
+      id: candidate.task_id,
+      project_id: candidate.project_id,
+      title: candidate.title,
+      description: candidate.description,
+    };
+    let agent: { id: string; token: string } | null = null;
+    let sessionId: string | null = null;
+    try {
+      agent = await registerSpawnAgent(db, candidate.project_id, candidate.task_id, profile.role_tag, backup);
+      sessionId = await createWorkerSession(env, taskForSession, profile, backup, agent);
+      // Persist the session id onto the agent immediately so that if the isolate dies
+      // before the commit below, reconcileStaleSpawns can find and terminate this session.
+      await db.prepare(
+        "UPDATE agent SET metadata_json = json_set(metadata_json, '$.session_id', ?), updated_at = ? WHERE id = ? AND project_id = ?",
+      ).bind(sessionId, timestamp, agent.id, candidate.project_id).run();
+      // Commit the task transition first so we never leave a live session on a task
+      // that was deleted or re-claimed while we were talking to the Devin API.
+      const assigned = await db.prepare(
+        "UPDATE task_item SET spawn_status = 'spawned', assignee_agent_id = ?, phase = CASE WHEN phase = 'pending' THEN 'ready' ELSE phase END, updated_at = ? WHERE id = ? AND spawn_status = 'spawning' AND deleted_at IS NULL",
+      ).bind(agent.id, timestamp, candidate.task_id).run();
+      if ((assigned.meta.changes ?? 0) !== 1) {
+        await releaseSpawnResources(db, env, candidate.project_id, backup, agent, sessionId, timestamp);
+        await event(db, candidate.task_id, "spawn_aborted", null, {
+          project_id: candidate.project_id,
+          worker_profile_id: profile.id,
+          reason: "task no longer claimable when spawn completed",
+        }).run().catch(() => undefined);
+        continue;
+      }
+      const cooldownUntil = new Date(Date.now() + DEFAULT_FAILOVER_COOLDOWN_SECONDS * 1000).toISOString();
+      await db.batch([
+        db.prepare(
+          "UPDATE backup_account SET status = 'active', cooldown_until = ?, last_used_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+        ).bind(cooldownUntil, timestamp, timestamp, backup.id, candidate.project_id),
+        event(db, candidate.task_id, "spawn_created", agent.id, {
+          project_id: candidate.project_id,
+          worker_profile_id: profile.id,
+          backup_account_id: String(backup.id),
+          session_id: sessionId,
+        }),
+      ]);
+    } catch (error) {
+      await releaseSpawnResources(db, env, candidate.project_id, backup, agent, sessionId, timestamp);
+      await db.batch([
+        db.prepare(
+          "UPDATE task_item SET spawn_status = 'failed', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
+        ).bind(timestamp, candidate.task_id),
+        event(db, candidate.task_id, "spawn_failed", null, {
+          project_id: candidate.project_id,
+          worker_profile_id: profile.id,
+          backup_account_id: String(backup.id),
+          reason: error instanceof Error ? error.message : "worker session creation failed",
+        }),
+      ]);
+    }
+  }
+}
+
 async function sweepLeases(db: D1Database, env?: Env): Promise<void> {
   const timestamp = now();
   const staleIdempotencyBefore = new Date(Date.now() - IDEMPOTENCY_IN_PROGRESS_TTL_MS).toISOString();
@@ -892,6 +1182,23 @@ function conditionalEvent(
 
 async function task(db: D1Database, taskId: string): Promise<Record<string, unknown> | null> {
   return db.prepare("SELECT * FROM task_item WHERE id = ?").bind(taskId).first<Record<string, unknown>>();
+}
+
+const D1_MAX_IN_PARAMS = 90;
+
+async function selectByIdChunks<T>(
+  db: D1Database,
+  ids: string[],
+  build: (placeholders: string) => string,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let offset = 0; offset < ids.length; offset += D1_MAX_IN_PARAMS) {
+    const chunk = ids.slice(offset, offset + D1_MAX_IN_PARAMS);
+    const placeholders = chunk.map(() => "?").join(",");
+    const result = await db.prepare(build(placeholders)).bind(...chunk).all<T>();
+    out.push(...result.results);
+  }
+  return out;
 }
 
 async function listDependencies(db: D1Database, taskId: string): Promise<string[]> {
@@ -979,6 +1286,17 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       if (!assigneeRow) return json({ error: "assignee agent not found" }, 422);
       if (assigneeRow.project_id !== boardId) return json({ error: "assignee belongs to another project" }, 403);
     }
+    const workerProfileId = body.worker_profile_id ? String(body.worker_profile_id).trim() : null;
+    if (workerProfileId) {
+      const profileRow = await env.DB.prepare(
+        "SELECT project_id FROM worker_profile WHERE id = ?",
+      ).bind(workerProfileId).first<{ project_id: string }>();
+      if (!profileRow) return json({ error: "worker profile not found" }, 422);
+      if (profileRow.project_id !== boardId) return json({ error: "worker profile belongs to another project" }, 403);
+    }
+    const spawnRequested = flag(body.spawn) === 1;
+    if (spawnRequested && !workerProfileId) return json({ error: "spawn requires worker_profile_id" }, 422);
+    const spawnStatus = spawnRequested ? "requested" : null;
     const key = idempotencyKey(request, body);
     const replay = await replayOrReserve(db, `task:create:${boardId}`, key);
     if (replay) return replay;
@@ -1010,6 +1328,8 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       required_gates: JSON.stringify(requiredGateNames),
       priority: Number(body.priority ?? 5),
       assignee_agent_id: assignee,
+      worker_profile_id: workerProfileId,
+      spawn_status: spawnStatus,
       sort_order: Number(body.sort_order ?? 0),
       dependencies: [],
       created_at: timestamp,
@@ -1020,14 +1340,18 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       db.prepare(
         `INSERT INTO task_item(
           id, board_id, title, description, phase, require_plan, require_acceptance, required_gates, priority,
-          assignee_agent_id, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          assignee_agent_id, worker_profile_id, spawn_status, sort_order, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         taskIdNew, responseBody.board_id, responseBody.title, responseBody.description, phase,
         requirePlan, requireAcceptance, responseBody.required_gates, responseBody.priority, responseBody.assignee_agent_id,
-        responseBody.sort_order, timestamp, timestamp,
+        workerProfileId, spawnStatus, responseBody.sort_order, timestamp, timestamp,
       ),
-      event(db, taskIdNew, "created", actor(auth), { title: responseBody.title }),
+      event(db, taskIdNew, "created", actor(auth), {
+        title: responseBody.title,
+        ...(workerProfileId ? { worker_profile_id: workerProfileId } : {}),
+        ...(spawnStatus ? { spawn_status: spawnStatus } : {}),
+      }),
     ]);
     return saveIdempotentResponse(db, `task:create:${boardId}`, key, json(responseBody, 201));
   }
@@ -1071,6 +1395,27 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       ).bind(assignee, String(current.board_id)).first();
       if (!target) return json({ error: "assignee agent not found in project" }, 422);
     }
+    const profileSpecified = body.worker_profile_id !== undefined;
+    const workerProfileId = !profileSpecified
+      ? (current.worker_profile_id ? String(current.worker_profile_id) : null)
+      : (body.worker_profile_id === null || body.worker_profile_id === "" ? null : String(body.worker_profile_id).trim());
+    if (profileSpecified && workerProfileId !== null) {
+      const profileRow = await db.prepare(
+        "SELECT project_id FROM worker_profile WHERE id = ?",
+      ).bind(workerProfileId).first<{ project_id: string }>();
+      if (!profileRow) return json({ error: "worker profile not found" }, 422);
+      if (profileRow.project_id !== String(current.board_id)) return json({ error: "worker profile belongs to another project" }, 403);
+    }
+    const requeueSpawn = flag(body.spawn) === 1;
+    if (requeueSpawn && !workerProfileId) return json({ error: "spawn requires worker_profile_id" }, 422);
+    const currentSpawnStatus = current.spawn_status ? String(current.spawn_status) : null;
+    if (requeueSpawn && (currentSpawnStatus === "spawning" || currentSpawnStatus === "spawned")) {
+      return json({ error: "task already has an active spawn" }, 409);
+    }
+    // Clearing the profile must also clear a pending spawn so it can't strand as 'requested'.
+    const spawnStatus = requeueSpawn
+      ? "requested"
+      : (workerProfileId === null ? null : currentSpawnStatus);
     const nextRow = {
       ...current,
       require_plan: requirePlan,
@@ -1102,6 +1447,8 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       require_acceptance: requireAcceptance,
       required_gates: JSON.stringify(requiredGateNames),
       assignee_agent_id: assignee,
+      worker_profile_id: workerProfileId,
+      spawn_status: spawnStatus,
       attempt_count: attemptCount,
       blocked,
       lease_owner: phase === "done" ? null : current.lease_owner ?? null,
@@ -1112,12 +1459,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, attempt_count = ?, blocked = ?,
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?,
              lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
              lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
              updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
       ...(phase === "done" && gateRequirementsChanged
         ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
@@ -1872,15 +2219,9 @@ async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promi
     attempt_count: 0,
     updated_at: timestamp,
   }));
-  const inserted = await env.DB.prepare(
-    `INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
-  ).bind(
-    message.id, message.project_id, message.sender_agent_id, message.kind, message.subject,
-    message.payload_json, message.reply_to, message.idempotency_key, message.created_at,
-  ).run();
-  if ((inserted.meta.changes ?? 0) === 0 && key) {
+  // Return the prior result if this idempotency key already produced a message
+  // (replayOrReserve above guards the common case; this covers a slipped-through race).
+  if (key) {
     const existing = await env.DB.prepare(
       "SELECT * FROM message WHERE project_id = ? AND idempotency_key = ?",
     ).bind(projectId, key).first<Record<string, unknown>>();
@@ -1894,7 +2235,17 @@ async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promi
       }, 201);
     }
   }
+  // Insert the message and all of its deliveries atomically so an isolate death can
+  // never leave a message row with no delivery rows (or vice versa).
   await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+    ).bind(
+      message.id, message.project_id, message.sender_agent_id, message.kind, message.subject,
+      message.payload_json, message.reply_to, message.idempotency_key, message.created_at,
+    ),
     ...deliveries.map((delivery) => env.DB.prepare(
       "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, seen_at, acked_at, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).bind(delivery.id, delivery.message_id, delivery.project_id, delivery.recipient_agent_id, delivery.status, delivery.seen_at, delivery.acked_at, delivery.attempt_count, delivery.updated_at)),
@@ -2281,6 +2632,153 @@ function backupProjectId(request: Request, body: Json, auth: Auth): string {
     ? body.project_id.trim()
     : (url.searchParams.get("project") || url.searchParams.get("project_id") || "").trim();
   return requested || (isAdmin(auth) ? "" : auth.projectId);
+}
+
+function jsonArrayText(value: unknown, fallback = "[]"): string {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    try {
+      const parsed = JSON.parse(trimmed);
+      return Array.isArray(parsed) ? JSON.stringify(parsed) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+  return Array.isArray(value) ? JSON.stringify(value) : fallback;
+}
+
+function jsonObjectText(value: unknown, fallback = "{}"): string {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    try {
+      const parsed = JSON.parse(trimmed);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? JSON.stringify(parsed) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value) ? JSON.stringify(value) : fallback;
+}
+
+function optionalText(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function workerProfileView(row: Record<string, unknown>) {
+  const parseArray = (value: unknown): unknown[] => {
+    try {
+      const parsed = JSON.parse(String(value ?? "[]"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  const parseObject = (value: unknown): Json => {
+    try {
+      const parsed = JSON.parse(String(value ?? "{}"));
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Json : {};
+    } catch {
+      return {};
+    }
+  };
+  return {
+    id: String(row.id),
+    project_id: String(row.project_id),
+    name: String(row.name ?? ""),
+    role_tag: String(row.role_tag ?? "worker"),
+    model: row.model ? String(row.model) : null,
+    snapshot_id: row.snapshot_id ? String(row.snapshot_id) : null,
+    system_prompt: row.system_prompt ? String(row.system_prompt) : null,
+    prompt_template: row.prompt_template ? String(row.prompt_template) : null,
+    playbook_refs: parseArray(row.playbook_refs_json),
+    knowledge_refs: parseArray(row.knowledge_refs_json),
+    mcp_tools: parseArray(row.mcp_tools_json),
+    repo_config: parseObject(row.repo_config_json),
+    enabled: Number(row.enabled ?? 0),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+async function workerProfiles(request: Request, env: Env, auth: Auth): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET") {
+    const projectId = (url.searchParams.get("project") || url.searchParams.get("project_id") || "").trim();
+    if (!projectId) return json({ error: "project is required" }, 400);
+    if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+    if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+    const rows = await env.DB.prepare(
+      "SELECT * FROM worker_profile WHERE project_id = ? ORDER BY role_tag, name, id",
+    ).bind(projectId).all<Record<string, unknown>>();
+    return json({ worker_profiles: rows.results.map(workerProfileView) });
+  }
+  if (request.method === "DELETE") {
+    const profileId = url.pathname.split("/").pop() || "";
+    if (!profileId) return json({ error: "worker profile id is required" }, 400);
+    const row = await env.DB.prepare("SELECT project_id FROM worker_profile WHERE id = ?")
+      .bind(profileId).first<{ project_id: string }>();
+    if (!row) return json({ error: "worker profile not found" }, 404);
+    if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+    if (!projectAllowed(auth, row.project_id)) return json({ error: "project access denied" }, 403);
+    const result = await env.DB.prepare("DELETE FROM worker_profile WHERE id = ? AND project_id = ?")
+      .bind(profileId, row.project_id).run();
+    return (result.meta.changes ?? 0) === 1 ? json({ ok: true }) : json({ error: "worker profile not found" }, 404);
+  }
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const body = await parseBody(request);
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  const projectId = backupProjectId(request, body, auth);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 404);
+  const entries = Array.isArray(body.worker_profiles)
+    ? body.worker_profiles
+    : Array.isArray(body.profiles) ? body.profiles : [body];
+  if (entries.length === 0) return json({ error: "at least one worker profile is required" }, 400);
+  const timestamp = now();
+  const statements: D1PreparedStatement[] = [];
+  const ids: string[] = [];
+  try {
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") throw new Error("each worker profile must be an object");
+      const item = entry as Json;
+      const profileId = String(item.id || "").trim();
+      const name = String(item.name || "").trim();
+      const roleTag = String(item.role_tag || "").trim();
+      if (!profileId || !name || !roleTag) throw new Error("id, name, and role_tag are required");
+      ids.push(profileId);
+      statements.push(env.DB.prepare(
+        `INSERT INTO worker_profile(
+           id, project_id, name, role_tag, model, snapshot_id, system_prompt, prompt_template,
+           playbook_refs_json, knowledge_refs_json, mcp_tools_json, repo_config_json, enabled, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name, role_tag = excluded.role_tag,
+           model = excluded.model, snapshot_id = excluded.snapshot_id, system_prompt = excluded.system_prompt,
+           prompt_template = excluded.prompt_template, playbook_refs_json = excluded.playbook_refs_json,
+           knowledge_refs_json = excluded.knowledge_refs_json, mcp_tools_json = excluded.mcp_tools_json,
+           repo_config_json = excluded.repo_config_json, enabled = excluded.enabled, updated_at = excluded.updated_at
+         WHERE worker_profile.project_id = excluded.project_id`,
+      ).bind(
+        profileId, projectId, name, roleTag, optionalText(item.model), optionalText(item.snapshot_id),
+        optionalText(item.system_prompt), optionalText(item.prompt_template),
+        jsonArrayText(item.playbook_refs), jsonArrayText(item.knowledge_refs), jsonArrayText(item.mcp_tools),
+        jsonObjectText(item.repo_config), flag(item.enabled ?? true), timestamp, timestamp,
+      ));
+    }
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : "invalid worker profile" }, 400);
+  }
+  if (statements.length > 0) await env.DB.batch(statements);
+  const rows = await env.DB.prepare(
+    `SELECT * FROM worker_profile WHERE project_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
+  ).bind(projectId, ...ids).all<Record<string, unknown>>();
+  return json({ worker_profiles: rows.results.map(workerProfileView) });
 }
 
 async function backupAccounts(request: Request, env: Env, auth: Auth): Promise<Response> {
@@ -2693,14 +3191,14 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
   ]);
   const tasks = taskRows.results;
   const taskIds = tasks.map((task) => String(task.id));
-  const gates = taskIds.length
-    ? await env.DB.prepare(
-      `SELECT task_id, gate_name, status, by_agent, note, created_at, updated_at
-       FROM task_gate WHERE task_id IN (${taskIds.map(() => "?").join(",")}) ORDER BY gate_name`,
-    ).bind(...taskIds).all<Record<string, unknown>>()
-    : { results: [] as Record<string, unknown>[] };
+  const gates = await selectByIdChunks<Record<string, unknown>>(
+    env.DB,
+    taskIds,
+    (placeholders) => `SELECT task_id, gate_name, status, by_agent, note, created_at, updated_at
+       FROM task_gate WHERE task_id IN (${placeholders}) ORDER BY gate_name`,
+  );
   const gatesByTask = new Map<string, Record<string, unknown>[]>();
-  for (const gate of gates.results) {
+  for (const gate of gates) {
     const taskGates = gatesByTask.get(String(gate.task_id)) ?? [];
     taskGates.push(gate);
     gatesByTask.set(String(gate.task_id), taskGates);
@@ -2720,17 +3218,17 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
     blocked_upstream_task_ids: [] as string[],
   }));
   const blockedTasks = taskViews.filter((task) => Number(task.blocked ?? 0) === 1);
-  const blockedDependencyRows = taskIds.length
-    ? await env.DB.prepare(
-      `SELECT d.task_id, d.depends_on_id
+  const blockedDependencyRows = await selectByIdChunks<{ task_id: string; depends_on_id: string }>(
+    env.DB,
+    taskIds,
+    (placeholders) => `SELECT d.task_id, d.depends_on_id
        FROM task_dependency d
        JOIN task_item dependency ON dependency.id = d.depends_on_id
-       WHERE d.task_id IN (${taskIds.map(() => "?").join(",")})
+       WHERE d.task_id IN (${placeholders})
          AND dependency.blocked = 1 AND dependency.deleted_at IS NULL`,
-    ).bind(...taskIds).all<{ task_id: string; depends_on_id: string }>()
-    : { results: [] as { task_id: string; depends_on_id: string }[] };
+  );
   const blockedUpstreamsByTask = new Map<string, string[]>();
-  for (const row of blockedDependencyRows.results) {
+  for (const row of blockedDependencyRows) {
     const upstreams = blockedUpstreamsByTask.get(row.task_id) ?? [];
     upstreams.push(row.depends_on_id);
     blockedUpstreamsByTask.set(row.task_id, upstreams);
@@ -2922,6 +3420,9 @@ export default {
     if (url.pathname === "/api/board/backup-accounts" || url.pathname.startsWith("/api/board/backup-accounts/")) {
       return backupAccounts(request, env, auth);
     }
+    if (url.pathname === "/api/board/worker-profiles" || url.pathname.startsWith("/api/board/worker-profiles/")) {
+      return workerProfiles(request, env, auth);
+    }
     if (url.pathname === "/api/board/account-claims" || url.pathname === "/api/board/account-claims/release") {
       return accountClaims(request, env, auth);
     }
@@ -2953,5 +3454,6 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     await deliverHookOutbox(env.DB);
     await sweepLeases(env.DB, env);
+    await runWorkerSpawn(env.DB, env, now());
   },
 };
