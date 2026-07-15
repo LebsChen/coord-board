@@ -2125,7 +2125,10 @@ describe("coord board", () => {
         id: "spawn-run-profile",
         name: "Runner",
         role_tag: "worker",
-        model: "gpt-5",
+        model: "ultra",
+        knowledge_refs: ["kn-1", "kn-2"],
+        playbook_refs: ["pb-1"],
+        snapshot_id: "snap-123",
       }),
     });
     await call("/api/board/backup-accounts", {
@@ -2151,12 +2154,23 @@ describe("coord board", () => {
     expect(task.response.status).toBe(201);
     const taskId = String(task.body.id);
     const capturedPrompts: string[] = [];
+    const capturedBodies: Record<string, unknown>[] = [];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
-      capturedPrompts.push(String(JSON.parse(String(init?.body ?? "{}")).prompt ?? ""));
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      capturedBodies.push(parsed);
+      capturedPrompts.push(String(parsed.prompt ?? ""));
       return new Response(JSON.stringify({ session_id: "devin-spawn-run" }), { status: 200 });
     });
     await worker.scheduled({} as ScheduledEvent, env);
     fetchMock.mockRestore();
+
+    // The create-session body must use only valid v3 SessionCreateRequest fields.
+    const createBody = capturedBodies.find((b) => "prompt" in b && !("message" in b));
+    expect(createBody).toBeDefined();
+    expect(createBody!.devin_mode).toBe("ultra");
+    expect(createBody!.knowledge_ids).toEqual(["kn-1", "kn-2"]);
+    expect(createBody!.playbook_id).toBe("pb-1");
+    expect(createBody!.snapshot_id).toBeUndefined();
 
     const row = await env.DB.prepare(
       "SELECT spawn_status, assignee_agent_id FROM task_item WHERE id = ?",
@@ -2440,10 +2454,13 @@ describe("coord board", () => {
     await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-block", session_id: "s" }) });
     const { taskId } = await seedSpawnedTask("wd-block", { session: "devin-wd-block", account: "wd-block-acct" });
     const devin = withDevin((method, url) => {
-      if (method === "GET" && url.includes("devin-wd-block")) {
-        return new Response(JSON.stringify({ status: "blocked", question: "Which port should I use?", choices: ["8080", "9090"] }), { status: 200 });
+      if (method === "GET" && url.endsWith("devin-wd-block/messages")) {
+        return new Response(JSON.stringify({ items: [{ source: "devin", message: "Which port should I use?\n- 8080\n- 9090" }], has_next_page: false }), { status: 200 });
       }
-      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+      if (method === "GET" && url.endsWith("devin-wd-block")) {
+        return new Response(JSON.stringify({ status: "suspended", status_detail: "waiting_for_user" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running", status_detail: "working" }), { status: 200 });
     });
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();
@@ -2465,10 +2482,13 @@ describe("coord board", () => {
     await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-risk", session_id: "s" }) });
     const { taskId } = await seedSpawnedTask("wd-risk", { session: "devin-wd-risk", account: "wd-risk-acct" });
     const devin = withDevin((method, url) => {
-      if (method === "GET" && url.includes("devin-wd-risk")) {
-        return new Response(JSON.stringify({ status: "blocked", question: "Should I delete the production database?", choices: ["yes", "no"] }), { status: 200 });
+      if (method === "GET" && url.endsWith("devin-wd-risk/messages")) {
+        return new Response(JSON.stringify({ items: [{ source: "devin", message: "Should I delete the production database?" }] }), { status: 200 });
       }
-      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+      if (method === "GET" && url.endsWith("devin-wd-risk")) {
+        return new Response(JSON.stringify({ status: "suspended", status_detail: "waiting_for_user" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running", status_detail: "working" }), { status: 200 });
     });
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();
@@ -2484,9 +2504,11 @@ describe("coord board", () => {
     await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-dedupe", session_id: "s" }) });
     const { taskId } = await seedSpawnedTask("wd-dedupe", { session: "devin-wd-dedupe", account: "wd-dedupe-acct" });
     const respond = (method: string, url: string) =>
-      method === "GET" && url.includes("devin-wd-dedupe")
-        ? new Response(JSON.stringify({ status: "blocked", question: "Pick one", choices: ["a", "b"] }), { status: 200 })
-        : new Response(JSON.stringify({ status: "running" }), { status: 200 });
+      method === "GET" && url.endsWith("devin-wd-dedupe/messages")
+        ? new Response(JSON.stringify({ items: [{ source: "devin", message: "Pick one" }] }), { status: 200 })
+        : method === "GET" && url.endsWith("devin-wd-dedupe")
+          ? new Response(JSON.stringify({ status: "suspended", status_detail: "waiting_for_user" }), { status: 200 })
+          : new Response(JSON.stringify({ status: "running", status_detail: "working" }), { status: 200 });
     let devin = withDevin(respond);
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();
@@ -2517,8 +2539,8 @@ describe("coord board", () => {
     await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "wd-wake", name: "Wake" }) });
     const { taskId, agentId } = await seedSpawnedTask("wd-wake", { session: "devin-wd-wake", account: "wd-wake-acct" });
     const devin = withDevin((method, url) =>
-      method === "GET" && url.includes("devin-wd-wake")
-        ? new Response(JSON.stringify({ status: "suspended" }), { status: 200 })
+      method === "GET" && url.endsWith("devin-wd-wake")
+        ? new Response(JSON.stringify({ status: "suspended", status_detail: "inactivity" }), { status: 200 })
         : new Response(JSON.stringify({ ok: true }), { status: 200 }));
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();
@@ -2534,8 +2556,8 @@ describe("coord board", () => {
     await call("/api/board/leader", { method: "POST", body: JSON.stringify({ project_id: "wd-done", session_id: "s" }) });
     const { taskId } = await seedSpawnedTask("wd-done", { session: "devin-wd-done", account: "wd-done-acct" });
     const devin = withDevin((method, url) =>
-      method === "GET" && url.includes("devin-wd-done")
-        ? new Response(JSON.stringify({ status: "idle", structured_output: { result: "shipped" } }), { status: 200 })
+      method === "GET" && url.endsWith("devin-wd-done")
+        ? new Response(JSON.stringify({ status: "exit", status_detail: "finished", structured_output: { result: "shipped" } }), { status: 200 })
         : new Response(JSON.stringify({ ok: true }), { status: 200 }));
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();
@@ -2557,8 +2579,8 @@ describe("coord board", () => {
     expect(JSON.parse(agent!.metadata_json).leader_sleep).toBe(1);
     // The watchdog now ignores this worker even if the session looks idle.
     devin = withDevin((method, url) =>
-      method === "GET" && url.includes("devin-sleep")
-        ? new Response(JSON.stringify({ status: "suspended" }), { status: 200 })
+      method === "GET" && url.endsWith("devin-sleep")
+        ? new Response(JSON.stringify({ status: "suspended", status_detail: "inactivity" }), { status: 200 })
         : new Response(JSON.stringify({ ok: true }), { status: 200 }));
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();

@@ -585,16 +585,31 @@ async function registerFailoverAgent(
   return { id: agentId, token };
 }
 
+// v3 SessionCreateRequest agent-mode enum. A worker profile's free-form "model" is only forwarded
+// as devin_mode when it names one of these; otherwise it stays as prompt context.
+const DEVIN_MODES: ReadonlySet<string> = new Set(["normal", "fast", "lite", "ultra", "fusion"]);
+
 async function createDevinSession(
   env: Env,
   orgId: string,
   credential: string,
   prompt: string,
-  options: { snapshotId?: string | null; playbookId?: string | null } = {},
+  options: {
+    playbookId?: string | null;
+    knowledgeIds?: string[];
+    devinMode?: string | null;
+    title?: string | null;
+  } = {},
 ): Promise<string> {
+  // Only fields defined by v3 SessionCreateRequest are sent. Snapshot selection is not a
+  // session-create field in v3 (it is bound via repo snapshot_setup), so it is not sent here.
   const requestBody: Json = { prompt };
-  if (options.snapshotId) requestBody.snapshot_id = options.snapshotId;
   if (options.playbookId) requestBody.playbook_id = options.playbookId;
+  if (options.knowledgeIds && options.knowledgeIds.length) requestBody.knowledge_ids = options.knowledgeIds;
+  if (options.devinMode && DEVIN_MODES.has(options.devinMode.trim().toLowerCase())) {
+    requestBody.devin_mode = options.devinMode.trim().toLowerCase();
+  }
+  if (options.title && options.title.trim()) requestBody.title = options.title.trim().slice(0, 200);
   const response = await fetch(
     `https://api.devin.ai/v3/organizations/${encodeURIComponent(orgId)}/sessions`,
     {
@@ -696,6 +711,7 @@ function buildSpawnPrompt(
   if (playbooks.length) lines.push(`Follow these playbooks: ${playbooks.map(String).join(", ")}.`);
   if (knowledge.length) lines.push(`Apply this knowledge: ${knowledge.map(String).join(", ")}.`);
   if (mcpTools.length) lines.push(`Use these MCP tools when available: ${mcpTools.map(String).join(", ")}.`);
+  if (profile.snapshot_id && profile.snapshot_id.trim()) lines.push(`Preferred machine snapshot: ${profile.snapshot_id.trim()}.`);
   if (Object.keys(repoConfig).length) lines.push(`Repository configuration: ${JSON.stringify(repoConfig)}.`);
   lines.push(briefingMarkdown(profile.role_tag));
   lines.push(`Claim task ${task.id} using the Board API, then work it to completion. Do not rely on the desktop client.`);
@@ -715,17 +731,21 @@ async function createWorkerSession(
     String(backup.credential_iv),
   );
   const prompt = buildSpawnPrompt(env, task, profile, agent);
-  const playbooks = (() => {
+  const parseStrings = (value: string): string[] => {
     try {
-      const parsed = JSON.parse(profile.playbook_refs_json || "[]");
-      return Array.isArray(parsed) && parsed.length ? String(parsed[0]) : null;
+      const parsed = JSON.parse(value || "[]");
+      return Array.isArray(parsed) ? parsed.map(String).filter((s) => s.trim()) : [];
     } catch {
-      return null;
+      return [];
     }
-  })();
+  };
+  const playbookRefs = parseStrings(profile.playbook_refs_json);
+  const knowledgeIds = parseStrings(profile.knowledge_refs_json);
   return createDevinSession(env, String(backup.org_id), credential, prompt, {
-    snapshotId: profile.snapshot_id,
-    playbookId: playbooks,
+    playbookId: playbookRefs.length ? playbookRefs[0] : null,
+    knowledgeIds,
+    devinMode: profile.model,
+    title: task.title,
   });
 }
 
@@ -758,31 +778,29 @@ type DevinSessionStatus = "running" | "blocked" | "idle" | "finished" | "failed"
 type DevinSessionView = {
   status: DevinSessionStatus;
   completed: boolean;
+  // Devin flagged this as requiring explicit approval (status_detail = waiting_for_approval):
+  // always route to a human regardless of the question wording.
+  approvalRequired: boolean;
   question: string | null;
   choices: string[];
 };
 
-function firstString(source: Record<string, unknown>, keys: readonly string[]): string {
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return "";
-}
+const DEVIN_API_BASE = "https://api.devin.ai/v3/organizations";
 
-function normalizeDevinStatus(raw: string): DevinSessionStatus {
-  const value = raw.trim().toLowerCase();
-  if (!value) return "unknown";
-  if (/(blocked|waiting|awaiting|needs?_input|need_input|input_required|paused_for)/.test(value)) return "blocked";
-  if (/(suspend|sleep|idle|hibernat|dormant|standby|snoozed|paused)/.test(value)) return "idle";
-  if (/(finish|complete|done|succeed|success|exit|stopped|ended|terminated|expired)/.test(value)) return "finished";
-  if (/(fail|error|crash|cancel|abort)/.test(value)) return "failed";
-  if (/(run|work|active|initializ|resum|in_progress|executing|processing)/.test(value)) return "running";
-  return "unknown";
-}
+// Devin v3 SessionResponse.status_detail values that mean the session cannot make progress and
+// needs a human (billing/quota/errors), as opposed to a normal working/waiting state.
+const DEVIN_FAILED_DETAILS: ReadonlySet<string> = new Set([
+  "error",
+  "usage_limit_exceeded",
+  "out_of_credits",
+  "out_of_quota",
+  "no_quota_allocation",
+  "payment_declined",
+  "org_usage_limit_exceeded",
+  "total_session_limit_exceeded",
+]);
 
-function hasStructuredOutput(raw: Record<string, unknown>): boolean {
-  const output = raw.structured_output ?? raw.structuredOutput;
+function hasStructuredOutput(output: unknown): boolean {
   if (output === undefined || output === null) return false;
   if (typeof output === "string") return output.trim().length > 0;
   if (Array.isArray(output)) return output.length > 0;
@@ -790,36 +808,72 @@ function hasStructuredOutput(raw: Record<string, unknown>): boolean {
   return false;
 }
 
-function extractBlockedQuestion(raw: Record<string, unknown>): { question: string | null; choices: string[] } {
-  let question = firstString(raw, ["pending_question", "question", "blocked_reason", "blocked_question", "prompt"]);
-  const choices: string[] = [];
-  const rawChoices = raw.choices ?? raw.options;
-  if (Array.isArray(rawChoices)) {
-    for (const choice of rawChoices) {
-      if (typeof choice === "string" && choice.trim()) choices.push(choice.trim());
-      else if (choice && typeof choice === "object") {
-        const label = firstString(choice as Record<string, unknown>, ["label", "text", "value", "title"]);
-        if (label) choices.push(label);
-      }
-    }
+// Map the authoritative v3 SessionResponse.status + status_detail onto the watchdog's coarse state.
+// v3 status enum:        new | claimed | running | exit | error | suspended | resuming
+// v3 status_detail enum: working | waiting_for_user | waiting_for_approval | finished | inactivity |
+//                        user_request | usage_limit_exceeded | out_of_credits | out_of_quota |
+//                        no_quota_allocation | payment_declined | org_usage_limit_exceeded |
+//                        total_session_limit_exceeded | error
+function normalizeDevinStatus(status: string, detail: string): DevinSessionStatus {
+  const s = status.trim().toLowerCase();
+  const d = detail.trim().toLowerCase();
+  if (s === "error" || DEVIN_FAILED_DETAILS.has(d)) return "failed";
+  if (d === "finished" || s === "exit") return "finished";
+  if (s === "suspended") {
+    // Suspended-for-input is a block; suspended for inactivity/user request is a wakeable sleep.
+    if (d === "waiting_for_user" || d === "waiting_for_approval") return "blocked";
+    return "idle";
   }
-  if (!question && Array.isArray(raw.messages) && raw.messages.length) {
-    const last = raw.messages[raw.messages.length - 1];
-    if (last && typeof last === "object") {
-      question = firstString(last as Record<string, unknown>, ["message", "text", "content", "body"]);
-      const opts = (last as Record<string, unknown>).options ?? (last as Record<string, unknown>).choices;
-      if (Array.isArray(opts)) {
-        for (const opt of opts) {
-          if (typeof opt === "string" && opt.trim()) choices.push(opt.trim());
+  if (s === "running" || s === "resuming" || s === "claimed" || s === "new") return "running";
+  return "unknown";
+}
+
+// Fetch the latest Devin-authored message as the blocked question. The v3 SessionResponse does not
+// carry the question text, so we read it from the (paginated) session messages endpoint. Choices are
+// not a structured API field, so we best-effort parse option lines out of the message text.
+async function fetchDevinBlockedQuestion(
+  orgId: string,
+  credential: string,
+  sessionId: string,
+): Promise<{ question: string | null; choices: string[] }> {
+  try {
+    const response = await fetch(
+      `${DEVIN_API_BASE}/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { method: "GET", headers: { Authorization: `Bearer ${credential}`, Accept: "application/json" } },
+    );
+    if (!response.ok) return { question: null, choices: [] };
+    const raw = (await response.json()) as Record<string, unknown>;
+    const items = Array.isArray(raw.items) ? raw.items : [];
+    let question: string | null = null;
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      const item = items[i];
+      if (item && typeof item === "object") {
+        const record = item as Record<string, unknown>;
+        if (record.source === "devin" && typeof record.message === "string" && record.message.trim()) {
+          question = record.message.trim();
+          break;
         }
       }
     }
+    return { question, choices: question ? extractChoices(question) : [] };
+  } catch {
+    return { question: null, choices: [] };
   }
-  return { question: question || null, choices };
 }
 
-// Poll a spawned worker's Devin session. Returns null on any transient/transport error so the
-// watchdog simply retries on the next tick rather than escalating a temporary blip.
+// Best-effort extraction of enumerated options from a question body (e.g. "1. Foo", "- Bar",
+// "a) Baz"). Devin's API has no structured choice field, so this is heuristic and may be empty.
+function extractChoices(text: string): string[] {
+  const choices: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:[-*]|\d+[.)]|[a-zA-Z][.)])\s+(.{1,200})$/);
+    if (match && match[1].trim()) choices.push(match[1].trim());
+  }
+  return choices;
+}
+
+// Poll a spawned worker's Devin session (v3 SessionResponse). Returns null on any transient/transport
+// error so the watchdog simply retries on the next tick rather than escalating a temporary blip.
 async function fetchDevinSession(
   orgId: string,
   credential: string,
@@ -827,26 +881,31 @@ async function fetchDevinSession(
 ): Promise<DevinSessionView | null> {
   try {
     const response = await fetch(
-      `https://api.devin.ai/v3/organizations/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}`,
+      `${DEVIN_API_BASE}/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}`,
       { method: "GET", headers: { Authorization: `Bearer ${credential}`, Accept: "application/json" } },
     );
     if (!response.ok) return null;
-    const raw = (await response.json()) as Record<string, unknown>;
-    const session = (raw.session && typeof raw.session === "object" ? raw.session as Record<string, unknown> : raw);
-    const status = normalizeDevinStatus(firstString(session, ["status_enum", "status", "state", "session_status"]));
-    const { question, choices } = extractBlockedQuestion(session);
-    const explicitDone = session.completed === true || session.is_complete === true || session.finished === true;
-    // A session is "really complete" when Devin reports it finished, or it produced final
-    // structured output and is no longer actively running. Idle/sleeping alone is not completion.
-    const completed = status === "finished"
-      || explicitDone
-      || (hasStructuredOutput(session) && (status === "idle" || status === "unknown"));
-    return { status, completed, question, choices };
+    const session = (await response.json()) as Record<string, unknown>;
+    const rawStatus = typeof session.status === "string" ? session.status : "";
+    const rawDetail = typeof session.status_detail === "string" ? session.status_detail : "";
+    const status = normalizeDevinStatus(rawStatus, rawDetail);
+    const approvalRequired = rawDetail.trim().toLowerCase() === "waiting_for_approval";
+    const completed = status === "finished" || (status !== "blocked" && hasStructuredOutput(session.structured_output));
+    let question: string | null = null;
+    let choices: string[] = [];
+    if (status === "blocked") {
+      const extracted = await fetchDevinBlockedQuestion(orgId, credential, sessionId);
+      question = extracted.question;
+      choices = extracted.choices;
+    }
+    return { status, completed, approvalRequired, question, choices };
   } catch {
     return null;
   }
 }
 
+// Send a message to a Devin session (v3). A message to a suspended session auto-resumes it, which is
+// exactly how the watchdog wakes an idle worker and how the Leader's answer reaches a blocked one.
 async function sendDevinSessionMessage(
   orgId: string,
   credential: string,
@@ -855,7 +914,7 @@ async function sendDevinSessionMessage(
 ): Promise<boolean> {
   try {
     const response = await fetch(
-      `https://api.devin.ai/v3/organizations/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
+      `${DEVIN_API_BASE}/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
       {
         method: "POST",
         headers: { Authorization: `Bearer ${credential}`, "Content-Type": "application/json" },
@@ -990,7 +1049,9 @@ async function handleWatchdogSession(
   if (session.status === "blocked") {
     if (transitioned || candidate.blocked !== 1) {
       const questionText = session.question || "The worker session is blocked and awaiting input.";
-      const highRisk = isHighRiskQuestion(`${questionText} ${session.choices.join(" ")}`);
+      // Devin's explicit approval-required state always needs a human; otherwise fall back to
+      // scanning the question/choices for high-risk keywords.
+      const highRisk = session.approvalRequired || isHighRiskQuestion(`${questionText} ${session.choices.join(" ")}`);
       await db.batch([
         db.prepare("UPDATE task_item SET blocked = 1, needs_human = ?, updated_at = ? WHERE id = ?")
           .bind(highRisk ? 1 : Number(candidate.needs_human ?? 0), timestamp, candidate.task_id),
