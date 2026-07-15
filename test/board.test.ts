@@ -2174,4 +2174,102 @@ describe("coord board", () => {
     ).bind("spawn-run-account").first<{ status: string }>();
     expect(account?.status).toBe("active");
   });
+
+  it("does not let a profile upsert move an existing profile to another project", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "hijack-owner", name: "Owner" }),
+    });
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "hijack-attacker", name: "Attacker" }),
+    });
+    const created = await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "hijack-owner",
+        id: "shared-id",
+        name: "Owned",
+        role_tag: "worker",
+      }),
+    });
+    expect(created.response.status).toBe(200);
+    const hijack = await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: "hijack-attacker",
+        id: "shared-id",
+        name: "Stolen",
+        role_tag: "worker",
+      }),
+    });
+    expect(hijack.response.status).toBe(200);
+    expect(hijack.body.worker_profiles).toHaveLength(0);
+    const stored = await env.DB.prepare(
+      "SELECT project_id, name FROM worker_profile WHERE id = ?",
+    ).bind("shared-id").first<{ project_id: string; name: string }>();
+    expect(stored?.project_id).toBe("hijack-owner");
+    expect(stored?.name).toBe("Owned");
+  });
+
+  it("recovers a task stuck in spawning and re-queues it", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "stuck-project", name: "Stuck" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "stuck-project", id: "stuck-profile", name: "P", role_tag: "worker" }),
+    });
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "stuck-project", id: "stuck-account", role_tag: "worker", org_id: "org-stuck", credential: "secret-stuck" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "stuck-project", title: "Stuck task", worker_profile_id: "stuck-profile", spawn: true }),
+    });
+    const taskId = String(task.body.id);
+    const stale = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await env.DB.prepare("UPDATE task_item SET spawn_status = 'spawning', updated_at = ? WHERE id = ?").bind(stale, taskId).run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({ session_id: "devin-stuck" }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    const row = await env.DB.prepare("SELECT spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string }>();
+    expect(row?.spawn_status).toBe("spawned");
+  });
+
+  it("re-queues a failed spawn via PATCH spawn", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "retry-project", name: "Retry" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "retry-project", id: "retry-profile", name: "P", role_tag: "worker" }),
+    });
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "retry-project", id: "retry-account", role_tag: "worker", org_id: "org-retry", credential: "secret-retry" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "retry-project", title: "Retry task", worker_profile_id: "retry-profile", spawn: true }),
+    });
+    const taskId = String(task.body.id);
+    await env.DB.prepare("UPDATE task_item SET spawn_status = 'failed' WHERE id = ?").bind(taskId).run();
+    const patched = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ spawn: true }),
+    });
+    expect(patched.response.status).toBe(200);
+    expect(patched.body.spawn_status).toBe("requested");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({ session_id: "devin-retry" }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    const row = await env.DB.prepare("SELECT spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string }>();
+    expect(row?.spawn_status).toBe("spawned");
+  });
 });

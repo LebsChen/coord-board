@@ -39,6 +39,8 @@ const DEFAULT_FAILOVER_COOLDOWN_SECONDS = 15 * 60;
 const DEFAULT_FAILOVER_STALE_GRACE_SECONDS = 10 * 60;
 const FAILOVER_REPLACEMENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const FAILOVER_REPLACEMENT_RESERVATION_TIMEOUT_MS = 10 * 60 * 1000;
+const SPAWN_STALE_GRACE_MS = 10 * 60 * 1000;
+const SPAWN_MAX_ACTIVE_PER_PROJECT = 8;
 const DEFAULT_ACCOUNT_CLAIM_TTL_SECONDS = 5 * 60;
 const MIN_ACCOUNT_CLAIM_TTL_SECONDS = 30;
 const MAX_ACCOUNT_CLAIM_TTL_SECONDS = 60 * 60;
@@ -965,7 +967,29 @@ async function registerSpawnAgent(
   return { id: agentId, token };
 }
 
+async function releaseSpawnResources(
+  db: D1Database,
+  env: Env,
+  projectId: string,
+  backup: Record<string, unknown>,
+  agent: { id: string; token: string } | null,
+  sessionId: string | null,
+  timestamp: string,
+): Promise<void> {
+  if (sessionId) await terminateFailoverSession(env, backup, sessionId);
+  if (agent) {
+    await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(agent.id, projectId).run();
+  }
+  await db.prepare(
+    "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+  ).bind(timestamp, backup.id, projectId).run();
+}
+
 async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Promise<void> {
+  // Recover tasks whose spawn was claimed but never finished (e.g. isolate died mid-spawn).
+  await db.prepare(
+    "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE spawn_status = 'spawning' AND updated_at <= ?",
+  ).bind(timestamp, new Date(Date.now() - SPAWN_STALE_GRACE_MS).toISOString()).run().catch(() => undefined);
   const pending = await db.prepare(
     `SELECT t.id AS task_id, t.board_id AS project_id, t.title, t.description, t.worker_profile_id
      FROM task_item t
@@ -989,6 +1013,18 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
       ]);
       continue;
     }
+    // Bound the number of concurrently live spawned workers per project.
+    const active = await db.prepare(
+      `SELECT COUNT(*) AS count FROM task_item
+       WHERE board_id = ? AND deleted_at IS NULL AND id <> ?
+         AND spawn_status IN ('spawning', 'spawned') AND phase <> 'done'`,
+    ).bind(candidate.project_id, candidate.task_id).first<{ count: number }>();
+    if (Number(active?.count ?? 0) >= SPAWN_MAX_ACTIVE_PER_PROJECT) {
+      await db.prepare(
+        "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
+      ).bind(timestamp, candidate.task_id).run();
+      continue;
+    }
     const backup = await reserveBackupAccount(db, candidate.project_id, profile.role_tag, timestamp);
     if (!backup) {
       await db.prepare(
@@ -1007,6 +1043,20 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
     try {
       agent = await registerSpawnAgent(db, candidate.project_id, candidate.task_id, profile.role_tag, backup);
       sessionId = await createWorkerSession(env, taskForSession, profile, backup, agent);
+      // Commit the task transition first so we never leave a live session on a task
+      // that was deleted or re-claimed while we were talking to the Devin API.
+      const assigned = await db.prepare(
+        "UPDATE task_item SET spawn_status = 'spawned', assignee_agent_id = ?, phase = CASE WHEN phase = 'pending' THEN 'ready' ELSE phase END, updated_at = ? WHERE id = ? AND spawn_status = 'spawning' AND deleted_at IS NULL",
+      ).bind(agent.id, timestamp, candidate.task_id).run();
+      if ((assigned.meta.changes ?? 0) !== 1) {
+        await releaseSpawnResources(db, env, candidate.project_id, backup, agent, sessionId, timestamp);
+        await event(db, candidate.task_id, "spawn_aborted", null, {
+          project_id: candidate.project_id,
+          worker_profile_id: profile.id,
+          reason: "task no longer claimable when spawn completed",
+        }).run().catch(() => undefined);
+        continue;
+      }
       const cooldownUntil = new Date(Date.now() + DEFAULT_FAILOVER_COOLDOWN_SECONDS * 1000).toISOString();
       await db.batch([
         db.prepare(
@@ -1015,9 +1065,6 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
         db.prepare(
           "UPDATE backup_account SET status = 'active', cooldown_until = ?, last_used_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
         ).bind(cooldownUntil, timestamp, timestamp, backup.id, candidate.project_id),
-        db.prepare(
-          "UPDATE task_item SET spawn_status = 'spawned', assignee_agent_id = ?, phase = CASE WHEN phase = 'pending' THEN 'ready' ELSE phase END, updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
-        ).bind(agent.id, timestamp, candidate.task_id),
         event(db, candidate.task_id, "spawn_created", agent.id, {
           project_id: candidate.project_id,
           worker_profile_id: profile.id,
@@ -1026,14 +1073,8 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
         }),
       ]);
     } catch (error) {
-      if (sessionId) await terminateFailoverSession(env, backup, sessionId);
-      if (agent) {
-        await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(agent.id, candidate.project_id).run();
-      }
+      await releaseSpawnResources(db, env, candidate.project_id, backup, agent, sessionId, timestamp);
       await db.batch([
-        db.prepare(
-          "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
-        ).bind(timestamp, backup.id, candidate.project_id),
         db.prepare(
           "UPDATE task_item SET spawn_status = 'failed', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
         ).bind(timestamp, candidate.task_id),
@@ -1303,6 +1344,22 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       ).bind(assignee, String(current.board_id)).first();
       if (!target) return json({ error: "assignee agent not found in project" }, 422);
     }
+    const profileSpecified = body.worker_profile_id !== undefined;
+    const workerProfileId = !profileSpecified
+      ? (current.worker_profile_id ? String(current.worker_profile_id) : null)
+      : (body.worker_profile_id === null || body.worker_profile_id === "" ? null : String(body.worker_profile_id).trim());
+    if (profileSpecified && workerProfileId !== null) {
+      const profileRow = await db.prepare(
+        "SELECT project_id FROM worker_profile WHERE id = ?",
+      ).bind(workerProfileId).first<{ project_id: string }>();
+      if (!profileRow) return json({ error: "worker profile not found" }, 422);
+      if (profileRow.project_id !== String(current.board_id)) return json({ error: "worker profile belongs to another project" }, 403);
+    }
+    const requeueSpawn = flag(body.spawn) === 1;
+    if (requeueSpawn && !workerProfileId) return json({ error: "spawn requires worker_profile_id" }, 422);
+    const spawnStatus = requeueSpawn
+      ? "requested"
+      : (current.spawn_status ? String(current.spawn_status) : null);
     const nextRow = {
       ...current,
       require_plan: requirePlan,
@@ -1334,6 +1391,8 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       require_acceptance: requireAcceptance,
       required_gates: JSON.stringify(requiredGateNames),
       assignee_agent_id: assignee,
+      worker_profile_id: workerProfileId,
+      spawn_status: spawnStatus,
       attempt_count: attemptCount,
       blocked,
       lease_owner: phase === "done" ? null : current.lease_owner ?? null,
@@ -1344,12 +1403,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, attempt_count = ?, blocked = ?,
+         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?,
              lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
              lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
              updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
       ...(phase === "done" && gateRequirementsChanged
         ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
@@ -2639,11 +2698,12 @@ async function workerProfiles(request: Request, env: Env, auth: Auth): Promise<R
            playbook_refs_json, knowledge_refs_json, mcp_tools_json, repo_config_json, enabled, created_at, updated_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           project_id = excluded.project_id, name = excluded.name, role_tag = excluded.role_tag,
+           name = excluded.name, role_tag = excluded.role_tag,
            model = excluded.model, snapshot_id = excluded.snapshot_id, system_prompt = excluded.system_prompt,
            prompt_template = excluded.prompt_template, playbook_refs_json = excluded.playbook_refs_json,
            knowledge_refs_json = excluded.knowledge_refs_json, mcp_tools_json = excluded.mcp_tools_json,
-           repo_config_json = excluded.repo_config_json, enabled = excluded.enabled, updated_at = excluded.updated_at`,
+           repo_config_json = excluded.repo_config_json, enabled = excluded.enabled, updated_at = excluded.updated_at
+         WHERE worker_profile.project_id = excluded.project_id`,
       ).bind(
         profileId, projectId, name, roleTag, optionalText(item.model), optionalText(item.snapshot_id),
         optionalText(item.system_prompt), optionalText(item.prompt_template),

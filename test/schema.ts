@@ -32,6 +32,6 @@ CREATE TABLE IF NOT EXISTS worker_profile (id TEXT PRIMARY KEY, project_id TEXT 
 CREATE INDEX IF NOT EXISTS idx_worker_profile_project ON worker_profile(project_id, role_tag, enabled);
 ALTER TABLE task_item ADD COLUMN worker_profile_id TEXT;
 ALTER TABLE task_item ADD COLUMN spawn_status TEXT CHECK (spawn_status IN ('requested', 'spawning', 'spawned', 'failed'));
-CREATE INDEX IF NOT EXISTS idx_task_spawn ON task_item(board_id, spawn_status, phase, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_task_spawn ON task_item(spawn_status, phase, board_id);
 `;
 export default schema;

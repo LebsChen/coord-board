@@ -25,4 +25,4 @@ ALTER TABLE task_item ADD COLUMN spawn_status TEXT
   CHECK (spawn_status IN ('requested', 'spawning', 'spawned', 'failed'));
 
 CREATE INDEX IF NOT EXISTS idx_task_spawn
-  ON task_item(board_id, spawn_status, phase, deleted_at);
+  ON task_item(spawn_status, phase, board_id);
