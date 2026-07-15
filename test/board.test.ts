@@ -2652,6 +2652,29 @@ describe("coord board", () => {
     expect(project?.leader_agent_id).toBe("lead-prov-project");
   });
 
+  it("does not let provision move an existing backup account to another project", async () => {
+    await call("/api/board/provision", {
+      method: "POST",
+      body: JSON.stringify({
+        project: { id: "acct-owner", name: "Owner" },
+        backup_accounts: [{ id: "shared-acct", role_tag: "worker", org_id: "org-owner", credential: "owner-cred" }],
+      }),
+    });
+    const hijack = await call("/api/board/provision", {
+      method: "POST",
+      body: JSON.stringify({
+        project: { id: "acct-attacker", name: "Attacker" },
+        backup_accounts: [{ id: "shared-acct", role_tag: "worker", org_id: "org-attacker", credential: "attacker-cred" }],
+      }),
+    });
+    expect(hijack.response.status).toBe(201);
+    const stored = await env.DB.prepare(
+      "SELECT project_id, org_id FROM backup_account WHERE id = ?",
+    ).bind("shared-acct").first<{ project_id: string; org_id: string }>();
+    expect(stored?.project_id).toBe("acct-owner");
+    expect(stored?.org_id).toBe("org-owner");
+  });
+
   it("spawn-stats reports per-profile metrics and budget usage", async () => {
     await call("/api/board/provision", {
       method: "POST",

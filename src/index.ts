@@ -3529,10 +3529,11 @@ async function buildBackupAccountStatement(
        credential_iv, key_version, enabled, status, cooldown_until, last_used_at, created_at, updated_at
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', NULL, NULL, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
-       project_id = excluded.project_id, role_tag = excluded.role_tag, label = excluded.label,
+       role_tag = excluded.role_tag, label = excluded.label,
        org_id = excluded.org_id, credential_type = excluded.credential_type,
        credential_ciphertext = excluded.credential_ciphertext, credential_iv = excluded.credential_iv,
-       key_version = excluded.key_version, enabled = excluded.enabled, updated_at = excluded.updated_at`,
+       key_version = excluded.key_version, enabled = excluded.enabled, updated_at = excluded.updated_at
+     WHERE backup_account.project_id = excluded.project_id`,
   ).bind(
     accountId, projectId, roleTag, label, orgId, credentialType, encrypted.ciphertext,
     encrypted.iv, BACKUP_ACCOUNT_KEY_VERSION, flag(item.enabled ?? true), timestamp, timestamp,
