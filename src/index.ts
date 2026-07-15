@@ -985,11 +985,46 @@ async function releaseSpawnResources(
   ).bind(timestamp, backup.id, projectId).run();
 }
 
-async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Promise<void> {
+async function reconcileStaleSpawns(db: D1Database, env: Env, timestamp: string): Promise<void> {
   // Recover tasks whose spawn was claimed but never finished (e.g. isolate died mid-spawn).
-  await db.prepare(
-    "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE spawn_status = 'spawning' AND updated_at <= ?",
-  ).bind(timestamp, new Date(Date.now() - SPAWN_STALE_GRACE_MS).toISOString()).run().catch(() => undefined);
+  // If a Devin session was already created before the isolate died, its id was persisted onto
+  // the spawn agent; terminate that orphaned session and release its account before re-queuing.
+  const cutoff = new Date(Date.now() - SPAWN_STALE_GRACE_MS).toISOString();
+  const stale = await db.prepare(
+    "SELECT id, board_id FROM task_item WHERE spawn_status = 'spawning' AND updated_at <= ?",
+  ).bind(cutoff).all<{ id: string; board_id: string }>();
+  for (const stuck of stale.results) {
+    const orphans = await db.prepare(
+      `SELECT id, metadata_json FROM agent
+       WHERE project_id = ? AND json_extract(metadata_json, '$.cloud_spawn') = 1
+         AND json_extract(metadata_json, '$.task_id') = ?`,
+    ).bind(stuck.board_id, stuck.id).all<{ id: string; metadata_json: string }>();
+    for (const orphan of orphans.results) {
+      let meta: Record<string, unknown> = {};
+      try { meta = JSON.parse(orphan.metadata_json || "{}"); } catch { meta = {}; }
+      const backupId = meta.backup_account_id ? String(meta.backup_account_id) : null;
+      const sessionId = meta.session_id ? String(meta.session_id) : null;
+      if (backupId) {
+        if (sessionId) {
+          const backup = await db.prepare(
+            "SELECT * FROM backup_account WHERE id = ? AND project_id = ?",
+          ).bind(backupId, stuck.board_id).first<Record<string, unknown>>();
+          if (backup) await terminateFailoverSession(env, backup, sessionId).catch(() => undefined);
+        }
+        await db.prepare(
+          "UPDATE backup_account SET status = 'idle', cooldown_until = NULL, updated_at = ? WHERE id = ? AND project_id = ? AND status = 'reserved'",
+        ).bind(timestamp, backupId, stuck.board_id).run().catch(() => undefined);
+      }
+      await db.prepare("DELETE FROM agent WHERE id = ? AND project_id = ?").bind(orphan.id, stuck.board_id).run();
+    }
+    await db.prepare(
+      "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
+    ).bind(timestamp, stuck.id).run();
+  }
+}
+
+async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Promise<void> {
+  await reconcileStaleSpawns(db, env, timestamp);
   const pending = await db.prepare(
     `SELECT t.id AS task_id, t.board_id AS project_id, t.title, t.description, t.worker_profile_id
      FROM task_item t
@@ -999,9 +1034,18 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
      LIMIT 25`,
   ).all<{ task_id: string; project_id: string; title: string; description: string; worker_profile_id: string }>();
   for (const candidate of pending.results) {
+    // Atomically claim the task AND enforce the per-project concurrency cap in one
+    // statement: D1 serializes writes, so folding the count into the CAS predicate makes
+    // the quota race-free (unlike a separate count-then-act check).
     const claim = await db.prepare(
-      "UPDATE task_item SET spawn_status = 'spawning', updated_at = ? WHERE id = ? AND spawn_status = 'requested'",
-    ).bind(timestamp, candidate.task_id).run();
+      `UPDATE task_item SET spawn_status = 'spawning', updated_at = ?
+       WHERE id = ? AND spawn_status = 'requested'
+         AND (
+           SELECT COUNT(*) FROM task_item active
+           WHERE active.board_id = ? AND active.deleted_at IS NULL AND active.id <> ?
+             AND active.spawn_status IN ('spawning', 'spawned') AND active.phase <> 'done'
+         ) < ?`,
+    ).bind(timestamp, candidate.task_id, candidate.project_id, candidate.task_id, SPAWN_MAX_ACTIVE_PER_PROJECT).run();
     if ((claim.meta.changes ?? 0) !== 1) continue;
     const profile = await db.prepare(
       "SELECT * FROM worker_profile WHERE id = ? AND project_id = ? AND enabled = 1",
@@ -1011,18 +1055,6 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
         db.prepare("UPDATE task_item SET spawn_status = 'failed', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'").bind(timestamp, candidate.task_id),
         event(db, candidate.task_id, "spawn_failed", null, { reason: "worker profile missing or disabled" }),
       ]);
-      continue;
-    }
-    // Bound the number of concurrently live spawned workers per project.
-    const active = await db.prepare(
-      `SELECT COUNT(*) AS count FROM task_item
-       WHERE board_id = ? AND deleted_at IS NULL AND id <> ?
-         AND spawn_status IN ('spawning', 'spawned') AND phase <> 'done'`,
-    ).bind(candidate.project_id, candidate.task_id).first<{ count: number }>();
-    if (Number(active?.count ?? 0) >= SPAWN_MAX_ACTIVE_PER_PROJECT) {
-      await db.prepare(
-        "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
-      ).bind(timestamp, candidate.task_id).run();
       continue;
     }
     const backup = await reserveBackupAccount(db, candidate.project_id, profile.role_tag, timestamp);
@@ -1043,6 +1075,11 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
     try {
       agent = await registerSpawnAgent(db, candidate.project_id, candidate.task_id, profile.role_tag, backup);
       sessionId = await createWorkerSession(env, taskForSession, profile, backup, agent);
+      // Persist the session id onto the agent immediately so that if the isolate dies
+      // before the commit below, reconcileStaleSpawns can find and terminate this session.
+      await db.prepare(
+        "UPDATE agent SET metadata_json = json_set(metadata_json, '$.session_id', ?), updated_at = ? WHERE id = ? AND project_id = ?",
+      ).bind(sessionId, timestamp, agent.id, candidate.project_id).run();
       // Commit the task transition first so we never leave a live session on a task
       // that was deleted or re-claimed while we were talking to the Devin API.
       const assigned = await db.prepare(
@@ -1059,9 +1096,6 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
       }
       const cooldownUntil = new Date(Date.now() + DEFAULT_FAILOVER_COOLDOWN_SECONDS * 1000).toISOString();
       await db.batch([
-        db.prepare(
-          "UPDATE agent SET metadata_json = json_set(metadata_json, '$.session_id', ?), updated_at = ? WHERE id = ? AND project_id = ?",
-        ).bind(sessionId, timestamp, agent.id, candidate.project_id),
         db.prepare(
           "UPDATE backup_account SET status = 'active', cooldown_until = ?, last_used_at = ?, updated_at = ? WHERE id = ? AND project_id = ?",
         ).bind(cooldownUntil, timestamp, timestamp, backup.id, candidate.project_id),
@@ -1148,6 +1182,23 @@ function conditionalEvent(
 
 async function task(db: D1Database, taskId: string): Promise<Record<string, unknown> | null> {
   return db.prepare("SELECT * FROM task_item WHERE id = ?").bind(taskId).first<Record<string, unknown>>();
+}
+
+const D1_MAX_IN_PARAMS = 90;
+
+async function selectByIdChunks<T>(
+  db: D1Database,
+  ids: string[],
+  build: (placeholders: string) => string,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let offset = 0; offset < ids.length; offset += D1_MAX_IN_PARAMS) {
+    const chunk = ids.slice(offset, offset + D1_MAX_IN_PARAMS);
+    const placeholders = chunk.map(() => "?").join(",");
+    const result = await db.prepare(build(placeholders)).bind(...chunk).all<T>();
+    out.push(...result.results);
+  }
+  return out;
 }
 
 async function listDependencies(db: D1Database, taskId: string): Promise<string[]> {
@@ -1357,9 +1408,14 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     }
     const requeueSpawn = flag(body.spawn) === 1;
     if (requeueSpawn && !workerProfileId) return json({ error: "spawn requires worker_profile_id" }, 422);
+    const currentSpawnStatus = current.spawn_status ? String(current.spawn_status) : null;
+    if (requeueSpawn && (currentSpawnStatus === "spawning" || currentSpawnStatus === "spawned")) {
+      return json({ error: "task already has an active spawn" }, 409);
+    }
+    // Clearing the profile must also clear a pending spawn so it can't strand as 'requested'.
     const spawnStatus = requeueSpawn
       ? "requested"
-      : (current.spawn_status ? String(current.spawn_status) : null);
+      : (workerProfileId === null ? null : currentSpawnStatus);
     const nextRow = {
       ...current,
       require_plan: requirePlan,
@@ -2163,15 +2219,9 @@ async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promi
     attempt_count: 0,
     updated_at: timestamp,
   }));
-  const inserted = await env.DB.prepare(
-    `INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
-  ).bind(
-    message.id, message.project_id, message.sender_agent_id, message.kind, message.subject,
-    message.payload_json, message.reply_to, message.idempotency_key, message.created_at,
-  ).run();
-  if ((inserted.meta.changes ?? 0) === 0 && key) {
+  // Return the prior result if this idempotency key already produced a message
+  // (replayOrReserve above guards the common case; this covers a slipped-through race).
+  if (key) {
     const existing = await env.DB.prepare(
       "SELECT * FROM message WHERE project_id = ? AND idempotency_key = ?",
     ).bind(projectId, key).first<Record<string, unknown>>();
@@ -2185,7 +2235,17 @@ async function sendMailboxMessage(request: Request, env: Env, auth: Auth): Promi
       }, 201);
     }
   }
+  // Insert the message and all of its deliveries atomically so an isolate death can
+  // never leave a message row with no delivery rows (or vice versa).
   await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, reply_to, idempotency_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+    ).bind(
+      message.id, message.project_id, message.sender_agent_id, message.kind, message.subject,
+      message.payload_json, message.reply_to, message.idempotency_key, message.created_at,
+    ),
     ...deliveries.map((delivery) => env.DB.prepare(
       "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, seen_at, acked_at, attempt_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ).bind(delivery.id, delivery.message_id, delivery.project_id, delivery.recipient_agent_id, delivery.status, delivery.seen_at, delivery.acked_at, delivery.attempt_count, delivery.updated_at)),
@@ -3131,14 +3191,14 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
   ]);
   const tasks = taskRows.results;
   const taskIds = tasks.map((task) => String(task.id));
-  const gates = taskIds.length
-    ? await env.DB.prepare(
-      `SELECT task_id, gate_name, status, by_agent, note, created_at, updated_at
-       FROM task_gate WHERE task_id IN (${taskIds.map(() => "?").join(",")}) ORDER BY gate_name`,
-    ).bind(...taskIds).all<Record<string, unknown>>()
-    : { results: [] as Record<string, unknown>[] };
+  const gates = await selectByIdChunks<Record<string, unknown>>(
+    env.DB,
+    taskIds,
+    (placeholders) => `SELECT task_id, gate_name, status, by_agent, note, created_at, updated_at
+       FROM task_gate WHERE task_id IN (${placeholders}) ORDER BY gate_name`,
+  );
   const gatesByTask = new Map<string, Record<string, unknown>[]>();
-  for (const gate of gates.results) {
+  for (const gate of gates) {
     const taskGates = gatesByTask.get(String(gate.task_id)) ?? [];
     taskGates.push(gate);
     gatesByTask.set(String(gate.task_id), taskGates);
@@ -3158,17 +3218,17 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
     blocked_upstream_task_ids: [] as string[],
   }));
   const blockedTasks = taskViews.filter((task) => Number(task.blocked ?? 0) === 1);
-  const blockedDependencyRows = taskIds.length
-    ? await env.DB.prepare(
-      `SELECT d.task_id, d.depends_on_id
+  const blockedDependencyRows = await selectByIdChunks<{ task_id: string; depends_on_id: string }>(
+    env.DB,
+    taskIds,
+    (placeholders) => `SELECT d.task_id, d.depends_on_id
        FROM task_dependency d
        JOIN task_item dependency ON dependency.id = d.depends_on_id
-       WHERE d.task_id IN (${taskIds.map(() => "?").join(",")})
+       WHERE d.task_id IN (${placeholders})
          AND dependency.blocked = 1 AND dependency.deleted_at IS NULL`,
-    ).bind(...taskIds).all<{ task_id: string; depends_on_id: string }>()
-    : { results: [] as { task_id: string; depends_on_id: string }[] };
+  );
   const blockedUpstreamsByTask = new Map<string, string[]>();
-  for (const row of blockedDependencyRows.results) {
+  for (const row of blockedDependencyRows) {
     const upstreams = blockedUpstreamsByTask.get(row.task_id) ?? [];
     upstreams.push(row.depends_on_id);
     blockedUpstreamsByTask.set(row.task_id, upstreams);

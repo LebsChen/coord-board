@@ -2272,4 +2272,97 @@ describe("coord board", () => {
     const row = await env.DB.prepare("SELECT spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string }>();
     expect(row?.spawn_status).toBe("spawned");
   });
+
+  it("rejects PATCH spawn on a task that is already actively spawning/spawned", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "guard-project", name: "Guard" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "guard-project", id: "guard-profile", name: "P", role_tag: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "guard-project", title: "Guard task", worker_profile_id: "guard-profile", spawn: true }),
+    });
+    const taskId = String(task.body.id);
+    await env.DB.prepare("UPDATE task_item SET spawn_status = 'spawned' WHERE id = ?").bind(taskId).run();
+    const patched = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ spawn: true }),
+    });
+    expect(patched.response.status).toBe(409);
+    const row = await env.DB.prepare("SELECT spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string }>();
+    expect(row?.spawn_status).toBe("spawned");
+  });
+
+  it("clears a pending spawn when the worker profile is removed", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "clear-project", name: "Clear" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "clear-project", id: "clear-profile", name: "P", role_tag: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "clear-project", title: "Clear task", worker_profile_id: "clear-profile", spawn: true }),
+    });
+    const taskId = String(task.body.id);
+    const patched = await call(`/api/board/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ worker_profile_id: null }),
+    });
+    expect(patched.response.status).toBe(200);
+    const row = await env.DB.prepare("SELECT worker_profile_id, spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ worker_profile_id: string | null; spawn_status: string | null }>();
+    expect(row?.worker_profile_id).toBeNull();
+    expect(row?.spawn_status).toBeNull();
+  });
+
+  it("terminates an orphaned session when reconciling a stuck spawn", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "orphan-project", name: "Orphan" }),
+    });
+    await call("/api/board/worker-profiles", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "orphan-project", id: "orphan-profile", name: "P", role_tag: "worker" }),
+    });
+    await call("/api/board/backup-accounts", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "orphan-project", id: "orphan-account", role_tag: "worker", org_id: "org-orphan", credential: "secret-orphan" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "orphan-project", title: "Orphan task", worker_profile_id: "orphan-profile", spawn: true }),
+    });
+    const taskId = String(task.body.id);
+    const stale = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    // Simulate an isolate that created the session and persisted its id, then died before commit.
+    await env.DB.prepare("UPDATE task_item SET spawn_status = 'spawning', updated_at = ? WHERE id = ?").bind(stale, taskId).run();
+    await env.DB.prepare("UPDATE backup_account SET status = 'reserved' WHERE id = ?").bind("orphan-account").run();
+    await env.DB.prepare(
+      "INSERT INTO agent(id, project_id, name, role, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, 'worker', 'online', ?, ?, ?)",
+    ).bind(
+      "orphan-agent", "orphan-project", "Orphan worker",
+      JSON.stringify({ cloud_spawn: true, task_id: taskId, backup_account_id: "orphan-account", session_id: "devin-orphan" }),
+      stale, stale,
+    ).run();
+    const seen: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      seen.push(`${init?.method ?? "GET"} ${url}`);
+      return new Response(JSON.stringify({ session_id: "devin-orphan-2" }), { status: 200 });
+    });
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    // The orphaned Devin session was terminated during reconciliation.
+    expect(seen.some((entry) => entry.includes("devin-orphan"))).toBe(true);
+    const orphan = await env.DB.prepare("SELECT id FROM agent WHERE id = ?").bind("orphan-agent").first();
+    expect(orphan).toBeNull();
+    const row = await env.DB.prepare("SELECT spawn_status FROM task_item WHERE id = ?").bind(taskId).first<{ spawn_status: string }>();
+    expect(row?.spawn_status).toBe("spawned");
+  });
 });
