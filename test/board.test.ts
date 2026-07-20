@@ -422,6 +422,69 @@ describe("coord board", () => {
     expect(ready.response.status).toBe(200);
   });
 
+  it("reports an assignee mismatch instead of an unmet dependency", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "claim-assignee-diagnostics", name: "Claim Assignee Diagnostics" }),
+    });
+    const developer = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "claim-assignee-developer",
+        project_id: "claim-assignee-diagnostics",
+        name: "Developer",
+        role: "开发 Agent",
+      }),
+    });
+    const reviewer = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "claim-assignee-reviewer",
+        project_id: "claim-assignee-diagnostics",
+        name: "Reviewer",
+        role: "代码审查 Agent",
+      }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        board_id: "claim-assignee-diagnostics",
+        title: "assigned pending task",
+        assignee_agent_id: "claim-assignee-developer",
+      }),
+    });
+    const denied = await call(
+      `/api/board/tasks/${task.body.id}/claim`,
+      { method: "POST", body: JSON.stringify({ agent_id: "claim-assignee-reviewer" }) },
+      String(reviewer.body.token),
+    );
+    expect(developer.body.token).toBeTruthy();
+    expect(denied.response.status).toBe(403);
+    expect(denied.body.error).toBe("task is assigned to another agent");
+  });
+
+  it("reports unmet dependencies when the dependency is not done", async () => {
+    const parent = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "diagnostics parent" }),
+    });
+    const child = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "diagnostics child" }),
+    });
+    const dependencies = await call(`/api/board/tasks/${child.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [parent.body.id] }),
+    });
+    expect(dependencies.response.status).toBe(200);
+    const blocked = await call(
+      `/api/board/tasks/${child.body.id}/claim`,
+      { method: "POST", body: JSON.stringify({ agent_id: "worker" }) },
+    );
+    expect(blocked.response.status).toBe(422);
+    expect(blocked.body.error).toBe("dependencies are unmet");
+  });
+
   it("replays idempotent creates", async () => {
     const init = { method: "POST", headers: { "idempotency-key": "same-create" }, body: JSON.stringify({ title: "once" }) };
     const first = await call("/api/board/tasks", init);

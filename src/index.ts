@@ -2054,7 +2054,28 @@ async function claimTask(request: Request, env: Env, auth: Auth, ctx: ExecutionC
     if (row.lease_owner && row.lease_expires_at && String(row.lease_expires_at) > timestamp) {
       return json({ error: "lease held", task: row }, 409);
     }
-    return json({ error: "task is unclaimable or dependencies are unmet", task: await taskView(env.DB, row) }, 422);
+    const taskDetails = await taskView(env.DB, row);
+    if (row.assignee_agent_id && row.assignee_agent_id !== owner && !canManage(auth)) {
+      return json({ error: "task is assigned to another agent", task: taskDetails }, 403);
+    }
+    const dependencyIds = await listDependencies(env.DB, taskId);
+    if (dependencyIds.length > 0) {
+      const dependencies = await selectByIdChunks<{ id: string; phase: Phase; deleted_at: string | null }>(
+        env.DB,
+        dependencyIds,
+        (placeholders) => `SELECT id, phase, deleted_at FROM task_item WHERE id IN (${placeholders})`,
+      );
+      const dependencyById = new Map(dependencies.map((dependency) => [dependency.id, dependency]));
+      const unmet = dependencyIds.some((dependencyId) => {
+        const dependency = dependencyById.get(dependencyId);
+        return !dependency || dependency.deleted_at !== null || dependency.phase !== "done";
+      });
+      if (unmet) return json({ error: "dependencies are unmet", task: taskDetails }, 422);
+    }
+    if (generation > 0 && Number(row.lease_generation ?? 0) !== generation) {
+      return json({ error: "lease generation mismatch", task: taskDetails }, 409);
+    }
+    return json({ error: "task is unclaimable", task: taskDetails }, 422);
   }
   const claimed = await task(env.DB, taskId);
   dispatchHooks(ctx, env, projectId, "task_claimed", "post", { task_id: taskId, actor_agent_id: owner, lease_expires_at: expires });
