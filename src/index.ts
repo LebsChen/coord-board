@@ -338,6 +338,7 @@ function roleCapabilities(role: string): readonly Capability[] {
   if (/lead|orchestrator|编排/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.lead;
   if (/审查|review/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.reviewer;
   if (/测试|test/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.tester;
+  if (/前端|frontend|front-end/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.developer;
   if (/开发|developer|dev/i.test(role)) return ROLE_CAPABILITY_DEFAULTS.developer;
   return ROLE_CAPABILITY_DEFAULTS.worker;
 }
