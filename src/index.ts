@@ -4136,20 +4136,30 @@ async function teamSnapshot(request: Request, env: Env, auth: Auth): Promise<Res
     taskGates.push(gate);
     gatesByTask.set(String(gate.task_id), taskGates);
   }
-  const taskViews = tasks.map((task) => ({
-    id: task.id,
-    title: task.title,
-    phase: task.phase,
-    blocked: task.blocked,
-    assignee_agent_id: task.assignee_agent_id,
-    lease_owner: task.lease_owner,
-    lease_expires_at: task.lease_expires_at,
-    plan_status: task.plan_status,
-    acceptance_status: task.acceptance_status,
-    required_gates: requiredGates(task),
-    gates: gatesByTask.get(String(task.id)) ?? [],
-    blocked_upstream_task_ids: [] as string[],
-  }));
+  const taskViews = tasks.map((task) => {
+    let readiness = normalizeReadiness({});
+    try {
+      readiness = normalizeReadiness(JSON.parse(String(task.readiness_json ?? "{}")));
+    } catch {}
+    return {
+      id: task.id,
+      title: task.title,
+      phase: task.phase,
+      blocked: task.blocked,
+      epic: String(task.epic ?? ""),
+      user_story: String(task.user_story ?? ""),
+      risk: normalizeRisk(task.risk, "low"),
+      readiness,
+      assignee_agent_id: task.assignee_agent_id,
+      lease_owner: task.lease_owner,
+      lease_expires_at: task.lease_expires_at,
+      plan_status: task.plan_status,
+      acceptance_status: task.acceptance_status,
+      required_gates: requiredGates(task),
+      gates: gatesByTask.get(String(task.id)) ?? [],
+      blocked_upstream_task_ids: [] as string[],
+    };
+  });
   const blockedTasks = taskViews.filter((task) => Number(task.blocked ?? 0) === 1);
   const blockedDependencyRows = await selectByIdChunks<{ task_id: string; depends_on_id: string }>(
     env.DB,

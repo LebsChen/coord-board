@@ -1654,6 +1654,43 @@ describe("coord board", () => {
     expect((await call(`/api/board/team?project=team-project-b`, {}, otherToken)).response.status).toBe(200);
   });
 
+  it("includes project fields in the team snapshot task projection", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "team-project-fields", name: "Team Project Fields" }),
+    });
+    const created = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        board_id: "team-project-fields",
+        title: "Projectized team task",
+        epic: "Launch",
+        user_story: "As a lead",
+        risk: "high",
+        readiness: {
+          problem_clear: true,
+          files_known: true,
+          verification_contract: true,
+        },
+      }),
+    });
+    expect(created.response.status).toBe(201);
+    const snapshot = await call("/api/board/team?project=team-project-fields");
+    expect(snapshot.response.status).toBe(200);
+    const task = snapshot.body.tasks.find((item: any) => item.id === created.body.id);
+    expect(task).toMatchObject({
+      epic: "Launch",
+      user_story: "As a lead",
+      risk: "high",
+    });
+    expect(task.readiness).toMatchObject({
+      problem_clear: true,
+      files_known: true,
+      verification_contract: true,
+    });
+    expect(typeof task.readiness).toBe("object");
+  });
+
   it("serves project events with bounded reads and project-scoped authorization", async () => {
     const project = await call("/api/board/projects", {
       method: "POST",
