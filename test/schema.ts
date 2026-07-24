@@ -57,5 +57,11 @@ CREATE INDEX IF NOT EXISTS idx_message_project_created ON message(project_id, cr
 CREATE INDEX IF NOT EXISTS idx_message_sender_created ON message(sender_agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_delivery_recipient_status ON message_delivery(recipient_agent_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_delivery_project_status ON message_delivery(project_id, status, updated_at);
+ALTER TABLE task_item ADD COLUMN epic TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_item ADD COLUMN user_story TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_item ADD COLUMN risk TEXT NOT NULL DEFAULT 'low';
+ALTER TABLE task_item ADD COLUMN readiness_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE task_item ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_task_epic ON task_item(board_id, epic, user_story);
 `;
 export default schema;

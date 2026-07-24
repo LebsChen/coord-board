@@ -64,6 +64,16 @@ const HOOK_DELIVERY_BATCH_SIZE = 50;
 const HOOK_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const HOOK_DELIVERY_IN_FLIGHT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_TASK_ATTEMPTS = 5;
+const RISK_VALUES = ["low", "medium", "high"] as const;
+const READINESS_KEYS = [
+  "problem_clear",
+  "non_goals_clear",
+  "acceptance_testable",
+  "files_known",
+  "scope_defined",
+  "verification_contract",
+  "human_approval_recorded",
+] as const;
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(data), {
@@ -106,6 +116,24 @@ function flag(value: unknown): number {
 function gateNames(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(String).map((name) => name.trim()).filter(Boolean))];
+}
+
+function normalizeReadiness(input: unknown): Record<string, boolean> {
+  const source = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  return Object.fromEntries(READINESS_KEYS.map((key) => [key, Boolean(source[key])]));
+}
+
+function normalizeEvidence(input: unknown): { commands: string[]; findings: string[]; residual: string } {
+  const source = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  return {
+    commands: Array.isArray(source.commands) ? source.commands.filter((value): value is string => typeof value === "string") : [],
+    findings: Array.isArray(source.findings) ? source.findings.filter((value): value is string => typeof value === "string") : [],
+    residual: typeof source.residual === "string" ? source.residual : "",
+  };
+}
+
+function normalizeRisk(input: unknown, fallback: string): string {
+  return typeof input === "string" && RISK_VALUES.includes(input as typeof RISK_VALUES[number]) ? input : fallback;
 }
 
 function requiredGates(row: TaskRow): string[] {
@@ -1682,12 +1710,73 @@ function dependencyGraphHasCycle(edges: Map<string, string[]>): boolean {
 }
 
 async function taskView(db: D1Database, row: Record<string, unknown>) {
+  let readiness = normalizeReadiness({});
+  let evidence = normalizeEvidence({});
+  try {
+    readiness = normalizeReadiness(JSON.parse(String(row.readiness_json ?? "{}")));
+  } catch {}
+  try {
+    evidence = normalizeEvidence(JSON.parse(String(row.evidence_json ?? "{}")));
+  } catch {}
   return {
     ...row,
+    readiness,
+    evidence,
     required_gates: requiredGates(row),
     dependencies: await listDependencies(db, String(row.id)),
     gates: await listGates(db, String(row.id)),
   };
+}
+
+function computeRoadmap(tasks: { epic: string; user_story: string; phase: string }[]) {
+  const epicMap = new Map<string, Map<string, { total: number; done: number }>>();
+  for (const task of tasks) {
+    const epic = task.epic || "";
+    const story = task.user_story || "";
+    const stories = epicMap.get(epic) ?? new Map<string, { total: number; done: number }>();
+    const current = stories.get(story) ?? { total: 0, done: 0 };
+    current.total += 1;
+    if (task.phase === "done") current.done += 1;
+    stories.set(story, current);
+    epicMap.set(epic, stories);
+  }
+  let total = 0;
+  let done = 0;
+  const epics = [...epicMap.entries()].map(([epic, stories]) => {
+    const storyViews = [...stories.entries()].map(([name, values]) => ({
+      name,
+      total: values.total,
+      done: values.done,
+      pct: values.total ? Math.round(values.done / values.total * 100) : 0,
+    }));
+    const epicTotal = storyViews.reduce((sum, story) => sum + story.total, 0);
+    const epicDone = storyViews.reduce((sum, story) => sum + story.done, 0);
+    total += epicTotal;
+    done += epicDone;
+    return {
+      epic,
+      total: epicTotal,
+      done: epicDone,
+      pct: epicTotal ? Math.round(epicDone / epicTotal * 100) : 0,
+      stories: storyViews,
+    };
+  });
+  return { epics, total, done, pct: total ? Math.round(done / total * 100) : 0 };
+}
+
+async function roadmap(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+  const url = new URL(request.url);
+  const requestedBoard = url.searchParams.get("board_id") || url.searchParams.get("project") || url.searchParams.get("board");
+  if (requestedBoard && !projectAllowed(auth, requestedBoard)) {
+    return json({ error: "project access denied" }, 403);
+  }
+  const board = requestedBoard || (isAdmin(auth) ? null : auth.projectId);
+  const query = board
+    ? env.DB.prepare("SELECT epic, user_story, phase FROM task_item WHERE board_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at").bind(board)
+    : env.DB.prepare("SELECT epic, user_story, phase FROM task_item WHERE deleted_at IS NULL ORDER BY board_id, sort_order, created_at");
+  const rows = (await query.all<{ epic: string; user_story: string; phase: string }>()).results;
+  return json(computeRoadmap(rows));
 }
 
 async function authorizeTask(
@@ -1746,6 +1835,14 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const spawnRequested = flag(body.spawn) === 1;
     if (spawnRequested && !workerProfileId) return json({ error: "spawn requires worker_profile_id" }, 422);
     const spawnStatus = spawnRequested ? "requested" : null;
+    if (body.risk !== undefined && (typeof body.risk !== "string" || !RISK_VALUES.includes(body.risk as typeof RISK_VALUES[number]))) {
+      return json({ error: "invalid risk" }, 422);
+    }
+    const epic = body.epic === undefined ? "" : String(body.epic);
+    const userStory = body.user_story === undefined ? "" : String(body.user_story);
+    const risk = normalizeRisk(body.risk, "low");
+    const readiness = normalizeReadiness(body.readiness);
+    const evidence = normalizeEvidence(body.evidence);
     const key = idempotencyKey(request, body);
     const replay = await replayOrReserve(db, `task:create:${boardId}`, key);
     if (replay) return replay;
@@ -1760,6 +1857,11 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       board_id: boardId,
       title: String(body.title || "").trim(),
       description: String(body.description || ""),
+      epic,
+      user_story: userStory,
+      risk,
+      readiness,
+      evidence,
       phase,
       require_plan: requirePlan,
       require_acceptance: requireAcceptance,
@@ -1789,12 +1891,13 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       db.prepare(
         `INSERT INTO task_item(
           id, board_id, title, description, phase, require_plan, require_acceptance, required_gates, priority,
-          assignee_agent_id, worker_profile_id, spawn_status, sort_order, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          assignee_agent_id, worker_profile_id, spawn_status, sort_order, epic, user_story, risk, readiness_json, evidence_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         taskIdNew, responseBody.board_id, responseBody.title, responseBody.description, phase,
         requirePlan, requireAcceptance, responseBody.required_gates, responseBody.priority, responseBody.assignee_agent_id,
-        workerProfileId, spawnStatus, responseBody.sort_order, timestamp, timestamp,
+        workerProfileId, spawnStatus, responseBody.sort_order, responseBody.epic, responseBody.user_story, responseBody.risk,
+        JSON.stringify(responseBody.readiness), JSON.stringify(responseBody.evidence), timestamp, timestamp,
       ),
       event(db, taskIdNew, "created", actor(auth), {
         title: responseBody.title,
@@ -1823,6 +1926,22 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const phase = body.phase === undefined ? current.phase : String(body.phase);
     const requirePlan = body.require_plan === undefined ? Number(current.require_plan ?? 0) : flag(body.require_plan);
     const requireAcceptance = body.require_acceptance === undefined ? Number(current.require_acceptance ?? 0) : flag(body.require_acceptance);
+    if (body.risk !== undefined && (typeof body.risk !== "string" || !RISK_VALUES.includes(body.risk as typeof RISK_VALUES[number]))) {
+      return json({ error: "invalid risk" }, 422);
+    }
+    const epic = body.epic === undefined ? String(current.epic ?? "") : String(body.epic);
+    const userStory = body.user_story === undefined ? String(current.user_story ?? "") : String(body.user_story);
+    const risk = body.risk === undefined ? normalizeRisk(current.risk, "low") : normalizeRisk(body.risk, "low");
+    let readiness = normalizeReadiness({});
+    try {
+      readiness = normalizeReadiness(JSON.parse(String(current.readiness_json ?? "{}")));
+    } catch {}
+    if (body.readiness !== undefined) readiness = normalizeReadiness(body.readiness);
+    let evidence = normalizeEvidence({});
+    try {
+      evidence = normalizeEvidence(JSON.parse(String(current.evidence_json ?? "{}")));
+    } catch {}
+    if (body.evidence !== undefined) evidence = normalizeEvidence(body.evidence);
     const requestedAttempts = body.attempt_count === undefined
       ? Number(current.attempt_count ?? 0)
       : Math.max(0, Math.floor(Number(body.attempt_count)));
@@ -1890,6 +2009,11 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       ...current,
       title,
       description,
+      epic,
+      user_story: userStory,
+      risk,
+      readiness_json: JSON.stringify(readiness),
+      evidence_json: JSON.stringify(evidence),
       priority,
       phase,
       require_plan: requirePlan,
@@ -1908,12 +2032,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?,
+         SET title = ?, description = ?, epic = ?, user_story = ?, risk = ?, readiness_json = ?, evidence_json = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?,
              lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
              lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
              updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, epic, userStory, risk, responseBody.readiness_json, responseBody.evidence_json, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
       ...(phase === "done" && gateRequirementsChanged
         ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
@@ -4150,14 +4274,14 @@ input{background:#0d1527;color:var(--text);border:1px solid var(--line);border-r
 .topbar{height:64px;position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:22px;padding:0 24px;background:rgba(11,16,32,.9);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:10px;font-weight:750;font-size:17px;letter-spacing:.2px}.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#62b1ff,#7c5cff);display:grid;place-items:center;color:#fff;font-weight:900}.stats{display:flex;gap:8px}.stat{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:4px 10px;color:var(--muted)}.stat b{color:var(--text)}.top-spacer{flex:1}.clock{font-variant-numeric:tabular-nums;color:#c8d4e9}.online{display:flex;align-items:center;gap:6px;color:var(--green)}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}.settings{position:absolute;right:18px;top:58px;width:310px;padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:9px;box-shadow:0 15px 45px #0008}.settings label{display:block;margin:8px 0;color:var(--muted)}.settings input{width:100%;margin-top:4px}
 .layout{display:grid;grid-template-columns:255px minmax(480px,1fr) 300px;gap:14px;padding:16px 18px;max-width:1800px;margin:auto}.panel{min-width:0;background:rgba(18,26,45,.78);border:1px solid var(--line);border-radius:10px;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;padding:13px 14px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.12em;font-size:11px;color:#b5c1d8}.panel-body{padding:10px}.panel-toggle{border:0;background:transparent;color:var(--muted);padding:2px 5px}
 .agent{display:grid;grid-template-columns:34px 1fr auto;gap:9px;align-items:center;padding:10px 5px;border-bottom:1px solid #25304a}.avatar{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:750;color:#fff}.agent-name{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agent-meta{font-size:11px;color:var(--muted)}.status{font-size:10px;border-radius:99px;padding:2px 7px;border:1px solid currentColor}.status.online,.status.active{color:var(--green)}.status.idle{color:var(--amber)}.status.shutdown,.status.offline{color:var(--muted)}.agent-task{grid-column:2/-1;font-size:11px;color:#b9c7dd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agent-actions{grid-column:2/-1}
-.board{display:flex;gap:10px;overflow-x:auto;padding:10px}.column{flex:1 0 180px;min-width:180px}.column-head{display:flex;justify-content:space-between;align-items:center;color:#bdc9dc;font-size:11px;letter-spacing:.1em;padding:5px 3px 9px}.count{color:var(--muted);background:#202e49;border-radius:99px;padding:2px 7px}.task{position:relative;background:var(--panel2);border:1px solid #2a3a59;border-radius:8px;margin-bottom:9px;padding:11px 10px 10px 14px;box-shadow:0 5px 13px #0002}.task:before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:3px;background:var(--blue)}.task.blocked:before{background:var(--red)}.task.done:before{background:var(--green)}.task-title{font-weight:650;margin-bottom:7px}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{font-size:10px;color:#c7d4ea;background:#263754;border-radius:4px;padding:2px 5px}.task-line{font-size:11px;color:var(--muted);margin-top:6px}.task-footer{display:flex;justify-content:space-between;gap:5px;align-items:end;margin-top:8px}.task-time{color:#9eabc1;font-size:10px}.task-actions{display:flex;gap:3px;flex-wrap:wrap}.task-actions button{font-size:10px;padding:3px 6px}.empty{padding:20px 5px;color:var(--muted);text-align:center;font-size:12px}
+.board{display:flex;gap:10px;overflow-x:auto;padding:10px}.column{flex:1 0 180px;min-width:180px}.column-head{display:flex;justify-content:space-between;align-items:center;color:#bdc9dc;font-size:11px;letter-spacing:.1em;padding:5px 3px 9px}.count{color:var(--muted);background:#202e49;border-radius:99px;padding:2px 7px}.task{position:relative;background:var(--panel2);border:1px solid #2a3a59;border-radius:8px;margin-bottom:9px;padding:11px 10px 10px 14px;box-shadow:0 5px 13px #0002}.task:before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:3px;background:var(--blue)}.task.blocked:before{background:var(--red)}.task.done:before{background:var(--green)}.task-title{font-weight:650;margin-bottom:7px}.chips{display:flex;gap:4px;flex-wrap:wrap}.chip{font-size:10px;color:#c7d4ea;background:#263754;border-radius:4px;padding:2px 5px}.chip.high{color:#ffb4bd;background:#542737}.task-line{font-size:11px;color:var(--muted);margin-top:6px}.task-footer{display:flex;justify-content:space-between;gap:5px;align-items:end;margin-top:8px}.task-time{color:#9eabc1;font-size:10px}.task-actions{display:flex;gap:3px;flex-wrap:wrap}.task-actions button{font-size:10px;padding:3px 6px}.tabs{display:flex;gap:6px;padding:10px 12px 0}.tabs button.active{background:#3479d2;border-color:#4b92ef}.roadmap{padding:10px}.roadmap-epic{background:var(--panel2);border:1px solid #2a3a59;border-radius:8px;padding:12px;margin-bottom:10px}.roadmap-story{display:grid;grid-template-columns:minmax(120px,1fr) 2fr auto;gap:8px;align-items:center;margin-top:9px;color:#c7d4ea}.progress{height:7px;background:#263754;border-radius:99px;overflow:hidden}.progress i{display:block;height:100%;background:var(--green)}.empty{padding:20px 5px;color:var(--muted);text-align:center;font-size:12px}
 .feed-item{position:relative;padding:10px 3px 10px 23px;border-bottom:1px solid #25304a}.feed-item:before{content:"";position:absolute;left:5px;top:15px;width:8px;height:8px;border-radius:50%;background:var(--purple);box-shadow:0 0 8px #b58cff}.feed-type{font-weight:650;color:#d5def0}.feed-meta{font-size:10px;color:var(--muted);margin-top:3px}.feed-summary{font-size:11px;color:#aebbd0;word-break:break-word;margin-top:4px}.notice{margin:10px 18px 0;padding:8px 11px;border:1px solid #6b5130;background:#30271b;color:#f5cf88;border-radius:7px}.new-task{display:flex;gap:8px;align-items:center;padding:10px 18px;border-bottom:1px solid var(--line)}.new-task input{flex:1;max-width:520px}.footer-note{color:var(--muted);text-align:center;padding:14px;font-size:11px}
 @media(max-width:1100px){.layout{grid-template-columns:220px minmax(440px,1fr)}.right{grid-column:1/-1}.right .panel-body{max-height:300px;overflow:auto}}@media(max-width:760px){.topbar{padding:0 12px;gap:10px}.stats{display:none}.layout{display:block;padding:10px}.panel{margin-bottom:10px}.board{overflow-x:auto}.clock{display:none}}
 </style></head><body>
 <header class="topbar"><div class="brand"><span class="logo">C</span><span>Coord Board</span></div><div class="stats"><span class="stat"><b id="agent-count">0</b> agents</span><span class="stat"><b id="task-count">0</b> tasks</span></div><div class="top-spacer"></div><span class="clock" id="clock">00:00:00</span><span class="online"><i class="dot"></i><span id="connection">Online</span></span><button class="primary" id="new-task-button">＋ New Task</button><button id="settings-button" title="Settings">⚙</button><div class="settings hidden" id="settings"><label>Bearer token<input id="token" type="password" autocomplete="off"></label><label>Agent ID<input id="agent" value="ui-agent" autocomplete="off"></label><button id="save-settings">Save &amp; refresh</button></div></header>
 <div id="notice" class="notice hidden"></div><form class="new-task hidden" id="new-task-form"><input id="title" placeholder="Task title" required><button class="primary">Create task</button><button type="button" id="cancel-new">Cancel</button></form>
 <main class="layout"><section class="panel left"><div class="panel-head"><span>Agents · Roster</span><span id="deadletters" class="muted">0 dead</span></div><div class="panel-body" id="agents"><div class="empty">Connect a project to view agents.</div></div></section>
-<section class="panel center"><div class="panel-head"><span>Board · <span id="project-heading">default</span></span><button class="panel-toggle" id="pause-button">Pause refresh</button></div><div class="board" id="board"></div></section>
+<section class="panel center"><div class="panel-head"><span>Board · <span id="project-heading">default</span></span><button class="panel-toggle" id="pause-button">Pause refresh</button></div><div class="tabs"><button class="active" id="board-tab">Board</button><button id="roadmap-tab">Roadmap</button></div><div class="board" id="board"></div><div class="roadmap hidden" id="roadmap"></div></section>
 <section class="panel right"><div class="panel-head"><span>Live Feed</span><button class="panel-toggle" id="feed-toggle">Collapse</button></div><div class="panel-body" id="feed"><div class="empty">No events yet.</div></div></section></main><div class="footer-note">Mission Control refreshes every 5 seconds · Project is selected by URL</div>
 <script>
 const query=new URLSearchParams(location.search);const sharedParams=new URLSearchParams(location.hash.startsWith('#')?location.hash.slice(1):location.hash);const sharedToken=sharedParams.get('token')||sharedParams.get('tkn');if(sharedToken)sessionStorage.setItem('coord-board-token',sharedToken);if(location.hash)history.replaceState(null,document.title,location.pathname+location.search);const project=query.get('project')||query.get('board')||sessionStorage.getItem('coord-board-project')||'default';let readOnly=false,paused=false,feedCollapsed=false;const token=document.querySelector('#token');const agent=document.querySelector('#agent');token.value=sessionStorage.getItem('coord-board-token')||'';agent.value=sessionStorage.getItem('coord-board-agent')||'ui-agent';document.querySelector('#project-heading').textContent=project;
@@ -4167,13 +4291,14 @@ function color(id){let n=0;for(const c of String(id||'x'))n=(n*31+c.charCodeAt(0
 function phaseBucket(t){if(Number(t.blocked)===1)return'blocked';if(t.phase==='done')return'done';if(t.acceptance_status&&t.acceptance_status!=='pending'&&t.acceptance_status!=='approved')return'review';if(t.plan_status&&t.plan_status!=='pending'&&t.phase!=='in_progress')return'review';if(t.phase==='in_progress'||t.lease_owner)return'assigned';return'inbox'}
 function setText(id,value){document.querySelector(id).textContent=value}
 function renderReadOnly(){document.querySelectorAll('.task-actions button,.agent-actions button,#new-task-button,#save-settings').forEach(b=>{if(b.dataset.write)b.disabled=readOnly});if(readOnly)document.querySelector('#new-task-button').disabled=true}
-function taskCard(t){const gates=(t.gates||[]).map(g=>esc(g.gate_name+':'+g.status)).join(', ')||'none';const tags=(t.tags||t.labels||[]).map(x=>'<span class="chip">'+esc(x)+'</span>').join('');const actions='<div class="task-actions">'+(t.phase!=='done'&&phaseBucket(t)!=='blocked'?'<button data-write="1" data-action="claim" data-id="'+esc(t.id)+'">Claim</button><button data-write="1" data-action="complete" data-id="'+esc(t.id)+'">Complete</button>':'')+'<button data-write="1" data-action="reassign" data-id="'+esc(t.id)+'">Reassign</button>'+(t.lease_owner?'<button data-write="1" data-action="release" data-id="'+esc(t.id)+'" data-agent="'+esc(t.lease_owner)+'">Force release</button>':'')+'</div>';return'<article class="task '+(phaseBucket(t)==='blocked'?'blocked ':'')+(t.phase==='done'?'done':'')+'"><div class="task-title">'+esc(t.title)+'</div><div class="chips">'+(tags||'<span class="chip">'+esc(t.phase)+'</span>')+'</div><div class="task-line">Assignee: '+esc(t.assignee_agent_id||'unassigned')+' · Lease: '+esc(t.lease_owner?'active':'open')+(t.lease_expires_at?' until '+esc(relative(t.lease_expires_at)):'')+'</div><div class="task-line">Plan: '+esc(t.plan_status||'—')+' · Acceptance: '+esc(t.acceptance_status||'—')+' · Gates: '+gates+'</div><div class="task-footer"><span class="task-time">'+esc(relative(t.updated_at||t.created_at))+'</span>'+actions+'</div></article>'}
+function taskCard(t){const gates=(t.gates||[]).map(g=>esc(g.gate_name+':'+g.status)).join(', ')||'none';const tags=(t.tags||t.labels||[]).map(x=>'<span class="chip">'+esc(x)+'</span>').join('');const readiness=t.readiness&&typeof t.readiness==='object'?Object.values(t.readiness).filter(Boolean).length:0;const risk='<span class="chip '+(t.risk==='high'?'high':'')+'">risk: '+esc(t.risk||'low')+'</span>';const epic=t.epic?'<span class="chip">epic: '+esc(t.epic)+'</span>':'';const actions='<div class="task-actions">'+(t.phase!=='done'&&phaseBucket(t)!=='blocked'?'<button data-write="1" data-action="claim" data-id="'+esc(t.id)+'">Claim</button><button data-write="1" data-action="complete" data-id="'+esc(t.id)+'">Complete</button>':'')+'<button data-write="1" data-action="reassign" data-id="'+esc(t.id)+'">Reassign</button>'+(t.lease_owner?'<button data-write="1" data-action="release" data-id="'+esc(t.id)+'" data-agent="'+esc(t.lease_owner)+'">Force release</button>':'')+'</div>';return'<article class="task '+(phaseBucket(t)==='blocked'?'blocked ':'')+(t.phase==='done'?'done':'')+'"><div class="task-title">'+esc(t.title)+'</div><div class="chips">'+(tags||'<span class="chip">'+esc(t.phase)+'</span>')+risk+'<span class="chip">就绪 '+readiness+'/7</span>'+epic+'</div><div class="task-line">Assignee: '+esc(t.assignee_agent_id||'unassigned')+' · Lease: '+esc(t.lease_owner?'active':'open')+(t.lease_expires_at?' until '+esc(relative(t.lease_expires_at)):'')+'</div><div class="task-line">Plan: '+esc(t.plan_status||'—')+' · Acceptance: '+esc(t.acceptance_status||'—')+' · Gates: '+gates+'</div><div class="task-footer"><span class="task-time">'+esc(relative(t.updated_at||t.created_at))+'</span>'+actions+'</div></article>'}
 function renderAgents(agents){document.querySelector('#agents').innerHTML=agents.length?agents.map(a=>'<article class="agent"><span class="avatar" style="background:'+color(a.id)+'">'+esc(initial(a))+'</span><div><div class="agent-name">'+esc(a.name||a.id)+'</div><div class="agent-meta">'+esc(a.role||'worker')+' · '+esc(relative(a.last_seen_at))+'</div></div><span class="status '+esc(a.status||'offline')+'">'+esc(a.status||'offline')+'</span>'+(a.current_task?'<div class="agent-task">↳ '+esc(a.current_task.title)+'</div>':'<div class="agent-task muted">No active task</div>')+'<div class="agent-actions"><button class="danger" data-write="1" data-action="shutdown" data-id="'+esc(a.id)+'">Force shutdown</button></div></article>').join(''):'<div class="empty">No agents in this project.</div>';renderReadOnly()}
 function renderBoard(tasks){const groups={inbox:[],assigned:[],review:[],done:[],blocked:[]};tasks.forEach(t=>groups[phaseBucket(t)].push(t));const columns=[['inbox','INBOX'],['assigned','ASSIGNED'],['review','REVIEW / ACCEPTANCE'],['done','DONE'],['blocked','BLOCKED']];document.querySelector('#board').innerHTML=columns.map(([key,label])=>'<div class="column"><div class="column-head"><span>'+label+'</span><span class="count">'+groups[key].length+'</span></div>'+(groups[key].map(taskCard).join('')||'<div class="empty">Clear</div>')+'</div>').join('');renderReadOnly()}
+function renderRoadmap(tasks){const groups={};tasks.forEach(t=>{const epic=t.epic||'';const story=t.user_story||'';groups[epic]??={};groups[epic][story]??={total:0,done:0};groups[epic][story].total++;if(t.phase==='done')groups[epic][story].done++});document.querySelector('#roadmap').innerHTML=Object.entries(groups).map(([epic,stories])=>{const list=Object.entries(stories);const total=list.reduce((n,[,v])=>n+v.total,0);const done=list.reduce((n,[,v])=>n+v.done,0);return'<section class="roadmap-epic"><strong>'+esc(epic||'未归类')+'</strong><span class="muted"> · '+done+'/'+total+' ('+(total?Math.round(done/total*100):0)+'%)</span>'+list.map(([name,v])=>{const pct=v.total?Math.round(v.done/v.total*100):0;return'<div class="roadmap-story"><span>'+esc(name||'未归类')+'</span><div class="progress"><i style="width:'+pct+'%"></i></div><span class="muted">'+v.done+'/'+v.total+' · '+pct+'%</span></div>'}).join('')+'</section>'}).join('')||'<div class="empty">No roadmap items.</div>'}
 function renderFeed(events){document.querySelector('#feed').innerHTML=events.length?events.map(e=>'<div class="feed-item"><div class="feed-type">◈ '+esc(e.type||'event')+'</div><div class="feed-meta">'+esc(relative(e.created_at))+' · '+esc(e.agent_id||'system')+(e.task_id?' · task '+esc(e.task_id):'')+'</div>'+(e.payload_summary?'<div class="feed-summary">'+esc(e.payload_summary)+'</div>':'')+'</div>').join(''):'<div class="empty">No events yet.</div>'}
-async function load(){if(paused)return;const [team,events]=await Promise.all([api('/team?project='+encodeURIComponent(project)),api('/events?project='+encodeURIComponent(project)+'&limit=50')]);if(team.status>=400){setText('#connection','Offline');document.querySelector('#notice').textContent=team.data.error||'Unable to load project';document.querySelector('#notice').classList.remove('hidden');return}setText('#connection','Online');document.querySelector('#notice').classList.add('hidden');const d=team.data;setText('#agent-count',(d.agents||[]).length);setText('#task-count',(d.tasks||[]).length);setText('#deadletters',(d.dead_letter_count||0)+' dead');renderAgents(d.agents||[]);renderBoard(d.tasks||[]);if(events.status<400)renderFeed(events.data.events||[])}
+let lastTasks=[];let roadmapMode=false;async function load(){if(paused)return;const [team,events]=await Promise.all([api('/team?project='+encodeURIComponent(project)),api('/events?project='+encodeURIComponent(project)+'&limit=50')]);if(team.status>=400){setText('#connection','Offline');document.querySelector('#notice').textContent=team.data.error||'Unable to load project';document.querySelector('#notice').classList.remove('hidden');return}setText('#connection','Online');document.querySelector('#notice').classList.add('hidden');const d=team.data;lastTasks=d.tasks||[];setText('#agent-count',(d.agents||[]).length);setText('#task-count',lastTasks.length);setText('#deadletters',(d.dead_letter_count||0)+' dead');renderAgents(d.agents||[]);roadmapMode?renderRoadmap(lastTasks):renderBoard(lastTasks);if(events.status<400)renderFeed(events.data.events||[])}
 async function write(path,body){const r=await api(path,{method:'POST',body:JSON.stringify(body||{})});if(r.status<400)load();else alert(r.data.error||'Request failed')}
-document.querySelector('#board').addEventListener('click',e=>{const b=e.target.closest('button[data-action]');if(!b||readOnly)return;const id=b.dataset.id;const action=b.dataset.action;if(action==='claim'||action==='complete')write('/tasks/'+encodeURIComponent(id)+'/'+action,{agent_id:agent.value});else if(action==='release')write('/tasks/'+encodeURIComponent(id)+'/release',{agent_id:b.dataset.agent});else if(action==='shutdown')write('/agents/'+encodeURIComponent(id)+'/shutdown',{});else if(action==='reassign'){const value=prompt('Assignee agent id (blank to clear):','');if(value!==null)write('/tasks/'+encodeURIComponent(id)+'/reassign',{assignee_agent_id:value||null})}});
+document.querySelector('#board').addEventListener('click',e=>{const b=e.target.closest('button[data-action]');if(!b||readOnly)return;const id=b.dataset.id;const action=b.dataset.action;if(action==='claim'||action==='complete')write('/tasks/'+encodeURIComponent(id)+'/'+action,{agent_id:agent.value});else if(action==='release')write('/tasks/'+encodeURIComponent(id)+'/release',{agent_id:b.dataset.agent});else if(action==='shutdown')write('/agents/'+encodeURIComponent(id)+'/shutdown',{});else if(action==='reassign'){const value=prompt('Assignee agent id (blank to clear):','');if(value!==null)write('/tasks/'+encodeURIComponent(id)+'/reassign',{assignee_agent_id:value||null})}});document.querySelector('#board-tab').onclick=()=>{roadmapMode=false;document.querySelector('#board-tab').classList.add('active');document.querySelector('#roadmap-tab').classList.remove('active');document.querySelector('#roadmap').classList.add('hidden');document.querySelector('#board').classList.remove('hidden');renderBoard(lastTasks)};document.querySelector('#roadmap-tab').onclick=()=>{roadmapMode=true;document.querySelector('#roadmap-tab').classList.add('active');document.querySelector('#board-tab').classList.remove('active');document.querySelector('#board').classList.add('hidden');document.querySelector('#roadmap').classList.remove('hidden');renderRoadmap(lastTasks)};
 document.querySelector('#agents').addEventListener('click',e=>{const b=e.target.closest('button[data-action="shutdown"]');if(b&&!readOnly)write('/agents/'+encodeURIComponent(b.dataset.id)+'/shutdown',{})});document.querySelector('#new-task-button').onclick=()=>{if(!readOnly)document.querySelector('#new-task-form').classList.toggle('hidden')};document.querySelector('#cancel-new').onclick=()=>document.querySelector('#new-task-form').classList.add('hidden');document.querySelector('#new-task-form').onsubmit=e=>{e.preventDefault();write('/tasks',{title:document.querySelector('#title').value,board_id:project});e.target.reset();e.target.classList.add('hidden')};document.querySelector('#settings-button').onclick=()=>document.querySelector('#settings').classList.toggle('hidden');document.querySelector('#save-settings').onclick=()=>{sessionStorage.setItem('coord-board-token',token.value);sessionStorage.setItem('coord-board-agent',agent.value);document.querySelector('#settings').classList.add('hidden');load()};document.querySelector('#pause-button').onclick=()=>{paused=!paused;document.querySelector('#pause-button').textContent=paused?'Resume refresh':'Pause refresh';if(!paused)load()};document.querySelector('#feed-toggle').onclick=()=>{feedCollapsed=!feedCollapsed;document.querySelector('#feed').classList.toggle('hidden',feedCollapsed);document.querySelector('#feed-toggle').textContent=feedCollapsed?'Expand':'Collapse'};setInterval(()=>{document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});document.querySelectorAll('.task-time,.agent-meta,.feed-meta').forEach(()=>{});},1000);setInterval(load,5000);document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});load()
 </script></body></html>`;
 
@@ -4210,6 +4335,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return json({ error: "share tokens are read-only" }, 403);
     }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);
+    if (url.pathname === "/api/board/roadmap") return roadmap(request, env, auth);
     const taskMatch = url.pathname.match(/^\/api\/board\/tasks(?:\/([^/]+)(?:\/(claim|renew|release|complete|review|verify|plan|plan-review|acceptance|gate|reassign|dependencies|events|answer|sleep))?)?$/);
     if (taskMatch) {
       const taskId = taskMatch[1];

@@ -485,6 +485,114 @@ describe("coord board", () => {
     expect(blocked.body.error).toBe("dependencies are unmet");
   });
 
+  it("persists and normalizes project-oriented task fields", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "projectization-fields", name: "Projectization Fields" }),
+    });
+    const created = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        board_id: "projectization-fields",
+        title: "Project task",
+        epic: "Launch",
+        user_story: "As a user",
+        risk: "medium",
+        readiness: { problem_clear: true, files_known: true, unexpected: true },
+        evidence: { commands: ["npm test", 7], findings: ["green"], residual: "none", extra: "ignored" },
+      }),
+    });
+    expect(created.response.status).toBe(201);
+    expect(created.body).toMatchObject({
+      epic: "Launch",
+      user_story: "As a user",
+      risk: "medium",
+      readiness: {
+        problem_clear: true,
+        files_known: true,
+        non_goals_clear: false,
+      },
+      evidence: { commands: ["npm test"], findings: ["green"], residual: "none" },
+    });
+    const fetched = await call(`/api/board/tasks/${created.body.id}?project=projectization-fields`);
+    expect(fetched.body.epic).toBe("Launch");
+    expect(fetched.body.user_story).toBe("As a user");
+    expect(fetched.body.risk).toBe("medium");
+    expect(Object.keys(fetched.body.readiness)).toHaveLength(7);
+    expect(fetched.body.evidence).toEqual({
+      commands: ["npm test"],
+      findings: ["green"],
+      residual: "none",
+    });
+    const patched = await call(`/api/board/tasks/${created.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        epic: "Ship",
+        risk: "high",
+        readiness: { acceptance_testable: true },
+      }),
+    });
+    expect(patched.response.status).toBe(200);
+    expect(patched.body.epic).toBe("Ship");
+    expect(patched.body.risk).toBe("high");
+    expect(patched.body.readiness.acceptance_testable).toBe(true);
+    expect(patched.body.readiness.problem_clear).toBe(false);
+  });
+
+  it("rejects invalid project risk values on create and patch", async () => {
+    const created = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "Risk validation", risk: "urgent" }),
+    });
+    expect(created.response.status).toBe(422);
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "Risk patch validation" }),
+    });
+    const patched = await call(`/api/board/tasks/${task.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ risk: "urgent" }),
+    });
+    expect(patched.response.status).toBe(422);
+    expect(patched.body.error).toBe("invalid risk");
+  });
+
+  it("aggregates the project roadmap by epic and user story", async () => {
+    await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "roadmap-project", name: "Roadmap Project" }),
+    });
+    const makeTask = (body: Record<string, unknown>) => call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "roadmap-project", title: "Roadmap task", ...body }),
+    });
+    const first = await makeTask({ epic: "Launch", user_story: "Onboarding" });
+    const second = await makeTask({ epic: "Launch", user_story: "Onboarding" });
+    await makeTask({ epic: "Launch", user_story: "Billing" });
+    await makeTask({ epic: "Ops", user_story: "" });
+    await call(`/api/board/tasks/${first.body.id}`, { method: "PATCH", body: JSON.stringify({ phase: "done" }) });
+    await call(`/api/board/tasks/${second.body.id}`, { method: "PATCH", body: JSON.stringify({ phase: "done" }) });
+    const result = await call("/api/board/roadmap?project=roadmap-project");
+    expect(result.response.status).toBe(200);
+    expect(result.body).toMatchObject({ total: 4, done: 2, pct: 50 });
+    expect(result.body.epics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        epic: "Launch",
+        total: 3,
+        done: 2,
+        pct: 67,
+        stories: expect.arrayContaining([
+          expect.objectContaining({ name: "Onboarding", total: 2, done: 2, pct: 100 }),
+          expect.objectContaining({ name: "Billing", total: 1, done: 0, pct: 0 }),
+        ]),
+      }),
+      expect.objectContaining({
+        epic: "Ops",
+        stories: [expect.objectContaining({ name: "", total: 1, done: 0, pct: 0 })],
+      }),
+    ]));
+  });
+
   it("replays idempotent creates", async () => {
     const init = { method: "POST", headers: { "idempotency-key": "same-create" }, body: JSON.stringify({ title: "once" }) };
     const first = await call("/api/board/tasks", init);
@@ -1750,6 +1858,23 @@ describe("coord board", () => {
     });
     expect(cycle.response.status).toBe(422);
     expect((await call(`/api/board/tasks/${a.body.id}`)).body.dependencies).toEqual([]);
+  });
+
+  it("rejects a two-task dependency cycle", async () => {
+    const [a, b] = await Promise.all([
+      call("/api/board/tasks", { method: "POST", body: JSON.stringify({ title: "two-node A" }) }),
+      call("/api/board/tasks", { method: "POST", body: JSON.stringify({ title: "two-node B" }) }),
+    ]);
+    expect((await call(`/api/board/tasks/${a.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [b.body.id] }),
+    })).response.status).toBe(200);
+    const cycle = await call(`/api/board/tasks/${b.body.id}/dependencies`, {
+      method: "PUT",
+      body: JSON.stringify({ depends_on: [a.body.id] }),
+    });
+    expect(cycle.response.status).toBe(422);
+    expect(cycle.body.error).toBe("dependency cycle");
   });
 
   it("prevents PATCH from bypassing required gates or acceptance", async () => {
