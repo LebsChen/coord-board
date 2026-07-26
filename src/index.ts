@@ -4275,6 +4275,153 @@ async function projectEvents(request: Request, env: Env, auth: Auth): Promise<Re
   });
 }
 
+const OFFICE_ACTION_MAX_LIMIT = 200;
+const OFFICE_ACTION_DEFAULT_LIMIT = 50;
+
+function parseEventPayload(payloadJson: unknown): Json {
+  try {
+    const payload = JSON.parse(String(payloadJson ?? "{}"));
+    return payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Json : {};
+  } catch {
+    return {};
+  }
+}
+
+function officeActionAgentId(payload: Json, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function officeActionMessage(subject: unknown): string {
+  return typeof subject === "string" ? subject.trim().slice(0, 80) : "";
+}
+
+async function officeActions(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+  const url = new URL(request.url);
+  const requestedProject = (
+    url.searchParams.get("project")
+    || url.searchParams.get("board_id")
+    || url.searchParams.get("board")
+    || url.searchParams.get("project_id")
+    || ""
+  ).trim();
+  if (!isAdmin(auth) && requestedProject && requestedProject !== auth.projectId) {
+    return json({ error: "project access denied" }, 403);
+  }
+  const projectId = requestedProject || (isAdmin(auth) ? "" : auth.projectId);
+  if (!projectId) return json({ error: "project selector is required for admin tokens" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 404);
+
+  const since = (url.searchParams.get("since") || "").trim();
+  const parsedLimit = Number(url.searchParams.get("limit") || OFFICE_ACTION_DEFAULT_LIMIT);
+  const limit = Number.isFinite(parsedLimit)
+    ? Math.min(OFFICE_ACTION_MAX_LIMIT, Math.max(1, Math.floor(parsedLimit)))
+    : OFFICE_ACTION_DEFAULT_LIMIT;
+  const [agentRows, taskRows, taskEvents, messageRows] = await Promise.all([
+    env.DB.prepare(
+      "SELECT id, name, role, status FROM agent WHERE project_id = ? ORDER BY created_at, id",
+    ).bind(projectId).all<{ id: string; name: string; role: string; status: string }>(),
+    env.DB.prepare(
+      "SELECT title, phase, blocked, needs_human, lease_owner, assignee_agent_id FROM task_item WHERE board_id = ? AND deleted_at IS NULL",
+    ).bind(projectId).all<Record<string, unknown>>(),
+    env.DB.prepare(
+      `SELECT e.event_type, e.actor_agent_id, e.payload_json, e.created_at,
+              t.title, t.lease_owner, t.assignee_agent_id
+       FROM task_event e
+       JOIN task_item t ON t.id = e.task_id
+       WHERE t.board_id = ? AND e.created_at > ? AND e.event_type IN ('task_claimed', 'reassigned', 'agent_failover')
+       ORDER BY e.created_at, e.id
+       LIMIT ?`,
+    ).bind(projectId, since, limit).all<Record<string, unknown>>(),
+    env.DB.prepare(
+      `SELECT m.sender_agent_id, m.subject, m.created_at, d.recipient_agent_id
+       FROM message m
+       JOIN message_delivery d ON d.message_id = m.id
+       WHERE m.project_id = ? AND m.kind = 'direct' AND m.sender_agent_id IS NOT NULL
+         AND m.created_at > ? AND d.recipient_agent_id IS NOT NULL
+       ORDER BY m.created_at, m.id, d.id
+       LIMIT ?`,
+    ).bind(projectId, since, limit).all<Record<string, unknown>>(),
+  ]);
+
+  const states = new Map<string, { agentId: string; state: "working" | "thinking" | "idle"; task?: string; priority: number }>();
+  for (const agent of agentRows.results) {
+    states.set(String(agent.id), { agentId: String(agent.id), state: "idle", priority: 0 });
+  }
+  for (const task of taskRows.results) {
+    const agentId = task.lease_owner || task.assignee_agent_id;
+    if (!agentId) continue;
+    const isWorking = task.phase === "in_progress" && Boolean(task.lease_owner);
+    const isThinking = Number(task.blocked) === 1 || Number(task.needs_human) === 1;
+    if (!isWorking && !isThinking) continue;
+    const priority = isWorking ? 2 : 1;
+    const current = states.get(String(agentId));
+    if (current && priority > current.priority) {
+      states.set(String(agentId), {
+        agentId: String(agentId),
+        state: isWorking ? "working" : "thinking",
+        task: String(task.title ?? ""),
+        priority,
+      });
+    }
+  }
+
+  const visits: Array<{
+    visitorAgentId: string;
+    hostAgentId: string;
+    message: string;
+    at: string;
+  }> = [];
+  for (const row of taskEvents.results) {
+    const payload = parseEventPayload(row.payload_json);
+    const visitor = row.event_type === "reassigned"
+      ? officeActionAgentId(payload, "previous_lease_owner", "previous_assignee_agent_id", "previous_agent_id")
+      : officeActionAgentId(payload, "previous_agent_id", "previous_lease_owner", "previous_assignee_agent_id")
+        || (typeof row.actor_agent_id === "string" ? row.actor_agent_id : null);
+    const host = officeActionAgentId(payload, "replacement_agent_id", "assignee_agent_id", "new_owner", "lease_owner")
+      || (typeof row.lease_owner === "string" ? row.lease_owner : null)
+      || (typeof row.assignee_agent_id === "string" ? row.assignee_agent_id : null);
+    if (!visitor || !host) continue;
+    visits.push({
+      visitorAgentId: visitor,
+      hostAgentId: host,
+      message: String(row.title ?? "").slice(0, 80),
+      at: String(row.created_at),
+    });
+  }
+  for (const row of messageRows.results) {
+    const visitor = typeof row.sender_agent_id === "string" ? row.sender_agent_id : "";
+    const host = typeof row.recipient_agent_id === "string" ? row.recipient_agent_id : "";
+    if (!visitor || !host) continue;
+    visits.push({
+      visitorAgentId: visitor,
+      hostAgentId: host,
+      message: officeActionMessage(row.subject),
+      at: String(row.created_at),
+    });
+  }
+  visits.sort((a, b) => a.at.localeCompare(b.at));
+  const limitedVisits = visits.slice(0, limit);
+  const cursor = limitedVisits.length > 0 ? limitedVisits[limitedVisits.length - 1].at : since;
+  return json({
+    roster: agentRows.results.map((agent) => ({
+      agentId: String(agent.id),
+      name: agent.name,
+      role: agent.role,
+      status: agent.status,
+    })),
+    states: [...states.values()].map(({ priority: _priority, ...state }) => state),
+    visits: limitedVisits,
+    cursor,
+  });
+}
+
 const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mission Control · Coord Board</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--panel:#121a2d;--panel2:#18233a;--line:#293652;--text:#e7edf8;--muted:#8d9ab3;--blue:#63a4ff;--green:#43d19a;--amber:#f5bd55;--red:#ff6b7d;--purple:#b58cff}
@@ -4389,6 +4536,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (url.pathname === "/api/board/failover-config") return failoverConfig(request, env, auth);
     if (url.pathname === "/api/board/team" && request.method === "GET") return teamSnapshot(request, env, auth);
     if (url.pathname === "/api/board/events" && request.method === "GET") return projectEvents(request, env, auth);
+    if (url.pathname === "/api/board/office-actions") return officeActions(request, env, auth);
     const agentMatch = url.pathname.match(/^\/api\/board\/agents(?:\/([^/]+)\/(heartbeat|join|idle|shutdown|rotate-token))?$/);
     if (agentMatch) {
       return agentMatch[1] && url.pathname.endsWith("/heartbeat")

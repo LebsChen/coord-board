@@ -1743,6 +1743,139 @@ describe("coord board", () => {
     expect(sharedEvents.response.status).toBe(200);
   });
 
+  it("derives office roster, states, visits, and incremental cursors", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "office-actions-project", name: "Office Actions" }),
+    });
+    expect(project.response.status).toBe(201);
+    const agents = await Promise.all([
+      call("/api/board/agents", {
+        method: "POST",
+        body: JSON.stringify({ id: "office-working", project_id: "office-actions-project", name: "Working", role: "开发" }),
+      }),
+      call("/api/board/agents", {
+        method: "POST",
+        body: JSON.stringify({ id: "office-thinking", project_id: "office-actions-project", name: "Thinking", role: "测试" }),
+      }),
+      call("/api/board/agents", {
+        method: "POST",
+        body: JSON.stringify({ id: "office-idle", project_id: "office-actions-project", name: "Idle", role: "worker" }),
+      }),
+      call("/api/board/agents", {
+        method: "POST",
+        body: JSON.stringify({ id: "office-visitor", project_id: "office-actions-project", name: "Visitor", role: "worker" }),
+      }),
+      call("/api/board/agents", {
+        method: "POST",
+        body: JSON.stringify({ id: "office-host", project_id: "office-actions-project", name: "Host", role: "worker" }),
+      }),
+    ]);
+    expect(agents.every((result) => result.response.status === 201)).toBe(true);
+    const officeAgentToken = String(agents[0].body.token);
+
+    const workingTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "office-actions-project", title: "Working task" }),
+    });
+    const thinkingTask = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "office-actions-project", title: "Thinking task" }),
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+      ).bind("office-working", "2099-01-01T00:00:00.000Z", workingTask.body.id),
+      env.DB.prepare(
+        "UPDATE task_item SET blocked = 1, assignee_agent_id = ? WHERE id = ?",
+      ).bind("office-thinking", thinkingTask.body.id),
+      env.DB.prepare(
+        "INSERT INTO task_event(id, task_id, actor_agent_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      ).bind(
+        "office-reassign-event",
+        workingTask.body.id,
+        "office-visitor",
+        "reassigned",
+        JSON.stringify({
+          previous_assignee_agent_id: "office-visitor",
+          assignee_agent_id: "office-host",
+          api_key: "do-not-leak",
+        }),
+        "2099-01-01T00:00:01.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, created_at) VALUES (?, ?, ?, 'direct', ?, ?, ?)",
+      ).bind(
+        "office-message",
+        "office-actions-project",
+        "office-visitor",
+        "Office hello",
+        JSON.stringify({ message: "safe", token: "do-not-leak" }),
+        "2099-01-01T00:00:02.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, updated_at) VALUES (?, ?, ?, ?, 'unread', ?)",
+      ).bind(
+        "office-delivery",
+        "office-message",
+        "office-actions-project",
+        "office-host",
+        "2099-01-01T00:00:02.000Z",
+      ),
+    ]);
+
+    const feed = await call("/api/board/office-actions?project=office-actions-project&since=2099-01-01T00:00:00.000Z");
+    expect(feed.response.status).toBe(200);
+    expect(feed.body.roster).toEqual(expect.arrayContaining([
+      { agentId: "office-working", name: "Working", role: "开发", status: "online" },
+      { agentId: "office-thinking", name: "Thinking", role: "测试", status: "online" },
+      { agentId: "office-idle", name: "Idle", role: "worker", status: "online" },
+    ]));
+    expect(feed.body.states).toEqual(expect.arrayContaining([
+      { agentId: "office-working", state: "working", task: "Working task" },
+      { agentId: "office-thinking", state: "thinking", task: "Thinking task" },
+      { agentId: "office-idle", state: "idle" },
+    ]));
+    expect(feed.body.visits).toEqual(expect.arrayContaining([
+      {
+        visitorAgentId: "office-visitor",
+        hostAgentId: "office-host",
+        message: "Working task",
+        at: "2099-01-01T00:00:01.000Z",
+      },
+      {
+        visitorAgentId: "office-visitor",
+        hostAgentId: "office-host",
+        message: "Office hello",
+        at: "2099-01-01T00:00:02.000Z",
+      },
+    ]));
+    expect(feed.body.cursor).toBe("2099-01-01T00:00:02.000Z");
+    expect(JSON.stringify(feed.body)).not.toContain("do-not-leak");
+
+    const incremental = await call("/api/board/office-actions?board_id=office-actions-project&since=2099-01-01T00:00:01.000Z");
+    expect(incremental.response.status).toBe(200);
+    expect(incremental.body.visits).toHaveLength(1);
+    expect(incremental.body.visits[0].message).toBe("Office hello");
+    expect(incremental.body.cursor).toBe("2099-01-01T00:00:02.000Z");
+    const limitRows = Array.from({ length: 201 }, (_, index) => {
+      const messageId = `office-limit-message-${index}`;
+      const at = `2099-01-02T00:00:${String(index % 60).padStart(2, "0")}.${String(index).padStart(3, "0")}Z`;
+      return [
+        env.DB.prepare(
+          "INSERT INTO message(id, project_id, sender_agent_id, kind, subject, payload_json, created_at) VALUES (?, ?, ?, 'direct', ?, '{}', ?)",
+        ).bind(messageId, "office-actions-project", "office-visitor", `Office ${index}`, at),
+        env.DB.prepare(
+          "INSERT INTO message_delivery(id, message_id, project_id, recipient_agent_id, status, updated_at) VALUES (?, ?, ?, ?, 'unread', ?)",
+        ).bind(`office-limit-delivery-${index}`, messageId, "office-actions-project", "office-host", at),
+      ];
+    }).flat();
+    await env.DB.batch(limitRows);
+    expect((await call("/api/board/office-actions?project=office-actions-project&limit=9999")).body.visits.length).toBeLessThanOrEqual(200);
+    expect((await call("/api/board/office-actions?project=other-project", {}, officeAgentToken)).response.status).toBe(403);
+    expect((await SELF.fetch(new Request("https://coord-board.test/api/board/office-actions?project=office-actions-project"))).status).toBe(401);
+  });
+
   it("serves fragment-token bootstrap without exposing it to the request", async () => {
     const response = await SELF.fetch(new Request("https://coord-board.test/?project=fragment-project"));
     expect(response.status).toBe(200);
