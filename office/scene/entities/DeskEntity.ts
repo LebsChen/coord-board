@@ -78,9 +78,9 @@ export class DeskEntity {
   setScreenAccent(color?: number, alpha = 0.9) {
     this.screenAccent.clear()
     if (color == null) return
-    const width = this.desk.isLeader ? 58 : 48
-    const height = this.desk.isLeader ? 26 : 22
-    this.screenAccent.roundRect(-width / 2, -95, width, height, 4)
+    const width = this.desk.isLeader ? 38 : 30
+    const height = this.desk.isLeader ? 18 : 15
+    this.screenAccent.roundRect(-width / 2, -16, width, height, 3)
     this.screenAccent.fill({ color, alpha: Math.min(1, alpha) })
   }
 
@@ -95,7 +95,7 @@ export class DeskEntity {
       workstation.anchor.set(0.5, 0.68)
       workstation.position.set(0, SEAT_OFFSET_Y - 6)
       workstation.alpha = 1
-      const targetWidth = this.desk.isLeader ? 270 : 220
+      const targetWidth = this.desk.isLeader ? 150 : 120
       workstation.scale.set(targetWidth / texture.width)
       this.deskLayer.addChild(workstation, this.screenAccent)
     } else {

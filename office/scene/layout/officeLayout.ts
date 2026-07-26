@@ -14,8 +14,8 @@ export const COLORS = {
 } as const
 
 /** 动态工位区 */
-const DESK_COL_GAP = 220
-const DESK_ROW_GAP = 220
+const DESK_COL_GAP = 170
+const DESK_ROW_GAP = 155
 export const SEAT_OFFSET_Y = 45
 export const LEADER_ROOM = {
   x: 44,
@@ -25,7 +25,7 @@ export const LEADER_ROOM = {
   doorwayX: 334,
   doorwayY: 222,
 } as const
-export const OPEN_AREA = { x: 430, y: 150, width: 620, height: 500 } as const
+export const OPEN_AREA = { x: 520, y: 185, width: 390, height: 345 } as const
 export const PUBLIC_ZONES = [
   { id: 'coffee' as const, label: 'Coffee', x: 140, y: 550, color: 0xd99b5f },
   { id: 'workout' as const, label: 'Workout', x: 300, y: 550, color: 0x6eb5a5 },

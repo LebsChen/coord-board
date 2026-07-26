@@ -415,7 +415,7 @@ export class OfficeScene {
     for (const zone of PUBLIC_ZONES) {
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 14, fill: zone.color } })
       label.anchor.set(0.5)
-      label.position.set(zone.x, zone.y - 24)
+      label.position.set(zone.x, zone.y - 42)
       map.addChild(label)
     }
 
