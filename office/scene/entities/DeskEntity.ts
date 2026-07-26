@@ -70,7 +70,7 @@ export class DeskEntity {
     this.shadowGfx.zIndex = deskZ - 0.5
     this.chairLayer.zIndex = nearby ? this.desk.y + 18 : chairZ
     this.occupiedIndicator.zIndex = chairZ + 0.5
-    this.screenAccent.zIndex = this.deskLayer.zIndex + 12
+    this.screenAccent.zIndex = this.desk.y + 110
   }
 
   setOccupied(occupied: boolean) {

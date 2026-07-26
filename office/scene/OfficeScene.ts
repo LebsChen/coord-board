@@ -276,7 +276,14 @@ export class OfficeScene {
     }))
 
     for (const e of this.agentEntities.values()) {
-      e.zIndex = e.position.y
+      const agent = this.agents.find((item) => item.id === e.agentId)
+      const seatedAtDesk = Boolean(
+        agent &&
+        !agent.publicZone &&
+        agent.targetX == null &&
+        agent.state !== 'walking',
+      )
+      e.zIndex = e.position.y + (seatedAtDesk ? 60 : 0)
     }
 
     for (const desk of this.deskEntities.values()) {
