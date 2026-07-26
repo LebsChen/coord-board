@@ -26,7 +26,7 @@
     "scene/navigation/deskNavGeometry.ts": "994c1139a2bffe288d80e68a9b9e885ba9b0aab6ef276b07b33cf609dff0985a",
     "scene/navigation/navPathfinding.ts": "25984ef53f1c530ca157065ed44ba19f23389701a8563a25f22fd3f86b7c4b50",
     "scene/navigation/officeNavigation.ts": "4eeef9f4c47cb84451f5a7d8a20a42f25fa2a84cac0312781b90e35574ab9f71",
-    "scene/simulation/OfficeSimulator.test.ts": "340a37844c79598e2a74c7c1a24906ef2cb0d6125a759e0e955dc16cfff533ca",
+    "scene/simulation/OfficeSimulator.test.ts": "f3394d199141b779c8b9329e78e046cdc15a74172639809ec8cd17d3be822311",
     "scene/simulation/OfficeSimulator.ts": "70bd56aefbfc1c7f0b6626f18f06169719669c83eb79a488ba90e117b4aafa44",
     "scene/simulation/deskVisit.test.ts": "0f78ac8b73e704166c650dba4de7f099cef2f46b52edc2102ffab7c6e53d231b",
     "scene/simulation/deskVisit.ts": "8f4e73734d0f883a9ac12366c643b5a044375f7efa0b1adeab26a017857bc069",

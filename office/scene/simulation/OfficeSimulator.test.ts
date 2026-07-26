@@ -48,12 +48,14 @@ describe('Office ambient simulation', () => {
       authoritativeState: 'idle',
       targetX: 140,
       targetY: 120,
+      publicZone: 'coffee',
       ambientZone: 'coffee',
     })
     expect(simulator.tick(0.1, [agent])[0]).toMatchObject({
       state: 'walking',
       targetX: 140,
       targetY: 120,
+      publicZone: 'coffee',
       ambientZone: 'coffee',
     })
   })
