@@ -27,9 +27,9 @@ export const LEADER_ROOM = {
 } as const
 export const OPEN_AREA = { x: 430, y: 150, width: 620, height: 500 } as const
 export const PUBLIC_ZONES = [
-  { id: 'coffee' as const, label: 'Coffee', x: 370, y: 145, color: 0xd99b5f },
-  { id: 'workout' as const, label: 'Workout', x: 370, y: 355, color: 0x6eb5a5 },
-  { id: 'restroom' as const, label: 'Restroom', x: 370, y: 565, color: 0x8299c7 },
+  { id: 'coffee' as const, label: 'Coffee', x: 140, y: 650, color: 0xd99b5f },
+  { id: 'workout' as const, label: 'Workout', x: 300, y: 650, color: 0x6eb5a5 },
+  { id: 'restroom' as const, label: 'Restroom', x: 460, y: 650, color: 0x8299c7 },
 ] as const
 export type PublicZoneId = typeof PUBLIC_ZONES[number]['id']
 

@@ -33,6 +33,7 @@ export class AgentEntity extends Container {
       this.character.setAgentColor(agent.color)
       this.character.setFacing(agent.facing)
       this.character.setViewFacing(agent.viewFacing ?? 'front')
+      this.character.setInZone(Boolean(agent.publicZone))
       this.character.playState(agent.state)
       this.addChild(this.character)
       this.overlay.addChild(this.statusLabel, this.bubble)
@@ -160,6 +161,7 @@ export class AgentEntity extends Container {
         }
       }
       this.character.playState(state, this.agent.customAnimation)
+      this.character.setInZone(Boolean(this.agent.publicZone))
     } else {
       this.walkPhase += dt * 8
       this.drawFallbackBody(state, 0)
@@ -202,6 +204,7 @@ export class AgentEntity extends Container {
       this.character.playState(this.agent.state, this.agent.customAnimation)
       this.character.setFacing(this.agent.facing)
       this.character.setViewFacing(this.agent.viewFacing ?? 'front')
+      this.character.setInZone(Boolean(this.agent.publicZone))
       this.character.setAgentColor(this.agent.color)
     } else {
       this.drawFallbackBody(this.agent.state, 0)

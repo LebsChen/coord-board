@@ -1,76 +1,80 @@
-import { Container, Graphics } from 'pixi.js'
+import { Container, Graphics, Sprite } from 'pixi.js'
 import type { AgentState } from '../../types/agent'
 import type { CharacterFacing } from './characterFacing'
+import { getAgentFrame } from '../assets/officeArt'
 
 export class VectorCharacter extends Container {
   readonly isReady = true
-  private readonly body: Graphics
   private readonly shadow: Graphics
+  private readonly sprite: Sprite
   private readonly scarf: Graphics
-  private color: number
+  private color = 0xffffff
   private state: AgentState = 'idle'
+  private inZone = false
   private direction: 1 | -1 = 1
+  private walkClock = 0
 
   constructor(_agentId: string, color: number) {
     super()
     this.color = color
     this.shadow = new Graphics()
-    this.body = new Graphics()
+    this.shadow.ellipse(0, 5, 24, 7)
+    this.shadow.fill({ color: 0x000000, alpha: 0.13 })
+    this.sprite = new Sprite(getAgentFrame(3) ?? undefined)
     this.scarf = new Graphics()
-    this.addChild(this.shadow, this.body, this.scarf)
-    this.redraw()
+    this.sprite.anchor.set(0.5, 0.86)
+    this.sprite.scale.set(0.2)
+    this.addChild(this.shadow, this.sprite, this.scarf)
+    this.applyTint()
   }
 
   setAgentColor(color: number): void {
     this.color = color
-    this.redraw()
+    this.applyTint()
   }
 
   setFacing(direction: 1 | -1): void {
     this.direction = direction
-    this.scale.x = direction
+    this.sprite.scale.x = Math.abs(this.sprite.scale.x) * direction
   }
 
   setViewFacing(_facing: CharacterFacing): void {}
 
+  setInZone(inZone: boolean): void {
+    this.inZone = inZone
+    this.updateFrame()
+  }
+
   playState(state: AgentState, _customAnimation?: string): void {
     this.state = state
-    this.redraw()
+    if (state === 'walking') this.walkClock += 1 / 12
+    this.updateFrame()
   }
 
   playAnimation(_animation: string): void {}
 
   getHeadOffsetY(): number {
-    return -52
+    return -78
   }
 
-  private redraw(): void {
-    this.shadow.clear()
-    this.shadow.ellipse(0, 4, 24, 7)
-    this.shadow.fill({ color: 0x000000, alpha: 0.12 })
-    this.body.clear()
+  private updateFrame(): void {
+    const frame =
+      this.state === 'walking'
+        ? 1 + (Math.floor(this.walkClock * 8) % 2)
+        : this.inZone
+          ? 0
+          : 3
+    const texture = getAgentFrame(frame)
+    if (texture) this.sprite.texture = texture
+    this.applyTint()
+  }
+
+  private applyTint(): void {
+    this.sprite.tint = 0xffffff
     this.scarf.clear()
-    const bob = this.state === 'walking' ? 2 : this.state === 'idle' ? 1 : 0
-    const legSwing = this.state === 'walking' ? 3 : 0
-    this.body.roundRect(-10, 4 + bob + legSwing, 7, 18, 3)
-    this.body.roundRect(3, 4 + bob - legSwing, 7, 18, 3)
-    this.body.fill(0x202124)
-    this.body.roundRect(-15, -10 + bob, 30, 25, 8)
-    this.body.fill(0x131313)
-    this.body.circle(0, -28 + bob, 17)
-    this.body.fill(0x131313)
-    for (let i = 0; i < 7; i++) {
-      const angle = -Math.PI * 0.95 + i * (Math.PI * 0.9 / 6)
-      this.body.moveTo(Math.cos(angle) * 12, -37 + bob + Math.sin(angle) * 10)
-      this.body.lineTo(Math.cos(angle) * 20, -45 + bob + Math.sin(angle) * 13)
-      this.body.lineTo(Math.cos(angle + 0.22) * 12, -35 + bob + Math.sin(angle + 0.22) * 10)
-      this.body.fill(0x131313)
-    }
-    this.scarf.roundRect(-15, -11 + bob, 30, 5, 2)
+    this.scarf.roundRect(-11, -58, 22, 5, 2)
     this.scarf.fill(this.color)
-    this.scarf.roundRect(7, -7 + bob, 5, 13, 2)
+    this.scarf.roundRect(6 * this.direction, -54, 4 * this.direction, 12, 1)
     this.scarf.fill(this.color)
-    this.body.scale.x = this.direction
-    this.scarf.scale.x = this.direction
   }
 }

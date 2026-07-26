@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Text } from 'pixi.js'
+import { Application, Container, Graphics, Sprite, Text } from 'pixi.js'
 import type { FederatedPointerEvent } from 'pixi.js'
 import type { Agent, AgentState } from '../types/agent'
 import {
@@ -11,7 +11,6 @@ import {
   SCENE_WIDTH,
   PUBLIC_ZONES,
   LEADER_ROOM,
-  OPEN_AREA,
   publicZonePosition,
   selectPublicZone,
 } from './layout/officeLayout'
@@ -22,6 +21,7 @@ import { AnimationSystem } from './systems/AnimationSystem'
 import { OfficeSimulator } from './simulation/OfficeSimulator'
 import { applyAgentStateUpdate } from './simulation/deskVisit'
 import { LABEL_HEIGHT, LABEL_WIDTH } from './ui/StatusLabel'
+import { getRoomPlate, loadOfficeArt } from './assets/officeArt'
 
 export type OfficeAgentClick = {
   agent: Agent
@@ -108,6 +108,7 @@ export class OfficeScene {
     app.stage.addChild(this.world)
     this.fitStage(width, height)
 
+    await loadOfficeArt()
     this.drawMap(this.world)
     this.spawnOffice(this.world)
     this.pushDataToEntities()
@@ -318,6 +319,20 @@ export class OfficeScene {
     for (const desk of this.deskEntities.values()) {
       desk.setOccupied(occupied.has(desk.deskId))
     }
+    const screenColors: Record<AgentState, number> = {
+      idle: 0xb9bec5,
+      walking: 0x92a9bf,
+      working: 0x5cbb86,
+      thinking: 0x76a7dd,
+      blocked: 0xdd7774,
+      done: 0x73c895,
+      talking: 0xe7aa5d,
+    }
+    for (const agent of this.agents) {
+      if (!agent.assignedDeskId) continue
+      const desk = this.deskEntities.get(agent.assignedDeskId)
+      if (desk) desk.setScreenAccent(screenColors[agent.state] ?? screenColors.idle)
+    }
   }
 
   /** 桌子 / 人物 / 椅子同层；桌沿为界动态遮挡 */
@@ -339,6 +354,7 @@ export class OfficeScene {
         entity.deskLayer,
         entity.chairLayer,
         entity.occupiedIndicator,
+        entity.screenAccent,
       )
     }
 
@@ -372,19 +388,13 @@ export class OfficeScene {
     floor.rect(0, 0, SCENE_WIDTH, SCENE_HEIGHT)
     floor.fill(COLORS.floor)
     map.addChild(floor)
-    const openFloor = new Graphics()
-    openFloor.roundRect(OPEN_AREA.x - 54, OPEN_AREA.y - 74, OPEN_AREA.width + 108, OPEN_AREA.height + 130, 28)
-    openFloor.fill({ color: 0xffffff, alpha: 0.72 })
-    openFloor.stroke({ color: 0xe9eaec, width: 2, alpha: 0.7 })
-    map.addChild(openFloor)
-
-    const room = new Graphics()
-    room.roundRect(LEADER_ROOM.x, LEADER_ROOM.y, LEADER_ROOM.width, LEADER_ROOM.height, 18)
-    room.fill({ color: 0xffffff, alpha: 0.9 })
-    room.stroke({ color: 0xdfe1e4, width: 3, alpha: 0.9 })
-    room.rect(LEADER_ROOM.doorwayX - 4, LEADER_ROOM.doorwayY - 20, 12, 42)
-    room.fill(COLORS.floor)
-    map.addChild(room)
+    const roomPlate = getRoomPlate()
+    if (roomPlate) {
+      const plate = new Sprite(roomPlate)
+      plate.width = SCENE_WIDTH
+      plate.height = SCENE_HEIGHT
+      map.addChild(plate)
+    }
     const roomLabel = new Text({
       text: 'LEADER OFFICE',
       style: { fontFamily: 'system-ui', fontSize: 11, fontWeight: '600', fill: 0x73777e, letterSpacing: 1.5 },
@@ -393,18 +403,10 @@ export class OfficeScene {
     map.addChild(roomLabel)
 
     for (const zone of PUBLIC_ZONES) {
-      const zoneGfx = new Graphics()
-      zoneGfx.roundRect(zone.x - 62, zone.y - 38, 124, 76, 18)
-      zoneGfx.fill({ color: 0xffffff, alpha: 0.96 })
-      zoneGfx.stroke({ color: 0xe0e2e5, alpha: 1, width: 2 })
-      zoneGfx.ellipse(zone.x, zone.y + 10, 38, 12)
-      zoneGfx.fill({ color: zone.color, alpha: 0.12 })
-      zoneGfx.circle(zone.x - 26, zone.y - 10, 6)
-      zoneGfx.fill({ color: zone.color, alpha: 0.8 })
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 14, fill: zone.color } })
       label.anchor.set(0.5)
       label.position.set(zone.x, zone.y)
-      map.addChild(zoneGfx, label)
+      map.addChild(label)
     }
 
     parent.addChildAt(map, 0)

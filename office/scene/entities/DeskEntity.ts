@@ -1,6 +1,7 @@
-import { Container, FillGradient, Graphics } from 'pixi.js'
+import { Container, FillGradient, Graphics, Sprite } from 'pixi.js'
 import type { Desk } from '../../types/agent'
 import { SEAT_OFFSET_Y } from '../layout/officeLayout'
+import { getWorkstation } from '../assets/officeArt'
 import {
   computeChairLayerZ,
   computeDeskLayerZ,
@@ -30,6 +31,7 @@ export class DeskEntity {
   readonly deskLayer = new Container()
   readonly chairLayer = new Container()
   readonly occupiedIndicator = new Graphics()
+  readonly screenAccent = new Graphics()
 
   private desk: Desk
 
@@ -42,6 +44,7 @@ export class DeskEntity {
       this.deskLayer,
       this.chairLayer,
       this.occupiedIndicator,
+      this.screenAccent,
     ]) {
       part.position.set(desk.x, desk.y)
     }
@@ -72,13 +75,31 @@ export class DeskEntity {
     }
   }
 
+  setScreenAccent(color: number, alpha = 0.9) {
+    this.screenAccent.clear()
+    const width = this.desk.isLeader ? 34 : 27
+    const height = this.desk.isLeader ? 18 : 14
+    this.screenAccent.roundRect(-width / 2, -53, width, height, 3)
+    this.screenAccent.fill({ color, alpha })
+  }
+
   getSeatPosition() {
     return { x: this.desk.seatX, y: this.desk.seatY }
   }
 
   private mountSprites() {
-    this.drawDeskFallback()
-    this.drawChairFallback()
+    const texture = getWorkstation()
+    if (texture) {
+      const workstation = new Sprite(texture)
+      workstation.anchor.set(0.5, 0.68)
+      workstation.position.set(0, SEAT_OFFSET_Y - 6)
+      const targetWidth = this.desk.isLeader ? 190 : 150
+      workstation.scale.set(targetWidth / texture.width)
+      this.deskLayer.addChild(workstation)
+    } else {
+      this.drawDeskFallback()
+      this.drawChairFallback()
+    }
   }
 
   private drawShadow() {
