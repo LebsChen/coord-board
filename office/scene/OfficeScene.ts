@@ -21,7 +21,7 @@ import { AnimationSystem } from './systems/AnimationSystem'
 import { OfficeSimulator } from './simulation/OfficeSimulator'
 import { applyAgentStateUpdate } from './simulation/deskVisit'
 import { LABEL_HEIGHT, LABEL_WIDTH } from './ui/StatusLabel'
-import { getRoomPlate, loadOfficeArt } from './assets/officeArt'
+import { getAmenity, getLeaderRoom, loadOfficeArt } from './assets/officeArt'
 
 export type OfficeAgentClick = {
   agent: Agent
@@ -194,22 +194,22 @@ export class OfficeScene {
     const padding = 20
     const minX = Math.min(
       ...DESKS.map((desk) => desk.x - LABEL_WIDTH / 2),
-      ...PUBLIC_ZONES.map((zone) => zone.x - 62),
+      ...PUBLIC_ZONES.map((zone) => zone.x - 80),
       LEADER_ROOM.x,
     ) - padding
     const maxX = Math.max(
       ...DESKS.map((desk) => desk.x + LABEL_WIDTH / 2),
-      ...PUBLIC_ZONES.map((zone) => zone.x + 62),
+      ...PUBLIC_ZONES.map((zone) => zone.x + 80),
       LEADER_ROOM.x + LEADER_ROOM.width,
     ) + padding
     const minY = Math.min(
       ...DESKS.map((desk) => desk.y - 100 - LABEL_HEIGHT),
-      ...PUBLIC_ZONES.map((zone) => zone.y - 38),
+      ...PUBLIC_ZONES.map((zone) => zone.y - 120),
       LEADER_ROOM.y,
     ) - padding
     const maxY = Math.max(
       ...DESKS.map((desk) => desk.y + 80),
-      ...PUBLIC_ZONES.map((zone) => zone.y + 38),
+      ...PUBLIC_ZONES.map((zone) => zone.y + 120),
       LEADER_ROOM.y + LEADER_ROOM.height,
     ) + padding
     const contentWidth = maxX - minX
@@ -398,12 +398,13 @@ export class OfficeScene {
     floor.rect(0, 0, SCENE_WIDTH, SCENE_HEIGHT)
     floor.fill(COLORS.floor)
     map.addChild(floor)
-    const roomPlate = getRoomPlate()
-    if (roomPlate) {
-      const plate = new Sprite(roomPlate)
-      plate.width = SCENE_WIDTH
-      plate.height = SCENE_HEIGHT
-      map.addChild(plate)
+    const leaderRoom = getLeaderRoom()
+    if (leaderRoom) {
+      const room = new Sprite(leaderRoom)
+      room.position.set(LEADER_ROOM.x, LEADER_ROOM.y)
+      room.width = LEADER_ROOM.width
+      room.height = LEADER_ROOM.height
+      map.addChild(room)
     }
     const roomLabel = new Text({
       text: 'LEADER OFFICE',
@@ -413,9 +414,19 @@ export class OfficeScene {
     map.addChild(roomLabel)
 
     for (const zone of PUBLIC_ZONES) {
-      const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 14, fill: zone.color } })
+      const index = PUBLIC_ZONES.indexOf(zone)
+      const amenity = getAmenity(index)
+      if (amenity) {
+        const room = new Sprite(amenity)
+        room.anchor.set(0.5)
+        room.position.set(zone.x, zone.y)
+        room.width = 140
+        room.height = 220
+        map.addChild(room)
+      }
+      const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: zone.color } })
       label.anchor.set(0.5)
-      label.position.set(zone.x, zone.y - 42)
+      label.position.set(zone.x, zone.y - 92)
       map.addChild(label)
     }
 

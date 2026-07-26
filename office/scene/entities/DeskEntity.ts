@@ -89,13 +89,14 @@ export class DeskEntity {
   }
 
   private mountSprites() {
+    if (this.desk.isLeader) return
     const texture = getWorkstation()
     if (texture) {
       const workstation = new Sprite(texture)
       workstation.anchor.set(0.5, 0.68)
       workstation.position.set(0, SEAT_OFFSET_Y - 6)
       workstation.alpha = 1
-      const targetWidth = this.desk.isLeader ? 150 : 120
+      const targetWidth = 130
       workstation.scale.set(targetWidth / texture.width)
       this.deskLayer.addChild(workstation, this.screenAccent)
     } else {

@@ -72,6 +72,10 @@ export class StatusLabel extends Container {
     this.paintStateDot()
   }
 
+  setIdentityColor(color: number) {
+    this.nameText.style.fill = color
+  }
+
   setTask(task?: string) {
     if (!task) {
       this.taskText.text = ''

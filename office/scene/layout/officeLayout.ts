@@ -14,28 +14,28 @@ export const COLORS = {
 } as const
 
 /** 动态工位区 */
-const DESK_COL_GAP = 170
-const DESK_ROW_GAP = 155
+const DESK_COL_GAP = 175
+const DESK_ROW_GAP = 165
 export const SEAT_OFFSET_Y = 45
 export const LEADER_ROOM = {
-  x: 44,
-  y: 72,
-  width: 290,
-  height: 300,
-  doorwayX: 334,
-  doorwayY: 222,
+  x: 40,
+  y: 58,
+  width: 300,
+  height: 232,
+  doorwayX: 340,
+  doorwayY: 174,
 } as const
-export const OPEN_AREA = { x: 520, y: 185, width: 390, height: 345 } as const
+export const OPEN_AREA = { x: 470, y: 140, width: 560, height: 420 } as const
 export const PUBLIC_ZONES = [
-  { id: 'coffee' as const, label: 'Coffee', x: 140, y: 550, color: 0xd99b5f },
-  { id: 'workout' as const, label: 'Workout', x: 300, y: 550, color: 0x6eb5a5 },
-  { id: 'restroom' as const, label: 'Restroom', x: 460, y: 550, color: 0x8299c7 },
+  { id: 'coffee' as const, label: 'Coffee', x: 115, y: 625, color: 0xd99b5f },
+  { id: 'workout' as const, label: 'Workout', x: 270, y: 625, color: 0x6eb5a5 },
+  { id: 'restroom' as const, label: 'Restroom', x: 425, y: 625, color: 0x8299c7 },
 ] as const
 export type PublicZoneId = typeof PUBLIC_ZONES[number]['id']
 
 const PUBLIC_ZONE_OFFSETS = [
-  { x: -18, y: 6 },
-  { x: 18, y: 6 },
+  { x: -24, y: 22 },
+  { x: 24, y: 22 },
 ] as const
 
 export function publicZonePosition(zoneId: PublicZoneId, slot: number): { x: number; y: number } {

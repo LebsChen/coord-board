@@ -26,9 +26,10 @@ export class AgentEntity extends Container {
     this.agent = { ...agent }
 
     this.statusLabel = new StatusLabel(agent.name)
+    this.statusLabel.setIdentityColor(agent.color)
     this.bubble = new Bubble()
 
-    this.character = new VectorCharacter(agent.id, agent.color)
+    this.character = new VectorCharacter(agent.id, agent.color, agent.assignedDeskId === 'desk-0')
     if (this.character.isReady) {
       this.character.setAgentColor(agent.color)
       this.character.setFacing(agent.facing)
@@ -65,6 +66,7 @@ export class AgentEntity extends Container {
     this.agent = { ...this.agent, ...patch }
     this.overlay.position.set(this.agent.x, this.agent.y)
     this.statusLabel.setName(this.agent.name)
+    this.statusLabel.setIdentityColor(this.agent.color)
     this.statusLabel.setState(this.agent.state)
     this.statusLabel.setTask(
       this.agent.state === 'working' || this.agent.state === 'thinking' || this.agent.state === 'blocked' || this.agent.state === 'done'
@@ -191,6 +193,7 @@ export class AgentEntity extends Container {
 
   private syncVisual() {
     this.statusLabel.setName(this.agent.name)
+    this.statusLabel.setIdentityColor(this.agent.color)
     this.statusLabel.setState(this.agent.state)
     this.statusLabel.setTask(
       this.agent.state === 'working' || this.agent.state === 'thinking' || this.agent.state === 'blocked' || this.agent.state === 'done'

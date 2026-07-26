@@ -7,30 +7,26 @@ export class VectorCharacter extends Container {
   readonly isReady = true
   private readonly shadow: Graphics
   private readonly sprite: Sprite
-  private readonly scarf: Graphics
-  private color = 0xffffff
+  private readonly leader: boolean
   private state: AgentState = 'idle'
   private inZone = false
   private direction: 1 | -1 = 1
   private walkClock = 0
 
-  constructor(_agentId: string, color: number) {
+  constructor(_agentId: string, color: number, leader = false) {
     super()
-    this.color = color
+    this.leader = leader
     this.shadow = new Graphics()
     this.shadow.ellipse(0, 5, 24, 7)
     this.shadow.fill({ color: 0x000000, alpha: 0.13 })
-    this.sprite = new Sprite(getAgentFrame(3) ?? undefined)
-    this.scarf = new Graphics()
+    this.sprite = new Sprite(getAgentFrame(3, leader) ?? undefined)
     this.sprite.anchor.set(0.5, 0.86)
-    this.sprite.scale.set(0.26)
-    this.addChild(this.shadow, this.sprite, this.scarf)
-    this.applyTint()
+    this.sprite.scale.set(0.25)
+    this.addChild(this.shadow, this.sprite)
   }
 
   setAgentColor(color: number): void {
-    this.color = color
-    this.applyTint()
+    void color
   }
 
   setFacing(direction: 1 | -1): void {
@@ -64,17 +60,7 @@ export class VectorCharacter extends Container {
         : this.inZone
           ? 0
           : 3
-    const texture = getAgentFrame(frame)
+    const texture = getAgentFrame(frame, this.leader)
     if (texture) this.sprite.texture = texture
-    this.applyTint()
-  }
-
-  private applyTint(): void {
-    this.sprite.tint = 0xffffff
-    this.scarf.clear()
-    this.scarf.roundRect(-11, -58, 22, 5, 2)
-    this.scarf.fill(this.color)
-    this.scarf.roundRect(6 * this.direction, -54, 4 * this.direction, 12, 1)
-    this.scarf.fill(this.color)
   }
 }
