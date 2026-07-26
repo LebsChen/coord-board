@@ -395,8 +395,9 @@ export class OfficeScene {
     map.label = 'map'
 
     const floor = new Graphics()
-    floor.rect(0, 0, SCENE_WIDTH, SCENE_HEIGHT)
-    floor.fill(COLORS.floor)
+    floor.roundRect(22, 24, SCENE_WIDTH - 44, SCENE_HEIGHT - 48, 18)
+    floor.fill({ color: 0xf2f1ee })
+    floor.stroke({ color: 0xdeddd9, width: 2, alpha: 0.8 })
     map.addChild(floor)
     const leaderRoom = getLeaderRoom()
     if (leaderRoom) {
@@ -410,7 +411,8 @@ export class OfficeScene {
       text: 'LEADER OFFICE',
       style: { fontFamily: 'system-ui', fontSize: 11, fontWeight: '600', fill: 0x73777e, letterSpacing: 1.5 },
     })
-    roomLabel.position.set(LEADER_ROOM.x + 20, LEADER_ROOM.y + 18)
+    roomLabel.anchor.set(0.5, 1)
+    roomLabel.position.set(LEADER_ROOM.x + LEADER_ROOM.width / 2, LEADER_ROOM.y - 12)
     map.addChild(roomLabel)
 
     for (const zone of PUBLIC_ZONES) {
@@ -426,7 +428,7 @@ export class OfficeScene {
       }
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: zone.color } })
       label.anchor.set(0.5)
-      label.position.set(zone.x, zone.y - 92)
+      label.position.set(zone.x, zone.y - 133)
       map.addChild(label)
     }
 

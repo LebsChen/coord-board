@@ -25,7 +25,7 @@ export const LEADER_ROOM = {
   doorwayX: 340,
   doorwayY: 174,
 } as const
-export const OPEN_AREA = { x: 470, y: 140, width: 560, height: 420 } as const
+export const OPEN_AREA = { x: 380, y: 140, width: 650, height: 420 } as const
 export const PUBLIC_ZONES = [
   { id: 'coffee' as const, label: 'Coffee', x: 115, y: 625, color: 0xd99b5f },
   { id: 'workout' as const, label: 'Workout', x: 270, y: 625, color: 0x6eb5a5 },

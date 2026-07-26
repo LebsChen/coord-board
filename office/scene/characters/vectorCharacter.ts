@@ -21,7 +21,7 @@ export class VectorCharacter extends Container {
     this.shadow.fill({ color: 0x000000, alpha: 0.13 })
     this.sprite = new Sprite(getAgentFrame(3, leader) ?? undefined)
     this.sprite.anchor.set(0.5, 0.86)
-    this.sprite.scale.set(0.25)
+    this.sprite.scale.set(0.22)
     this.addChild(this.shadow, this.sprite)
   }
 
@@ -62,5 +62,9 @@ export class VectorCharacter extends Container {
           : 3
     const texture = getAgentFrame(frame, this.leader)
     if (texture) this.sprite.texture = texture
+    const seated = frame === 3
+    const scale = seated ? 0.16 : 0.22
+    this.sprite.scale.set(scale * this.direction, scale)
+    this.sprite.position.y = seated ? 4 : 0
   }
 }

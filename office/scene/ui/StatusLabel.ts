@@ -47,6 +47,7 @@ export class StatusLabel extends Container {
   private stateDot: Graphics
   private taskBg: Graphics
   private currentState = 'idle'
+  private baselineY = LABEL_BASELINE_Y
 
   constructor(name: string) {
     super()
@@ -74,6 +75,10 @@ export class StatusLabel extends Container {
 
   setIdentityColor(color: number) {
     this.nameText.style.fill = color
+  }
+
+  setBaselineY(y: number) {
+    this.baselineY = y
   }
 
   setTask(task?: string) {
@@ -109,12 +114,12 @@ export class StatusLabel extends Container {
 
   /** 标签固定在工位单元格中央，避免被显示器和相邻工位遮挡 */
   layout(_crownTopY: number) {
-    this.position.set(0, LABEL_BASELINE_Y)
+    this.position.set(0, this.baselineY)
   }
 
   /** 名字/任务标签块顶边 Y（Agent 本地坐标） */
   getLabelTopY(crownTopY: number): number {
-    const baselineY = LABEL_BASELINE_Y
+    const baselineY = this.baselineY
     if (!this.taskBg.visible) {
       return baselineY - this.nameText.height
     }
