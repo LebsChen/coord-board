@@ -23,7 +23,7 @@ export class VectorCharacter extends Container {
     this.sprite = new Sprite(getAgentFrame(3) ?? undefined)
     this.scarf = new Graphics()
     this.sprite.anchor.set(0.5, 0.86)
-    this.sprite.scale.set(0.18)
+    this.sprite.scale.set(0.26)
     this.addChild(this.shadow, this.sprite, this.scarf)
     this.applyTint()
   }
@@ -54,7 +54,7 @@ export class VectorCharacter extends Container {
   playAnimation(_animation: string): void {}
 
   getHeadOffsetY(): number {
-    return -78
+    return -82
   }
 
   private updateFrame(): void {

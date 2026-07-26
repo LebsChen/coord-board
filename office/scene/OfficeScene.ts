@@ -365,7 +365,6 @@ export class OfficeScene {
         entity.deskLayer,
         entity.chairLayer,
         entity.occupiedIndicator,
-        entity.deskFrontLayer,
       )
     }
 
