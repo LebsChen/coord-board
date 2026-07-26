@@ -1,0 +1,31 @@
+{
+  "source": "coord-board/office",
+  "files": {
+    "feed/officeConnector.ts": "83c48cf8e5e7ffc1100a4de3b293280bf1e3f4e72f5e34c80b426c5c0d96c284",
+    "feed/officeFeed.test.ts": "5c600c2a2e9a102667fe24929675e1fcba6670fd55733ef7c6c34d89e1e39286",
+    "feed/officeFeed.ts": "0e95dcd8d66eeac0df2396fb72f838b91396d73cccfb921217e5327aeba4d3fd",
+    "scene/OfficeScene.ts": "4dad1602ba68cc28c2a8a01cea7a05763acf9fcd4b3fc8bbb2d0b359df2a701e",
+    "scene/assets/loadOfficeAssets.ts": "252699e585352dc1b0b4951de7e2d58851809c97c55631e350ee205da8d4f4a6",
+    "scene/characters/characterFacing.ts": "96db91f2417805ce5d3dcdb5eef74e1dd7d5fa1c788c0ed17dcf9851d2d70d0b",
+    "scene/characters/characterRenderer.ts": "aaf60a7fe7749d4d2bfc77738623a84e70a363e7fbafc59fa2cad7028afd3c69",
+    "scene/entities/AgentEntity.ts": "d118e95b06f46f962b9cc6b5f08a0f5f12c4320677a615b27227458cd6e71567",
+    "scene/entities/DeskEntity.ts": "10d1a290e4854f3d44438bd4941bde6939d7c1429fbf3aaa1eca3ebbb832bafb",
+    "scene/layout/officeLayout.test.ts": "bdf0772c9b664ebb37d99e5cf1ec8ecf9adb556e35b2c714589a451e51566082",
+    "scene/layout/officeLayout.ts": "d9d0971ff982369b3a02e0f895376bc12a245d4b8e54804e4c3893f3d97138be",
+    "scene/navigation/deskNavGeometry.ts": "994c1139a2bffe288d80e68a9b9e885ba9b0aab6ef276b07b33cf609dff0985a",
+    "scene/navigation/navPathfinding.ts": "25984ef53f1c530ca157065ed44ba19f23389701a8563a25f22fd3f86b7c4b50",
+    "scene/navigation/officeNavigation.ts": "33ecbde432ec5903184644b7604c8e2ecca927dfa3bc61146816b6786fc292bf",
+    "scene/simulation/OfficeSimulator.ts": "e1bd245e0e5267df20a5f1c9d6ebd868183a99f8d8bb671dc09620f900e7074e",
+    "scene/simulation/deskVisit.test.ts": "b629d87ff6c53ab6f41257e8b708f4ac5c0bcfe684874ff32749aa9b0c0ce076",
+    "scene/simulation/deskVisit.ts": "5c537ed8e9af360d35101a3f5a500c72a0ceabe3c8ca673b1b5ee02442b50485",
+    "scene/systems/AnimationSystem.ts": "72d65ef5bc62dab6e5e954d036325904bf2080dbeaaf9524f94961384d85d075",
+    "scene/systems/MovementSystem.ts": "5efee60eea8d46ebec11d83b2e9e3d74bfb5ca298d649df0cc34d388d3d494a7",
+    "scene/systems/deskDepthSort.ts": "3fc9198af71409431f535e0f5507341c7b4eb8d02e28053de34f769d7ccec63e",
+    "scene/systems/movementFacing.ts": "6b2b72ca4883975d676a8a5471929ea3066cfc39261d1f6f5dcf50486d6e0c2a",
+    "scene/ui/Bubble.ts": "ab2a82a4abe37f0fe42610201aeccd2d685a3e509e3333112d62bdd6482a82e7",
+    "scene/ui/StatusLabel.test.ts": "77ab0cc98e158ac49e6a6311500c90ebc1f68b548935d6670b329756a4e19918",
+    "scene/ui/StatusLabel.ts": "719c90868b4f08a1dec7f57d8745103e1f404977bbaa07322f2b1570dea1e1b8",
+    "types/agent.ts": "7996b2aeed6ad0f1c00be376858012970d5ad3a41f31109b140878ce7e857f35",
+    "types/officeAction.ts": "58a1b4b6bdb076ef65d7a3b106a503f09a9c1410d00d8dbac79799ef2ed227de"
+  }
+}

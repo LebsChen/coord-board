@@ -38,6 +38,103 @@ describe("coord board", () => {
     expect(notFound.headers.get("access-control-allow-origin")).toBe("*");
   });
 
+  it("exchanges a project share grant into a single-use office session", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "office-auth", name: "Office Auth" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    const share = await call("/api/board/share-token", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "office-auth", ttl_seconds: 60 }),
+    });
+    expect(share.response.status).toBe(201);
+    const shareToken = String(share.body.token);
+    const bootstrapResponse = await SELF.fetch(request(
+      "/api/board/office/bootstrap",
+      { method: "POST", body: JSON.stringify({ project: "office-auth" }) },
+      shareToken,
+    ));
+    expect(bootstrapResponse.status).toBe(200);
+    const bootstrap = (await bootstrapResponse.json() as { bootstrap: string }).bootstrap;
+    const sessionResponse = await SELF.fetch(new Request("https://coord-board.test/api/board/office/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bootstrap }),
+    }));
+    expect(sessionResponse.status).toBe(200);
+    expect(sessionResponse.headers.get("set-cookie")).toContain("HttpOnly");
+    expect(sessionResponse.headers.get("set-cookie")).toContain("Secure");
+    expect(sessionResponse.headers.get("set-cookie")).toContain("SameSite=Lax");
+    const cookie = sessionResponse.headers.get("set-cookie")!.split(";", 1)[0];
+
+    const office = await SELF.fetch(new Request(
+      "https://coord-board.test/api/board/office-actions?project=office-auth",
+      { headers: { cookie } },
+    ));
+    expect(office.status).toBe(200);
+    const wrongProject = await SELF.fetch(new Request(
+      "https://coord-board.test/api/board/office-actions?project=other-project",
+      { headers: { cookie } },
+    ));
+    expect(wrongProject.status).toBe(403);
+    const write = await SELF.fetch(new Request(
+      "https://coord-board.test/api/board/projects",
+      { method: "POST", headers: { cookie, "content-type": "application/json" }, body: "{}" },
+    ));
+    expect(write.status).toBe(403);
+    const revoked = await SELF.fetch(new Request(
+      "https://coord-board.test/api/board/office/session/revoke",
+      { method: "POST", headers: { cookie } },
+    ));
+    expect(revoked.status).toBe(200);
+    const afterRevoke = await SELF.fetch(new Request(
+      "https://coord-board.test/api/board/office-actions?project=office-auth",
+      { headers: { cookie } },
+    ));
+    expect(afterRevoke.status).toBe(401);
+
+    const reused = await SELF.fetch(new Request("https://coord-board.test/api/board/office/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bootstrap }),
+    }));
+    expect(reused.status).toBe(401);
+  });
+
+  it("rejects office bootstrap for a different project and expired grants", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "office-auth-expiry", name: "Office Auth Expiry" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    const share = await call("/api/board/share-token", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "office-auth-expiry", ttl_seconds: 60 }),
+    });
+    expect(share.response.status).toBe(201);
+    const wrongProject = await SELF.fetch(request(
+      "/api/board/office/bootstrap",
+      { method: "POST", body: JSON.stringify({ project: "other-project" }) },
+      String(share.body.token),
+    ));
+    expect(wrongProject.status).toBe(403);
+    const valid = await SELF.fetch(request(
+      "/api/board/office/bootstrap",
+      { method: "POST", body: JSON.stringify({ project: "office-auth-expiry" }) },
+      String(share.body.token),
+    ));
+    const bootstrap = (await valid.json() as { bootstrap: string }).bootstrap;
+    await env.DB.prepare("UPDATE office_bootstrap SET expires_at = ? WHERE code_hash = ?")
+      .bind("2000-01-01T00:00:00.000Z", await sha256ForTest(bootstrap)).run();
+    const expired = await SELF.fetch(new Request("https://coord-board.test/api/board/office/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bootstrap }),
+    }));
+    expect(expired.status).toBe(401);
+  });
+
   it("encrypts backup credentials and exposes metadata only", async () => {
     const project = await call("/api/board/projects", {
       method: "POST",
@@ -1833,7 +1930,7 @@ describe("coord board", () => {
     ]));
     expect(feed.body.states).toEqual(expect.arrayContaining([
       { agentId: "office-working", state: "working", task: "Working task" },
-      { agentId: "office-thinking", state: "thinking", task: "Thinking task" },
+      { agentId: "office-thinking", state: "blocked", task: "Thinking task" },
       { agentId: "office-idle", state: "idle" },
     ]));
     expect(feed.body.visits).toEqual(expect.arrayContaining([

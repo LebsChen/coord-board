@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   BOARD_TOKEN: string;
+  ASSETS?: Fetcher;
   BACKUP_ACCOUNT_MASTER_KEY?: string;
   BOARD_BASE_URL?: string;
 }
@@ -14,7 +15,8 @@ type MailboxStatus = "unread" | "seen" | "acked" | "nacked" | "dead";
 type Auth =
   | { kind: "admin"; agentId: string | null }
   | { kind: "agent"; agentId: string; projectId: string; role: string }
-  | { kind: "share"; agentId: null; projectId: string; scope: "read" };
+  | { kind: "share"; agentId: null; projectId: string; scope: "read" }
+  | { kind: "office-session"; agentId: null; projectId: string; scope: "read" };
 
 const ALL_CAPABILITIES: readonly Capability[] = [
   "manage", "claim", "release", "complete", "review", "verify", "plan_submit", "plan_review", "accept", "gate",
@@ -332,21 +334,29 @@ function randomToken(): string {
 
 async function authenticate(request: Request, env: Env): Promise<Auth | null> {
   const value = request.headers.get("authorization") ?? "";
-  if (!value.startsWith("Bearer ")) return null;
-  const token = value.slice("Bearer ".length);
-  if (token === env.BOARD_TOKEN) {
-    return { kind: "admin", agentId: request.headers.get("x-agent-id") || null };
+  if (value.startsWith("Bearer ")) {
+    const token = value.slice("Bearer ".length);
+    if (token === env.BOARD_TOKEN) {
+      return { kind: "admin", agentId: request.headers.get("x-agent-id") || null };
+    }
+    const tokenHash = await sha256(token);
+    const agent = await env.DB.prepare(
+      "SELECT id, project_id, role FROM agent WHERE token_hash = ? AND token_revoked_at IS NULL",
+    ).bind(tokenHash).first<{ id: string; project_id: string; role: string }>();
+    if (agent) return { kind: "agent", agentId: agent.id, projectId: agent.project_id, role: agent.role };
+    const share = await env.DB.prepare(
+      "SELECT project_id, scope FROM share_token WHERE token_hash = ? AND expires_at > ? AND scope = 'read'",
+    ).bind(tokenHash, now()).first<{ project_id: string; scope: "read" }>();
+    if (share) return { kind: "share", agentId: null, projectId: share.project_id, scope: "read" };
   }
-  const tokenHash = await sha256(token);
-  const agent = await env.DB.prepare(
-    "SELECT id, project_id, role FROM agent WHERE token_hash = ? AND token_revoked_at IS NULL",
-  ).bind(tokenHash).first<{ id: string; project_id: string; role: string }>();
-  if (agent) return { kind: "agent", agentId: agent.id, projectId: agent.project_id, role: agent.role };
-  const share = await env.DB.prepare(
-    "SELECT project_id, scope FROM share_token WHERE token_hash = ? AND expires_at > ? AND scope = 'read'",
-  ).bind(tokenHash, now()).first<{ project_id: string; scope: "read" }>();
-  return share
-    ? { kind: "share", agentId: null, projectId: share.project_id, scope: "read" }
+  const cookie = request.headers.get("cookie") ?? "";
+  const session = cookie.match(/(?:^|;\s*)coord_board_office_session=([^;]+)/)?.[1];
+  if (!session) return null;
+  const row = await env.DB.prepare(
+    "SELECT project_id FROM office_session WHERE session_hash = ? AND expires_at > ? AND revoked_at IS NULL",
+  ).bind(await sha256(session), now()).first<{ project_id: string }>();
+  return row
+    ? { kind: "office-session", agentId: null, projectId: row.project_id, scope: "read" }
     : null;
 }
 
@@ -356,6 +366,18 @@ function isAdmin(auth: Auth): auth is Extract<Auth, { kind: "admin" }> {
 
 function isShare(auth: Auth): auth is Extract<Auth, { kind: "share" }> {
   return auth.kind === "share";
+}
+
+function isOfficeSession(auth: Auth): auth is Extract<Auth, { kind: "office-session" }> {
+  return auth.kind === "office-session";
+}
+
+function isReadOnlyViewer(auth: Auth): boolean {
+  return isShare(auth) || isOfficeSession(auth);
+}
+
+function isAgent(auth: Auth): auth is Extract<Auth, { kind: "agent" }> {
+  return auth.kind === "agent";
 }
 
 function canManage(auth: Auth): boolean {
@@ -372,7 +394,8 @@ function roleCapabilities(role: string): readonly Capability[] {
 
 function capabilityDecision(auth: Auth, capability: Capability, task: TaskRow | null): { decision: Decision; reason: string } {
   if (isAdmin(auth)) return { decision: "allow", reason: "admin token has all capabilities" };
-  if (isShare(auth)) return { decision: "deny", reason: "share tokens are read-only" };
+  if (isReadOnlyViewer(auth)) return { decision: "deny", reason: "office viewers are read-only" };
+  if (!isAgent(auth)) return { decision: "deny", reason: "authentication cannot perform writes" };
   if (!task || auth.projectId !== String(task.board_id)) {
     return { decision: "deny", reason: "task belongs to another project" };
   }
@@ -398,8 +421,8 @@ function actor(auth: Auth): string | null {
 function bodyAgent(body: Json, auth: Auth): string {
   const requested = typeof body.agent_id === "string" ? body.agent_id.trim() : "";
   if (isAdmin(auth)) return requested || auth.agentId || "";
-  if (isShare(auth)) return "";
-  return requested || auth.agentId;
+  if (isReadOnlyViewer(auth)) return "";
+  return requested || (isAgent(auth) ? auth.agentId : "");
 }
 
 function checkAgentIdentity(body: Json, auth: Auth): Response | null {
@@ -3435,6 +3458,65 @@ async function issueShareToken(request: Request, env: Env, auth: Auth): Promise<
   }, 201);
 }
 
+const OFFICE_BOOTSTRAP_TTL_SECONDS = 120;
+const OFFICE_SESSION_TTL_SECONDS = 12 * 60 * 60;
+
+async function issueOfficeBootstrap(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  if (!isShare(auth)) return json({ error: "read-only share authorization required" }, 403);
+  const body = await parseBody(request);
+  const requestedProject = typeof body.project === "string" ? body.project.trim() : "";
+  if (requestedProject && requestedProject !== auth.projectId) {
+    return json({ error: "project access denied" }, 403);
+  }
+  const bootstrap = randomToken();
+  const expiresAt = new Date(Date.now() + OFFICE_BOOTSTRAP_TTL_SECONDS * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO office_bootstrap(code_hash, project_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+  ).bind(await sha256(bootstrap), auth.projectId, expiresAt, now()).run();
+  return json({ bootstrap, project_id: auth.projectId, expires_at: expiresAt });
+}
+
+async function exchangeOfficeBootstrap(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const body = await parseBody(request);
+  const bootstrap = typeof body.bootstrap === "string" ? body.bootstrap.trim() : "";
+  if (!bootstrap) return json({ error: "bootstrap is required" }, 400);
+  const timestamp = now();
+  const hash = await sha256(bootstrap);
+  const row = await env.DB.prepare(
+    "SELECT project_id, expires_at FROM office_bootstrap WHERE code_hash = ? AND expires_at > ? AND used_at IS NULL AND revoked_at IS NULL",
+  ).bind(hash, timestamp).first<{ project_id: string; expires_at: string }>();
+  if (!row) return json({ error: "invalid or expired bootstrap" }, 401);
+  const used = await env.DB.prepare(
+    "UPDATE office_bootstrap SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? AND revoked_at IS NULL",
+  ).bind(timestamp, hash, timestamp).run();
+  if (used.meta.changes !== 1) return json({ error: "bootstrap already used" }, 401);
+  const session = randomToken();
+  const sessionExpires = new Date(Date.now() + OFFICE_SESSION_TTL_SECONDS * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO office_session(session_hash, project_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+  ).bind(await sha256(session), row.project_id, sessionExpires, timestamp).run();
+  return json(
+    { project_id: row.project_id, expires_at: sessionExpires },
+    200,
+    { "set-cookie": `coord_board_office_session=${session}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${OFFICE_SESSION_TTL_SECONDS}` },
+  );
+}
+
+async function revokeOfficeSession(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  const cookie = request.headers.get("cookie") ?? "";
+  const session = cookie.match(/(?:^|;\s*)coord_board_office_session=([^;]+)/)?.[1];
+  if (session) {
+    await env.DB.prepare("UPDATE office_session SET revoked_at = ? WHERE session_hash = ?")
+      .bind(now(), await sha256(session)).run();
+  }
+  return json({ ok: true }, 200, {
+    "set-cookie": "coord_board_office_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+  });
+}
+
 async function agents(request: Request, env: Env, auth: Auth): Promise<Response> {
   if (request.method === "GET") {
     const rows = isAdmin(auth)
@@ -4239,7 +4321,7 @@ async function projectEvents(request: Request, env: Env, auth: Auth): Promise<Re
   }
   const projectId = requestedProject || (isAdmin(auth) ? "" : auth.projectId);
   if (!projectId) return json({ error: "project selector is required for admin tokens" }, 400);
-  if (!isAdmin(auth) && !isShare(auth) && !roleCapabilities(auth.role).includes("manage")) {
+  if (!isAdmin(auth) && !isReadOnlyViewer(auth) && (!isAgent(auth) || !roleCapabilities(auth.role).includes("manage"))) {
     return json({ error: "capability denied", capability: "manage" }, 403);
   }
   if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
@@ -4350,7 +4432,7 @@ async function officeActions(request: Request, env: Env, auth: Auth): Promise<Re
     ).bind(projectId, since, limit).all<Record<string, unknown>>(),
   ]);
 
-  const states = new Map<string, { agentId: string; state: "working" | "thinking" | "idle"; task?: string; priority: number }>();
+  const states = new Map<string, { agentId: string; state: "working" | "thinking" | "blocked" | "done" | "idle"; task?: string; priority: number }>();
   for (const agent of agentRows.results) {
     states.set(String(agent.id), { agentId: String(agent.id), state: "idle", priority: 0 });
   }
@@ -4358,14 +4440,16 @@ async function officeActions(request: Request, env: Env, auth: Auth): Promise<Re
     const agentId = task.lease_owner || task.assignee_agent_id;
     if (!agentId) continue;
     const isWorking = task.phase === "in_progress" && Boolean(task.lease_owner);
-    const isThinking = Number(task.blocked) === 1 || Number(task.needs_human) === 1;
-    if (!isWorking && !isThinking) continue;
-    const priority = isWorking ? 2 : 1;
+    const isBlocked = Number(task.blocked) === 1;
+    const isThinking = Number(task.needs_human) === 1 && !isBlocked;
+    const isDone = task.phase === "done";
+    if (!isWorking && !isBlocked && !isThinking && !isDone) continue;
+    const priority = isBlocked ? 4 : isWorking ? 3 : isThinking ? 2 : 1;
     const current = states.get(String(agentId));
     if (current && priority > current.priority) {
       states.set(String(agentId), {
         agentId: String(agentId),
-        state: isWorking ? "working" : "thinking",
+        state: isBlocked ? "blocked" : isWorking ? "working" : isThinking ? "thinking" : "done",
         task: String(task.title ?? ""),
         priority,
       });
@@ -4483,12 +4567,31 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (url.pathname === "/health" || url.pathname === "/api/health") {
       return json({ ok: true, service: "coord-board" });
     }
+    if (url.pathname === "/office" || url.pathname === "/office/" || url.pathname.startsWith("/office/assets/")) {
+      if (!env.ASSETS) return json({ error: "office assets are not configured" }, 503);
+      const assetPath = url.pathname === "/office" || url.pathname === "/office/"
+        ? "/office/index.html"
+        : url.pathname;
+      const assetUrl = new URL(request.url);
+      assetUrl.pathname = assetPath;
+      return env.ASSETS.fetch(new Request(assetUrl, request));
+    }
+    if (url.pathname === "/api/board/office/session") {
+      return exchangeOfficeBootstrap(request, env);
+    }
+    if (url.pathname === "/api/board/office/session/revoke") {
+      return revokeOfficeSession(request, env);
+    }
     const auth = await authenticate(request, env);
     if (!auth) {
       if (request.method === "GET" && url.pathname === "/") return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       return json({ error: "unauthorized" }, 401);
     }
-    if (isShare(auth) && request.method !== "GET") {
+    if (url.pathname === "/api/board/office/bootstrap") return issueOfficeBootstrap(request, env, auth);
+    if (isOfficeSession(auth) && (request.method !== "GET" || url.pathname !== "/api/board/office-actions")) {
+      return json({ error: "office session is restricted to GET office data" }, 403);
+    }
+    if (isReadOnlyViewer(auth) && request.method !== "GET") {
       return json({ error: "share tokens are read-only" }, 403);
     }
     if (url.pathname.startsWith("/api/mailbox/")) return mailbox(request, env, auth, ctx);

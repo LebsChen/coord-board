@@ -4,9 +4,10 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run build:office && wrangler deploy",
+    "build:office": "vite build --config office-vite.config.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "node scripts/check-office-source.mjs && vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.8.19",
@@ -14,5 +15,8 @@
     "typescript": "^5.7.3",
     "vitest": "^3.2.0",
     "wrangler": "^3.100.0"
+  },
+  "dependencies": {
+    "pixi.js": "^8.19.0"
   }
 }
