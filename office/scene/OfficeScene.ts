@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Sprite, Text } from 'pixi.js'
+import { Application, Container, Graphics, Text } from 'pixi.js'
 import type { FederatedPointerEvent } from 'pixi.js'
 import type { Agent, AgentState } from '../types/agent'
 import {
@@ -10,16 +10,14 @@ import {
   SCENE_HEIGHT,
   SCENE_WIDTH,
   PUBLIC_ZONES,
+  publicZonePosition,
+  selectPublicZone,
 } from './layout/officeLayout'
 import { AgentEntity } from './entities/AgentEntity'
 import { DeskEntity } from './entities/DeskEntity'
 import { MovementSystem } from './systems/MovementSystem'
 import { AnimationSystem } from './systems/AnimationSystem'
 import { OfficeSimulator } from './simulation/OfficeSimulator'
-import {
-  getOfficeBackgroundTexture,
-  loadOfficeAssets,
-} from './assets/loadOfficeAssets'
 import { applyAgentStateUpdate } from './simulation/deskVisit'
 import { LABEL_HEIGHT, LABEL_WIDTH } from './ui/StatusLabel'
 
@@ -43,6 +41,7 @@ export class OfficeScene {
   private simulator = new OfficeSimulator()
   private activityClock = 0
   private zoneClock = new Map<string, number>()
+  private idleVisitSequence = 0
 
   private agents: Agent[] = []
   private readonly options: {
@@ -73,6 +72,11 @@ export class OfficeScene {
         x: desk.seatX,
         y: desk.seatY,
         state: entry.state ?? 'idle',
+        authoritativeState: entry.state ?? 'idle',
+        authoritativeTask:
+          entry.state === 'working' || entry.state === 'thinking' || entry.state === 'blocked' || entry.state === 'done'
+            ? entry.task
+            : undefined,
         assignedDeskId: desk.id,
         currentTask:
           entry.state === 'working' || entry.state === 'thinking' || entry.state === 'blocked' || entry.state === 'done'
@@ -101,13 +105,6 @@ export class OfficeScene {
     this.world = new Container()
     app.stage.addChild(this.world)
     this.fitStage(width, height)
-
-    const officeOk = await loadOfficeAssets()
-    if (!officeOk) {
-      console.error(
-        '[Office] desk.png / chair.png 加载失败，工位将使用矢量占位图。请检查 public/assets/office/ 并硬刷新。',
-      )
-    }
 
     this.drawMap(this.world)
     this.spawnOffice(this.world)
@@ -380,21 +377,6 @@ export class OfficeScene {
       map.addChild(zoneGfx, label)
     }
 
-    const bgTex = getOfficeBackgroundTexture()
-    if (bgTex) {
-      const bg = new Sprite(bgTex)
-      const scale = Math.min(
-        SCENE_WIDTH / bgTex.width,
-        SCENE_HEIGHT / bgTex.height,
-      )
-      bg.scale.set(scale)
-      bg.position.set(
-        (SCENE_WIDTH - bgTex.width * scale) / 2,
-        (SCENE_HEIGHT - bgTex.height * scale) / 2,
-      )
-      map.addChild(bg)
-    }
-
     parent.addChildAt(map, 0)
   }
 
@@ -405,9 +387,15 @@ export class OfficeScene {
     for (const agent of this.agents) {
       if (agent.publicZone) occupied.set(agent.publicZone, (occupied.get(agent.publicZone) ?? 0) + 1)
     }
-    const candidate = this.agents.find((agent) =>
-      agent.state === 'idle' && !agent.mission && !agent.publicZone && !agent.targetX,
+    const candidates = this.agents.filter((agent) =>
+      (agent.authoritativeState ?? agent.state) === 'idle' &&
+      !agent.mission &&
+      !agent.publicZone &&
+      !agent.targetX,
     )
+    const candidate = candidates.length
+      ? candidates[this.idleVisitSequence % candidates.length]
+      : undefined
     if (!candidate) {
       for (const agent of this.agents) {
         if (!agent.publicZone) continue
@@ -425,13 +413,15 @@ export class OfficeScene {
       }
       return
     }
-    const hash = [...candidate.id].reduce((value, char) => value + char.charCodeAt(0), 0)
-    const zone = PUBLIC_ZONES[hash % PUBLIC_ZONES.length]!
-    if ((occupied.get(zone.id) ?? 0) >= 2) return
+    const selectedZone = selectPublicZone(this.idleVisitSequence, occupied)
+    if (!selectedZone) return
+    const zone = PUBLIC_ZONES.find((entry) => entry.id === selectedZone.id)!
+    const position = publicZonePosition(zone.id, selectedZone.slot)
     this.agents = this.agents.map((item) => item.id === candidate.id
-      ? { ...MovementSystem.assignWalkPath(item, [{ x: zone.x + ((hash % 3) - 1) * 18, y: zone.y + ((hash % 2) ? 14 : -14) }]), publicZone: zone.id }
+      ? { ...MovementSystem.assignWalkPath(item, [position]), publicZone: zone.id }
       : item)
     this.zoneClock.set(candidate.id, 0)
+    this.idleVisitSequence += 1
     this.pushDataToEntities()
   }
 }

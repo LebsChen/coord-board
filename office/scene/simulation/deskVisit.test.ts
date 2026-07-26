@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { Agent } from '../../types/agent'
 import { applyAgentStateUpdate } from './deskVisit'
+import { startDeskVisit } from './deskVisit'
+import { configureOfficeRoster, DESKS } from '../layout/officeLayout'
 
 const agent: Agent = {
   id: 'visitor',
@@ -47,5 +49,49 @@ describe('desk visit state updates', () => {
     expect(updated.mission?.resumeState).toBe('working')
     expect(updated.mission?.resumeTask).toBe('新任务')
     expect(updated.walkPath).toHaveLength(2)
+  })
+
+  it('preempts an idle zone excursion with the visit mission path', () => {
+    configureOfficeRoster([
+      { id: 'visitor', name: 'Visitor', state: 'idle' },
+      { id: 'host', name: 'Host', state: 'working', task: 'Host task' },
+    ])
+    const visitorDesk = DESKS[0]!
+    const hostDesk = DESKS[1]!
+    const agents: Agent[] = [
+      {
+        ...agent,
+        id: 'visitor',
+        state: 'walking',
+        authoritativeState: 'idle',
+        authoritativeTask: undefined,
+        currentTask: undefined,
+        assignedDeskId: visitorDesk.id,
+        targetX: 120,
+        targetY: 120,
+        publicZone: 'coffee',
+        mission: undefined,
+      },
+      {
+        ...agent,
+        id: 'host',
+        name: 'Host',
+        x: 300,
+        y: 300,
+        assignedDeskId: hostDesk.id,
+        state: 'working',
+        authoritativeState: 'working',
+        authoritativeTask: 'Host task',
+        currentTask: 'Host task',
+      },
+    ]
+
+    const next = startDeskVisit(agents, 1, 2, 'Visit host')
+    expect(next[0]).toMatchObject({
+      mission: { kind: 'desk_visit', hostAgentId: 'host' },
+      state: 'walking',
+      publicZone: undefined,
+    })
+    expect(next[0]!.targetX).not.toBe(120)
   })
 })

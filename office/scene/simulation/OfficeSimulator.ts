@@ -32,10 +32,13 @@ export class OfficeSimulator {
 
     return agents.map((agent) => {
       if (agentHasActiveMission(agent)) return agent
+      if (agent.targetX != null || agent.walkPath != null) return agent
 
       const desk = this.deskFor(agent)
       const roster = AGENT_ROSTER.find((r) => r.id === agent.id)
       const visitor = visitorByHost.get(agent.id)
+      const authoritativeState = agent.authoritativeState ?? agent.state
+      const authoritativeTask = agent.authoritativeTask ?? agent.currentTask
       const toward = visitor
         ? talkFacingToward(agent.x, agent.y, visitor.x, visitor.y)
         : agent.customAnimation
@@ -47,22 +50,22 @@ export class OfficeSimulator {
           ? ('talking' as const)
           : agent.customAnimation
             ? ('talking' as const)
-          : agent.state === 'thinking' || agent.state === 'idle'
-            ? agent.state
-            : ('working' as const)
+          : authoritativeState
 
       return {
         ...agent,
         x: desk.seatX,
         y: desk.seatY,
-        state,
+        state: state as Agent['state'],
+        authoritativeState,
+        authoritativeTask,
         viewFacing: toward.viewFacing,
         facing: toward.facing,
         currentTask: visitor
           ? HANDOFF_STATUS.receiving
           : state === 'idle'
             ? undefined
-            : (agent.currentTask ?? roster?.task),
+            : (authoritativeTask ?? roster?.task),
         targetX: undefined,
         targetY: undefined,
         walkPath: undefined,

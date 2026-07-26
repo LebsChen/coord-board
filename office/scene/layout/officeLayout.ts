@@ -24,6 +24,31 @@ export const PUBLIC_ZONES = [
 ] as const
 export type PublicZoneId = typeof PUBLIC_ZONES[number]['id']
 
+const PUBLIC_ZONE_OFFSETS = [
+  { x: -18, y: -14 },
+  { x: 18, y: 14 },
+] as const
+
+export function publicZonePosition(zoneId: PublicZoneId, slot: number): { x: number; y: number } {
+  const zone = PUBLIC_ZONES.find((entry) => entry.id === zoneId) ?? PUBLIC_ZONES[0]!
+  const offset = PUBLIC_ZONE_OFFSETS[Math.max(0, Math.min(slot, PUBLIC_ZONE_OFFSETS.length - 1))]!
+  return { x: zone.x + offset.x, y: zone.y + offset.y }
+}
+
+export const PUBLIC_ZONE_CAPACITY = PUBLIC_ZONE_OFFSETS.length
+
+export function selectPublicZone(
+  sequence: number,
+  occupancy: Map<PublicZoneId, number>,
+): { id: PublicZoneId; slot: number } | null {
+  for (let offset = 0; offset < PUBLIC_ZONES.length; offset++) {
+    const zone = PUBLIC_ZONES[(sequence + offset) % PUBLIC_ZONES.length]!
+    const slot = occupancy.get(zone.id) ?? 0
+    if (slot < PUBLIC_ZONE_CAPACITY) return { id: zone.id, slot }
+  }
+  return null
+}
+
 export function buildDesks(count: number): Desk[] {
   const total = Math.max(1, count)
   const columns = Math.max(1, Math.ceil(Math.sqrt(total)))
@@ -115,6 +140,10 @@ function buildInitialAgents(): Agent[] {
       x: desk.seatX,
       y: desk.seatY,
       state,
+      authoritativeState: state,
+      authoritativeTask: state === 'working' || state === 'thinking' || state === 'blocked' || state === 'done'
+        ? entry.task
+        : undefined,
       currentTask:
         state === 'working' || state === 'thinking' || state === 'blocked' || state === 'done'
           ? entry.task

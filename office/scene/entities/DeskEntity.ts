@@ -1,10 +1,6 @@
-import { Container, FillGradient, Graphics, Sprite } from 'pixi.js'
+import { Container, FillGradient, Graphics } from 'pixi.js'
 import type { Desk } from '../../types/agent'
 import { SEAT_OFFSET_Y } from '../layout/officeLayout'
-import {
-  getOfficeChairTexture,
-  getOfficeDeskTexture,
-} from '../assets/loadOfficeAssets'
 import {
   computeChairLayerZ,
   computeDeskLayerZ,
@@ -25,13 +21,6 @@ const STYLE = {
   keyboardStroke: 0xd0ccc4,
   mouse: 0xf5f4f1,
 } as const
-
-const DESK_BASE_WIDTH = 152
-const CHAIR_BASE_WIDTH = 104
-const DESK_ANCHOR_Y = 0.62
-const DESK_TARGET_WIDTH = (DESK_BASE_WIDTH * 2) / 3
-const CHAIR_ANCHOR_Y = 0.36
-const CHAIR_TARGET_WIDTH = CHAIR_BASE_WIDTH / 2
 
 const CHAIR_DEPTH_AHEAD = 2
 
@@ -58,13 +47,6 @@ export class DeskEntity {
     }
 
     this.drawShadow()
-    this.mountSprites()
-  }
-
-  /** 素材晚到或 HMR 后可重新挂载 PNG */
-  remountSprites() {
-    this.deskLayer.removeChildren()
-    this.chairLayer.removeChildren()
     this.mountSprites()
   }
 
@@ -95,28 +77,8 @@ export class DeskEntity {
   }
 
   private mountSprites() {
-    const deskTex = getOfficeDeskTexture()
-    const chairTex = getOfficeChairTexture()
-
-    if (deskTex) {
-      const desk = new Sprite(deskTex)
-      desk.anchor.set(0.5, DESK_ANCHOR_Y)
-      desk.position.set(0, SEAT_OFFSET_Y - 14)
-      desk.scale.set(DESK_TARGET_WIDTH / deskTex.width)
-      this.deskLayer.addChild(desk)
-    } else {
-      this.drawDeskFallback()
-    }
-
-    if (chairTex) {
-      const chair = new Sprite(chairTex)
-      chair.anchor.set(0.5, CHAIR_ANCHOR_Y)
-      chair.position.set(0, SEAT_OFFSET_Y)
-      chair.scale.set(CHAIR_TARGET_WIDTH / chairTex.width)
-      this.chairLayer.addChild(chair)
-    } else {
-      this.drawChairFallback()
-    }
+    this.drawDeskFallback()
+    this.drawChairFallback()
   }
 
   private drawShadow() {

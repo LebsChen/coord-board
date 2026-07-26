@@ -60,6 +60,7 @@ export class OfficeFeedConnector {
   private async poll(): Promise<void> {
     if (this.stopped) return
     try {
+      const initialPoll = this.cursor === ''
       const feed = await this.source.getOfficeActions(this.projectId, this.cursor || undefined)
       if (this.stopped) return
       this.onFeed?.(feed)
@@ -88,8 +89,10 @@ export class OfficeFeedConnector {
           task: converted.task,
         })
       }
-      for (const visit of convertOfficeVisits(feed.visits, activeMap)) {
-        this.scene.requestDeskVisit(visit.visitor, visit.host, visit.message)
+      if (!initialPoll) {
+        for (const visit of convertOfficeVisits(feed.visits, activeMap)) {
+          this.scene.requestDeskVisit(visit.visitor, visit.host, visit.message)
+        }
       }
       this.cursor = feed.cursor
     } catch (error) {

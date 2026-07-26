@@ -142,10 +142,11 @@ export function startDeskVisitTour(
   )
   const mission = missionForStops(
     stops,
-    visitor.currentTask ??
+    visitor.authoritativeTask ??
+      visitor.currentTask ??
       AGENT_ROSTER[visitorRosterNo - 1]?.task ??
       '工作中…',
-    visitor.state,
+    visitor.authoritativeState ?? visitor.state,
     talkDuration,
   )
   if (!mission) return agents
@@ -154,7 +155,7 @@ export function startDeskVisitTour(
   return agents.map((a) => {
     if (a.id !== visitor.id) return a
     const going = assignGotoHost(a, firstStop, agents)
-    return { ...going, mission }
+    return { ...going, mission, publicZone: undefined }
   })
 }
 
@@ -350,6 +351,7 @@ export function processDeskVisitMissions(
       delete rest.mission
       return {
         ...rest,
+        publicZone: undefined,
         state: mission.resumeState ?? 'working',
         viewFacing:
           mission.resumeState === 'working' || mission.resumeState === 'thinking'
@@ -379,6 +381,8 @@ export function applyAgentStateUpdate(
   if (agent.mission) {
     return {
       ...agent,
+      authoritativeState: state,
+      authoritativeTask: task,
       mission: {
         ...agent.mission,
         resumeState: state,
@@ -390,6 +394,8 @@ export function applyAgentStateUpdate(
   return {
     ...agent,
     state,
+    authoritativeState: state,
+    authoritativeTask: task,
     currentTask: task,
     targetX: undefined,
     targetY: undefined,

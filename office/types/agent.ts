@@ -43,6 +43,9 @@ export interface Agent {
   walkPath?: { x: number; y: number }[]
   walkPathIndex?: number
   state: AgentState
+  /** Last state/task received from the Board; simulation must not overwrite these. */
+  authoritativeState?: AgentState
+  authoritativeTask?: string
   currentTask?: string
   assignedDeskId?: string
   bubbleText?: string
