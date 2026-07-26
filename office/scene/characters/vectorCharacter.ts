@@ -63,7 +63,7 @@ export class VectorCharacter extends Container {
     const texture = getAgentFrame(frame, this.leader)
     if (texture) this.sprite.texture = texture
     const seated = frame === 3
-    const scale = seated ? 0.16 : 0.22
+    const scale = seated ? (this.leader ? 0.2 : 0.16) : 0.22
     this.sprite.scale.set(scale * this.direction, scale)
     this.sprite.position.y = seated ? 4 : 0
   }

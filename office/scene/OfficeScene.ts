@@ -205,7 +205,7 @@ export class OfficeScene {
     const minY = Math.min(
       ...DESKS.map((desk) => desk.y - 100 - LABEL_HEIGHT),
       ...PUBLIC_ZONES.map((zone) => zone.y - 120),
-      LEADER_ROOM.y,
+      LEADER_ROOM.y - 40,
     ) - padding
     const maxY = Math.max(
       ...DESKS.map((desk) => desk.y + 80),
@@ -365,6 +365,7 @@ export class OfficeScene {
         entity.deskLayer,
         entity.chairLayer,
         entity.occupiedIndicator,
+        entity.screenAccent,
       )
     }
 
@@ -428,7 +429,7 @@ export class OfficeScene {
       }
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: zone.color } })
       label.anchor.set(0.5)
-      label.position.set(zone.x, zone.y - 125)
+      label.position.set(zone.x, zone.y - 70)
       map.addChild(label)
     }
 
@@ -440,7 +441,9 @@ export class OfficeScene {
     this.activityClock = 0
     const occupied = new Map<string, number>()
     for (const agent of this.agents) {
-      if (agent.publicZone) occupied.set(agent.publicZone, (occupied.get(agent.publicZone) ?? 0) + 1)
+      if (agent.publicZone) {
+        occupied.set(agent.publicZone, (occupied.get(agent.publicZone) ?? 0) + 1)
+      }
     }
     for (const agent of this.agents) {
       if (!agent.publicZone || agent.targetX != null || agent.mission) continue

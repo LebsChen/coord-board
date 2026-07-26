@@ -57,4 +57,21 @@ describe('Office ambient simulation', () => {
       publicZone: 'coffee',
     })
   })
+
+  it('does not pin a dwelling idle agent back to its desk', () => {
+    const simulator = new OfficeSimulator()
+    const agent = makeAgent({
+      state: 'idle',
+      authoritativeState: 'idle',
+      x: 91,
+      y: 687,
+      publicZone: 'coffee',
+    })
+    expect(simulator.tick(0.1, [agent])[0]).toMatchObject({
+      x: 91,
+      y: 687,
+      state: 'idle',
+      publicZone: 'coffee',
+    })
+  })
 })

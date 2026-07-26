@@ -73,6 +73,12 @@ describe("coord board", () => {
       { headers: { cookie } },
     ));
     expect(office.status).toBe(200);
+    const kanban = await SELF.fetch(new Request(
+      "https://coord-board.test/?project=office-auth",
+      { headers: { cookie } },
+    ));
+    expect(kanban.status).toBe(200);
+    expect(kanban.headers.get("content-type")).toContain("text/html");
     const wrongProject = await SELF.fetch(new Request(
       "https://coord-board.test/api/board/office-actions?project=other-project",
       { headers: { cookie } },

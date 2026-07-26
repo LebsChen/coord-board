@@ -34,8 +34,8 @@ export const PUBLIC_ZONES = [
 export type PublicZoneId = typeof PUBLIC_ZONES[number]['id']
 
 const PUBLIC_ZONE_OFFSETS = [
-  { x: -24, y: 22 },
-  { x: 24, y: 22 },
+  { x: -24, y: 62 },
+  { x: 24, y: 62 },
 ] as const
 
 export function publicZonePosition(zoneId: PublicZoneId, slot: number): { x: number; y: number } {
@@ -71,7 +71,7 @@ export function buildDesks(count: number): Desk[] {
     x: LEADER_ROOM.x + LEADER_ROOM.width / 2,
     y: LEADER_ROOM.y + LEADER_ROOM.height / 2 + 20,
     seatX: LEADER_ROOM.x + LEADER_ROOM.width / 2,
-    seatY: LEADER_ROOM.y + LEADER_ROOM.height / 2 + 65,
+    seatY: LEADER_ROOM.y + LEADER_ROOM.height / 2 + 52,
     isLeader: true,
     room: 'leader',
   })

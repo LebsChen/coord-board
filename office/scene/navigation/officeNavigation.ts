@@ -565,18 +565,8 @@ export function planWalkTo(
   toY: number,
   ctx?: NavPathContext,
 ): NavPoint[] {
-  const insideLeaderRoom = (x: number, y: number) =>
-    x >= LEADER_ROOM.x && x <= LEADER_ROOM.x + LEADER_ROOM.width &&
-    y >= LEADER_ROOM.y && y <= LEADER_ROOM.y + LEADER_ROOM.height
-  const fromInRoom = insideLeaderRoom(fromX, fromY)
-  const toInRoom = insideLeaderRoom(toX, toY)
-  if (fromInRoom !== toInRoom) {
-    const doorInside = { x: LEADER_ROOM.doorwayX - 18, y: LEADER_ROOM.doorwayY }
-    const doorOutside = { x: LEADER_ROOM.doorwayX + 28, y: LEADER_ROOM.doorwayY }
-    return dedupePoints(fromInRoom
-      ? [{ x: fromX, y: fromY }, doorInside, doorOutside, { x: toX, y: toY }]
-      : [{ x: fromX, y: fromY }, doorOutside, doorInside, { x: toX, y: toY }])
-  }
+  const doorwayPath = routeThroughLeaderDoor(fromX, fromY, toX, toY)
+  if (doorwayPath) return doorwayPath
   const g = ensureGraph()
   const fromId = nearestNodeId(g, fromX, fromY)
   const toId = nearestNodeId(g, toX, toY)
@@ -598,6 +588,8 @@ export function planWalkFrom(
   toY: number,
   ctx?: NavPathContext,
 ): NavPoint[] {
+  const doorwayPath = routeThroughLeaderDoor(fromX, fromY, toX, toY)
+  if (doorwayPath) return doorwayPath
   const desk = findDeskAtSeat(fromX, fromY)
   if (desk) {
     const g = ensureGraph()
@@ -640,6 +632,27 @@ export function planWalkFrom(
     return dedupePoints([...steps, ...corridor])
   }
   return planWalkTo(fromX, fromY, toX, toY, ctx)
+}
+
+function routeThroughLeaderDoor(
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+): NavPoint[] | null {
+  const insideLeaderRoom = (x: number, y: number) =>
+    x >= LEADER_ROOM.x &&
+    x <= LEADER_ROOM.x + LEADER_ROOM.width &&
+    y >= LEADER_ROOM.y &&
+    y <= LEADER_ROOM.y + LEADER_ROOM.height
+  const fromInRoom = insideLeaderRoom(fromX, fromY)
+  const toInRoom = insideLeaderRoom(toX, toY)
+  if (fromInRoom === toInRoom) return null
+  const doorInside = { x: LEADER_ROOM.doorwayX - 18, y: LEADER_ROOM.doorwayY }
+  const doorOutside = { x: LEADER_ROOM.doorwayX + 28, y: LEADER_ROOM.doorwayY }
+  return dedupePoints(fromInRoom
+    ? [{ x: fromX, y: fromY }, doorInside, doorOutside, { x: toX, y: toY }]
+    : [{ x: fromX, y: fromY }, doorOutside, doorInside, { x: toX, y: toY }])
 }
 
 export function planWalkToDeskSeat(

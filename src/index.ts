@@ -4610,6 +4610,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       assetUrl.pathname = assetPath;
       return env.ASSETS.fetch(new Request(assetUrl, request));
     }
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
     if (url.pathname === "/api/board/office/session") {
       return exchangeOfficeBootstrap(request, env);
     }
@@ -4618,12 +4621,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     }
     const auth = await authenticate(request, env);
     if (!auth) {
-      if (request.method === "GET" && url.pathname === "/") return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       return json({ error: "unauthorized" }, 401);
     }
     if (url.pathname === "/api/board/office/bootstrap") return issueOfficeBootstrap(request, env, auth);
     if (url.pathname === "/api/board/office/link") return issueOfficeLink(request, env, auth);
-    if (isOfficeSession(auth) && (request.method !== "GET" || url.pathname !== "/api/board/office-actions")) {
+    if (url.pathname.startsWith("/api/") && isOfficeSession(auth) && (request.method !== "GET" || url.pathname !== "/api/board/office-actions")) {
       return json({ error: "office session is restricted to GET office data" }, 403);
     }
     if (isReadOnlyViewer(auth) && request.method !== "GET") {

@@ -9,4 +9,5 @@ The committed WebP files are optimized derivatives of the supplied PNG
 sources. The workstation, room, amenity, and character magenta backgrounds
 were keyed to real alpha with edge de-fringing during conversion. The scene
 uses separate front-facing room and furniture pieces rather than a single
-room plate.
+room plate. The chairless seated worker and Leader frames are likewise
+original project artwork keyed from the supplied magenta source.

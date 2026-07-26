@@ -64,6 +64,7 @@ export class DeskEntity {
     this.shadowGfx.zIndex = deskZ - 0.5
     this.chairLayer.zIndex = chairZ
     this.occupiedIndicator.zIndex = chairZ + 0.5
+    this.screenAccent.zIndex = chairZ + 10
   }
 
   setOccupied(occupied: boolean) {
@@ -78,9 +79,9 @@ export class DeskEntity {
   setScreenAccent(color?: number, alpha = 0.9) {
     this.screenAccent.clear()
     if (color == null) return
-    const width = this.desk.isLeader ? 38 : 30
-    const height = this.desk.isLeader ? 18 : 15
-    this.screenAccent.roundRect(-width / 2, -16, width, height, 3)
+    const width = this.desk.isLeader ? 46 : 40
+    const height = this.desk.isLeader ? 22 : 20
+    this.screenAccent.roundRect(-width / 2, -76, width, height, 3)
     this.screenAccent.fill({ color, alpha: Math.min(1, alpha) })
   }
 
@@ -98,7 +99,7 @@ export class DeskEntity {
       workstation.alpha = 1
       const targetWidth = 145
       workstation.scale.set(targetWidth / texture.width)
-      this.deskLayer.addChild(workstation, this.screenAccent)
+      this.deskLayer.addChild(workstation)
     } else {
       this.drawDeskFallback()
       this.drawChairFallback()
