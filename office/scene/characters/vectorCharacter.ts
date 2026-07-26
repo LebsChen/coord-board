@@ -16,8 +16,8 @@ export class VectorCharacter extends Container {
   constructor(_agentId: string, color: number) {
     super()
     this.shadow = new Graphics()
-    this.shadow.ellipse(0, 5, 24, 7)
-    this.shadow.fill({ color: 0x000000, alpha: 0.13 })
+    this.shadow.ellipse(0, 5, 26, 8)
+    this.shadow.fill({ color: 0x000000, alpha: 0.18 })
     this.sprite = new Sprite(getAgentFrame(3) ?? undefined)
     this.sprite.anchor.set(0.5, 0.86)
     this.sprite.scale.set(0.22)

@@ -423,8 +423,8 @@ export class OfficeScene {
         const room = new Sprite(amenity)
         room.anchor.set(0.5)
         room.position.set(zone.x, zone.y)
-        room.width = 140
-        room.height = 220
+        room.width = 120
+        room.height = 200
         map.addChild(room)
       }
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: 0x73777e } })

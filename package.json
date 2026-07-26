@@ -7,7 +7,7 @@
     "deploy": "npm run build:office && wrangler deploy",
     "build:office": "vite build --config office-vite.config.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/check-office-source.mjs && vitest run"
+    "test": "python3 scripts/check-office-art.py && node scripts/check-office-source.mjs && vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.8.19",

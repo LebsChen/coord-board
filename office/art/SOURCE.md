@@ -11,3 +11,7 @@ were keyed to real alpha with edge de-fringing during conversion. The scene
 uses one coherent all-white minimalist render style, with a separately drawn
 chair, figure, desk, monitor, and front-facing room pieces. The figure sheet
 is shared by every agent, including the lead.
+
+The keyed-asset sanity check in `scripts/check-office-art.py` verifies that
+real transparency exists and that surviving light source pixels remain neutral
+white/grey rather than being channel-mixed by the magenta key.
