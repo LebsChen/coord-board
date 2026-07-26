@@ -205,7 +205,7 @@ export class OfficeScene {
     const minY = Math.min(
       ...DESKS.map((desk) => desk.y - 100 - LABEL_HEIGHT),
       ...PUBLIC_ZONES.map((zone) => zone.y - 120),
-      LEADER_ROOM.y - 40,
+      LEADER_ROOM.y - 45,
     ) - padding
     const maxY = Math.max(
       ...DESKS.map((desk) => desk.y + 80),
@@ -413,7 +413,7 @@ export class OfficeScene {
       style: { fontFamily: 'system-ui', fontSize: 11, fontWeight: '600', fill: 0x73777e, letterSpacing: 1.5 },
     })
     roomLabel.anchor.set(0.5, 1)
-    roomLabel.position.set(LEADER_ROOM.x + LEADER_ROOM.width / 2, LEADER_ROOM.y - 28)
+    roomLabel.position.set(LEADER_ROOM.x + LEADER_ROOM.width / 2, LEADER_ROOM.y - 36)
     map.addChild(roomLabel)
 
     for (const zone of PUBLIC_ZONES) {

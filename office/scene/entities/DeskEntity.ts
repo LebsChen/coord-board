@@ -79,9 +79,9 @@ export class DeskEntity {
   setScreenAccent(color?: number, alpha = 0.9) {
     this.screenAccent.clear()
     if (color == null) return
-    const width = this.desk.isLeader ? 46 : 40
-    const height = this.desk.isLeader ? 22 : 20
-    this.screenAccent.roundRect(-width / 2, -76, width, height, 3)
+    const width = this.desk.isLeader ? 56 : 50
+    const height = this.desk.isLeader ? 27 : 25
+    this.screenAccent.roundRect(-width / 2, -34, width, height, 3)
     this.screenAccent.fill({ color, alpha: Math.min(1, alpha) })
   }
 
