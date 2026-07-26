@@ -34,7 +34,7 @@ export class OfficeSimulator {
       if (agentHasActiveMission(agent)) return agent
       if (agent.targetX != null || agent.walkPath != null) return agent
       if (agent.publicZone) return agent
-      if (agent.authoritativeState === 'idle' && agent.state === 'idle') return agent
+      if (agent.ambientZone) return agent
 
       const desk = this.deskFor(agent)
       const roster = AGENT_ROSTER.find((r) => r.id === agent.id)

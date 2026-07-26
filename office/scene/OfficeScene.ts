@@ -441,12 +441,13 @@ export class OfficeScene {
     this.activityClock = 0
     const occupied = new Map<string, number>()
     for (const agent of this.agents) {
-      if (agent.publicZone) {
-        occupied.set(agent.publicZone, (occupied.get(agent.publicZone) ?? 0) + 1)
+      const ambientZone = agent.ambientZone ?? agent.publicZone
+      if (ambientZone) {
+        occupied.set(ambientZone, (occupied.get(ambientZone) ?? 0) + 1)
       }
     }
     for (const agent of this.agents) {
-      if (!agent.publicZone || agent.targetX != null || agent.mission) continue
+      if (!agent.ambientZone || agent.targetX != null || agent.mission) continue
       const elapsed = (this.zoneClock.get(agent.id) ?? 0) + 6
       this.zoneClock.set(agent.id, elapsed)
       if (elapsed < 18) continue
@@ -456,6 +457,7 @@ export class OfficeScene {
           ? {
               ...MovementSystem.assignWalkPath(item, [{ x: desk.seatX, y: desk.seatY }]),
               publicZone: undefined,
+              ambientZone: undefined,
             }
           : item)
         this.zoneClock.delete(agent.id)
@@ -467,6 +469,7 @@ export class OfficeScene {
       (agent.authoritativeState ?? agent.state) === 'idle' &&
       !agent.mission &&
       !agent.publicZone &&
+      !agent.ambientZone &&
       !agent.targetX,
     )
     const candidate = candidates.length
@@ -478,7 +481,11 @@ export class OfficeScene {
     const zone = PUBLIC_ZONES.find((entry) => entry.id === selectedZone.id)!
     const position = publicZonePosition(zone.id, selectedZone.slot)
     this.agents = this.agents.map((item) => item.id === candidate.id
-      ? { ...MovementSystem.assignWalkPath(item, [position]), publicZone: zone.id }
+      ? {
+          ...MovementSystem.assignWalkPath(item, [position]),
+          publicZone: zone.id,
+          ambientZone: zone.id,
+        }
       : item)
     this.zoneClock.set(candidate.id, 0)
     this.idleVisitSequence += 1

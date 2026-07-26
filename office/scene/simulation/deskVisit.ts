@@ -155,7 +155,7 @@ export function startDeskVisitTour(
   return agents.map((a) => {
     if (a.id !== visitor.id) return a
     const going = assignGotoHost(a, firstStop, agents)
-    return { ...going, mission, publicZone: undefined }
+    return { ...going, mission, publicZone: undefined, ambientZone: undefined }
   })
 }
 
@@ -352,6 +352,7 @@ export function processDeskVisitMissions(
       return {
         ...rest,
         publicZone: undefined,
+        ambientZone: undefined,
         state: mission.resumeState ?? 'working',
         viewFacing:
           mission.resumeState === 'working' || mission.resumeState === 'thinking'

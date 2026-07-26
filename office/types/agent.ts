@@ -56,6 +56,8 @@ export interface Agent {
   viewFacing?: CharacterFacing
   mission?: DeskVisitMission
   publicZone?: 'coffee' | 'workout' | 'restroom'
+  /** Ambient excursion zone retained until the walked return completes. */
+  ambientZone?: 'coffee' | 'workout' | 'restroom'
 }
 
 export interface Desk {
