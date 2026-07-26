@@ -427,7 +427,7 @@ export class OfficeScene {
         room.height = 220
         map.addChild(room)
       }
-      const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: zone.color } })
+      const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: 0x73777e } })
       label.anchor.set(0.5)
       label.position.set(zone.x, zone.y - 70)
       map.addChild(label)

@@ -1,7 +1,7 @@
 import { Container, FillGradient, Graphics, Sprite } from 'pixi.js'
 import type { Desk } from '../../types/agent'
 import { SEAT_OFFSET_Y } from '../layout/officeLayout'
-import { getWorkstation } from '../assets/officeArt'
+import { getChair, getDesk } from '../assets/officeArt'
 import {
   computeChairLayerZ,
   computeDeskLayerZ,
@@ -54,7 +54,13 @@ export class DeskEntity {
   }
 
   updateDepthZ(agentPositions: { x: number; y: number }[]) {
-    const deskZ = computeDeskLayerZ(this.desk, agentPositions)
+    const nearby = agentPositions.some((agent) =>
+      Math.abs(agent.x - this.desk.seatX) < 42 &&
+      Math.abs(agent.y - this.desk.seatY) < 32,
+    )
+    const deskZ = nearby
+      ? this.desk.y + 100
+      : computeDeskLayerZ(this.desk, agentPositions)
     const chairZ = computeChairLayerZ(
       this.desk,
       agentPositions,
@@ -62,9 +68,9 @@ export class DeskEntity {
     )
     this.deskLayer.zIndex = deskZ
     this.shadowGfx.zIndex = deskZ - 0.5
-    this.chairLayer.zIndex = chairZ
+    this.chairLayer.zIndex = nearby ? this.desk.y + 20 : chairZ
     this.occupiedIndicator.zIndex = chairZ + 0.5
-    this.screenAccent.zIndex = chairZ + 10
+    this.screenAccent.zIndex = this.deskLayer.zIndex + 1
   }
 
   setOccupied(occupied: boolean) {
@@ -79,9 +85,9 @@ export class DeskEntity {
   setScreenAccent(color?: number, alpha = 0.9) {
     this.screenAccent.clear()
     if (color == null) return
-    const width = this.desk.isLeader ? 56 : 50
-    const height = this.desk.isLeader ? 27 : 25
-    this.screenAccent.roundRect(-width / 2, -34, width, height, 3)
+    const width = this.desk.isLeader ? 58 : 54
+    const height = this.desk.isLeader ? 30 : 28
+    this.screenAccent.roundRect(-width / 2, -43, width, height, 3)
     this.screenAccent.fill({ color, alpha: Math.min(1, alpha) })
   }
 
@@ -91,15 +97,22 @@ export class DeskEntity {
 
   private mountSprites() {
     if (this.desk.isLeader) return
-    const texture = getWorkstation()
-    if (texture) {
-      const workstation = new Sprite(texture)
-      workstation.anchor.set(0.5, 0.68)
-      workstation.position.set(0, SEAT_OFFSET_Y - 6)
-      workstation.alpha = 1
-      const targetWidth = 145
-      workstation.scale.set(targetWidth / texture.width)
-      this.deskLayer.addChild(workstation)
+    const deskTexture = getDesk()
+    const chairTexture = getChair()
+    if (deskTexture && chairTexture) {
+      const desk = new Sprite(deskTexture)
+      desk.anchor.set(0.5, 0.68)
+      desk.position.set(0, SEAT_OFFSET_Y - 6)
+      desk.alpha = 1
+      desk.scale.set(145 / deskTexture.width)
+      this.deskLayer.addChild(desk)
+
+      const chair = new Sprite(chairTexture)
+      chair.anchor.set(0.5, 0.68)
+      chair.position.set(0, SEAT_OFFSET_Y + 10)
+      chair.alpha = 1
+      chair.scale.set(88 / chairTexture.width)
+      this.chairLayer.addChild(chair)
     } else {
       this.drawDeskFallback()
       this.drawChairFallback()

@@ -6,8 +6,8 @@ owned by the project; no code, sprites, or other assets were copied from
 third-party office visualizations.
 
 The committed WebP files are optimized derivatives of the supplied PNG
-sources. The workstation, room, amenity, and character magenta backgrounds
+sources. The desk, chair, room, amenity, and character magenta backgrounds
 were keyed to real alpha with edge de-fringing during conversion. The scene
-uses separate front-facing room and furniture pieces rather than a single
-room plate. The chairless seated worker and Leader frames are likewise
-original project artwork keyed from the supplied magenta source.
+uses one coherent all-white minimalist render style, with a separately drawn
+chair, figure, desk, monitor, and front-facing room pieces. The figure sheet
+is shared by every agent, including the lead.

@@ -29,7 +29,7 @@ export class AgentEntity extends Container {
     this.statusLabel.setIdentityColor(agent.color)
     this.bubble = new Bubble()
 
-    this.character = new VectorCharacter(agent.id, agent.color, agent.assignedDeskId === 'desk-0')
+    this.character = new VectorCharacter(agent.id, agent.color)
     if (this.character.isReady) {
       this.character.setAgentColor(agent.color)
       this.character.setFacing(agent.facing)

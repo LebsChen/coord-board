@@ -7,26 +7,29 @@ export class VectorCharacter extends Container {
   readonly isReady = true
   private readonly shadow: Graphics
   private readonly sprite: Sprite
-  private readonly leader: boolean
+  private readonly identityBand: Graphics
   private state: AgentState = 'idle'
   private inZone = false
   private direction: 1 | -1 = 1
   private walkClock = 0
 
-  constructor(_agentId: string, color: number, leader = false) {
+  constructor(_agentId: string, color: number) {
     super()
-    this.leader = leader
     this.shadow = new Graphics()
     this.shadow.ellipse(0, 5, 24, 7)
     this.shadow.fill({ color: 0x000000, alpha: 0.13 })
-    this.sprite = new Sprite(getAgentFrame(3, leader) ?? undefined)
+    this.sprite = new Sprite(getAgentFrame(3) ?? undefined)
     this.sprite.anchor.set(0.5, 0.86)
     this.sprite.scale.set(0.22)
-    this.addChild(this.shadow, this.sprite)
+    this.identityBand = new Graphics()
+    this.addChild(this.shadow, this.sprite, this.identityBand)
+    this.setAgentColor(color)
   }
 
   setAgentColor(color: number): void {
-    void color
+    this.identityBand.clear()
+    this.identityBand.roundRect(-7, -2, 14, 4, 2)
+    this.identityBand.fill({ color, alpha: 0.95 })
   }
 
   setFacing(direction: 1 | -1): void {
@@ -60,11 +63,13 @@ export class VectorCharacter extends Container {
         : this.inZone
           ? 0
           : 3
-    const texture = getAgentFrame(frame, this.leader)
+    const texture = getAgentFrame(frame)
     if (texture) this.sprite.texture = texture
     const seated = frame === 3
-    const scale = seated ? (this.leader ? 0.2 : 0.16) : 0.22
+    const scale = seated ? 0.16 : 0.22
     this.sprite.scale.set(scale * this.direction, scale)
     this.sprite.position.y = seated ? 4 : 0
+    this.identityBand.scale.set(1)
+    this.identityBand.position.set(0, seated ? -27 : -45)
   }
 }
