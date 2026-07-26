@@ -4,11 +4,7 @@ import {
   resolveWalkViewFacing,
   viewFacingToLR,
 } from '../systems/movementFacing'
-import {
-  defaultCharacterRenderer,
-  type CharacterRenderer,
-  type CharacterRendererFactory,
-} from '../characters/characterRenderer'
+import { VectorCharacter } from '../characters/vectorCharacter'
 import { Bubble } from '../ui/Bubble'
 import { StatusLabel } from '../ui/StatusLabel'
 
@@ -16,7 +12,7 @@ export class AgentEntity extends Container {
   readonly agentId: string
   readonly overlay = new Container()
   private agent: Agent
-  private character: CharacterRenderer | null = null
+  private character: VectorCharacter | null = null
   private fallbackBody: Graphics | null = null
   private fallbackScarf: Graphics | null = null
   private statusLabel: StatusLabel
@@ -24,7 +20,6 @@ export class AgentEntity extends Container {
   private walkPhase = 0
   constructor(
     agent: Agent,
-    characterFactory: CharacterRendererFactory = defaultCharacterRenderer,
   ) {
     super()
     this.agentId = agent.id
@@ -33,7 +28,7 @@ export class AgentEntity extends Container {
     this.statusLabel = new StatusLabel(agent.name)
     this.bubble = new Bubble()
 
-    this.character = characterFactory(agent.id, agent.color)
+    this.character = new VectorCharacter(agent.id, agent.color)
     if (this.character.isReady) {
       this.character.setAgentColor(agent.color)
       this.character.setFacing(agent.facing)

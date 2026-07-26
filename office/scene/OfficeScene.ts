@@ -12,7 +12,6 @@ import {
   PUBLIC_ZONES,
 } from './layout/officeLayout'
 import { AgentEntity } from './entities/AgentEntity'
-import type { CharacterRendererFactory } from './characters/characterRenderer'
 import { DeskEntity } from './entities/DeskEntity'
 import { MovementSystem } from './systems/MovementSystem'
 import { AnimationSystem } from './systems/AnimationSystem'
@@ -55,13 +54,11 @@ export class OfficeScene {
       state?: AgentState
       task?: string
     }>
-    characterFactory?: CharacterRendererFactory
   }
 
   constructor(options: {
     onAgentClick?: (event: OfficeAgentClick) => void
     roster?: Array<{ id: string; name: string; role?: string; state?: AgentState; task?: string }>
-    characterFactory?: CharacterRendererFactory
   } = {}) {
     this.options = options
     configureOfficeRoster(options.roster ?? [
@@ -78,7 +75,7 @@ export class OfficeScene {
         state: entry.state ?? 'idle',
         assignedDeskId: desk.id,
         currentTask:
-          entry.state === 'working' || entry.state === 'thinking'
+          entry.state === 'working' || entry.state === 'thinking' || entry.state === 'blocked' || entry.state === 'done'
             ? entry.task
             : undefined,
         facing: i % 2 === 0 ? 1 : -1,
@@ -195,10 +192,22 @@ export class OfficeScene {
     if (!this.world) return
 
     const padding = 20
-    const minX = Math.min(...DESKS.map((desk) => desk.x - LABEL_WIDTH / 2)) - padding
-    const maxX = Math.max(...DESKS.map((desk) => desk.x + LABEL_WIDTH / 2)) + padding
-    const minY = Math.min(...DESKS.map((desk) => desk.y - 100 - LABEL_HEIGHT)) - padding
-    const maxY = Math.max(...DESKS.map((desk) => desk.y + 80)) + padding
+    const minX = Math.min(
+      ...DESKS.map((desk) => desk.x - LABEL_WIDTH / 2),
+      ...PUBLIC_ZONES.map((zone) => zone.x - 62),
+    ) - padding
+    const maxX = Math.max(
+      ...DESKS.map((desk) => desk.x + LABEL_WIDTH / 2),
+      ...PUBLIC_ZONES.map((zone) => zone.x + 62),
+    ) + padding
+    const minY = Math.min(
+      ...DESKS.map((desk) => desk.y - 100 - LABEL_HEIGHT),
+      ...PUBLIC_ZONES.map((zone) => zone.y - 38),
+    ) - padding
+    const maxY = Math.max(
+      ...DESKS.map((desk) => desk.y + 80),
+      ...PUBLIC_ZONES.map((zone) => zone.y + 38),
+    ) + padding
     const contentWidth = maxX - minX
     const contentHeight = maxY - minY
     const scale = Math.min(
@@ -331,7 +340,7 @@ export class OfficeScene {
     }
 
     for (const agent of this.agents) {
-      const entity = new AgentEntity(agent, this.options.characterFactory)
+      const entity = new AgentEntity(agent)
       this.agentEntities.set(agent.id, entity)
       entity.zIndex = agent.y
       entity.on('pointertap', (event: FederatedPointerEvent) => {

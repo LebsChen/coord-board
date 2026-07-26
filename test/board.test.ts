@@ -102,6 +102,22 @@ describe("coord board", () => {
     expect(reused.status).toBe(401);
   });
 
+  it("issues an Office link without returning an admin or share token", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "office-link", name: "Office Link" }),
+    });
+    expect([201, 409]).toContain(project.response.status);
+    const link = await call("/api/board/office/link", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "office-link" }),
+    });
+    expect(link.response.status).toBe(200);
+    expect(link.body.project_id).toBe("office-link");
+    expect(typeof link.body.bootstrap).toBe("string");
+    expect(link.body.token).toBeUndefined();
+  });
+
   it("rejects office bootstrap for a different project and expired grants", async () => {
     const project = await call("/api/board/projects", {
       method: "POST",
@@ -634,6 +650,17 @@ describe("coord board", () => {
     expect(patched.body.risk).toBe("high");
     expect(patched.body.readiness.acceptance_testable).toBe(true);
     expect(patched.body.readiness.problem_clear).toBe(false);
+
+    await env.DB.prepare("UPDATE task_item SET blocked = 1, needs_human = 1 WHERE id = ?")
+      .bind(created.body.id)
+      .run();
+    const clearedFlags = await call(`/api/board/tasks/${created.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ blocked: false, needs_human: false }),
+    });
+    expect(clearedFlags.response.status).toBe(200);
+    expect(clearedFlags.body.blocked).toBe(0);
+    expect(clearedFlags.body.needs_human).toBe(0);
   });
 
   it("rejects invalid project risk values on create and patch", async () => {

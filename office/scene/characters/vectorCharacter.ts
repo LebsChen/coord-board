@@ -2,23 +2,7 @@ import { Container, Graphics } from 'pixi.js'
 import type { AgentState } from '../../types/agent'
 import type { CharacterFacing } from './characterFacing'
 
-export interface CharacterRenderer extends Container {
-  readonly isReady: boolean
-  setAgentColor(color: number): void
-  setFacing(direction: 1 | -1): void
-  setViewFacing(facing: CharacterFacing): void
-  playState(state: AgentState, customAnimation?: string): void
-  playAnimation(animation: string): void
-  getHeadOffsetY(): number
-}
-
-export type CharacterRendererFactory = (
-  agentId: string,
-  color: number,
-) => CharacterRenderer
-
-/** Small self-contained renderer used by Board and other hosts by default. */
-export class VectorCharacter extends Container implements CharacterRenderer {
+export class VectorCharacter extends Container {
   readonly isReady = true
   private readonly body: Graphics
   private readonly shadow: Graphics
@@ -66,8 +50,3 @@ export class VectorCharacter extends Container implements CharacterRenderer {
     this.body.scale.x = this.direction
   }
 }
-
-export const defaultCharacterRenderer: CharacterRendererFactory = (
-  agentId,
-  color,
-) => new VectorCharacter(agentId, color)

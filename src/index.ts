@@ -1969,7 +1969,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       ? Number(current.attempt_count ?? 0)
       : Math.max(0, Math.floor(Number(body.attempt_count)));
     const attemptCount = Number.isFinite(requestedAttempts) ? requestedAttempts : Number(current.attempt_count ?? 0);
-    const blocked = phase === "pending" && attemptCount === 0 ? 0 : Number(current.blocked ?? 0);
+    const blocked = body.blocked === undefined
+      ? (phase === "pending" && attemptCount === 0 ? 0 : Number(current.blocked ?? 0))
+      : flag(body.blocked);
+    const needsHuman = body.needs_human === undefined
+      ? Number(current.needs_human ?? 0)
+      : flag(body.needs_human);
     const requiredGateNames = body.required_gates === undefined
       ? requiredGates(current)
       : gateNames(body.required_gates);
@@ -2047,6 +2052,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       spawn_status: spawnStatus,
       attempt_count: attemptCount,
       blocked,
+      needs_human: needsHuman,
       lease_owner: phase === "done" ? null : current.lease_owner ?? null,
       lease_expires_at: phase === "done" ? null : current.lease_expires_at ?? null,
       updated_at: timestamp,
@@ -2055,12 +2061,12 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     await db.batch([
       db.prepare(
         `UPDATE task_item
-         SET title = ?, description = ?, epic = ?, user_story = ?, risk = ?, readiness_json = ?, evidence_json = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?,
+          SET title = ?, description = ?, epic = ?, user_story = ?, risk = ?, readiness_json = ?, evidence_json = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?, needs_human = ?,
              lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
              lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
              updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, epic, userStory, risk, responseBody.readiness_json, responseBody.evidence_json, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
+      ).bind(title, description, epic, userStory, risk, responseBody.readiness_json, responseBody.evidence_json, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, needsHuman, phase, phase, timestamp, taskId, String(current.board_id)),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
       ...(phase === "done" && gateRequirementsChanged
         ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
@@ -3477,6 +3483,34 @@ async function issueOfficeBootstrap(request: Request, env: Env, auth: Auth): Pro
   return json({ bootstrap, project_id: auth.projectId, expires_at: expiresAt });
 }
 
+async function issueOfficeLink(request: Request, env: Env, auth: Auth): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+  if (!canManage(auth)) return json({ error: "manage authorization required" }, 403);
+  const body = await parseBody(request);
+  const projectId = typeof body.project_id === "string" && body.project_id.trim()
+    ? body.project_id.trim()
+    : (isAdmin(auth) ? "" : auth.projectId);
+  if (!projectId) return json({ error: "project_id is required" }, 400);
+  if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
+  const project = await env.DB.prepare("SELECT id FROM project WHERE id = ?").bind(projectId).first();
+  if (!project) return json({ error: "project not found" }, 404);
+
+  const timestamp = now();
+  const shareToken = randomToken();
+  const shareExpiresAt = new Date(Date.now() + OFFICE_BOOTSTRAP_TTL_SECONDS * 1000).toISOString();
+  const bootstrap = randomToken();
+  const bootstrapExpiresAt = new Date(Date.now() + OFFICE_BOOTSTRAP_TTL_SECONDS * 1000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO share_token(token_hash, project_id, expires_at, scope, created_by, created_at) VALUES (?, ?, ?, 'read', ?, ?)",
+    ).bind(await sha256(shareToken), projectId, shareExpiresAt, actor(auth), timestamp),
+    env.DB.prepare(
+      "INSERT INTO office_bootstrap(code_hash, project_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+    ).bind(await sha256(bootstrap), projectId, bootstrapExpiresAt, timestamp),
+  ]);
+  return json({ bootstrap, project_id: projectId, expires_at: bootstrapExpiresAt });
+}
+
 async function exchangeOfficeBootstrap(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
   const body = await parseBody(request);
@@ -4519,7 +4553,7 @@ input{background:#0d1527;color:var(--text);border:1px solid var(--line);border-r
 .feed-item{position:relative;padding:10px 3px 10px 23px;border-bottom:1px solid #25304a}.feed-item:before{content:"";position:absolute;left:5px;top:15px;width:8px;height:8px;border-radius:50%;background:var(--purple);box-shadow:0 0 8px #b58cff}.feed-type{font-weight:650;color:#d5def0}.feed-meta{font-size:10px;color:var(--muted);margin-top:3px}.feed-summary{font-size:11px;color:#aebbd0;word-break:break-word;margin-top:4px}.notice{margin:10px 18px 0;padding:8px 11px;border:1px solid #6b5130;background:#30271b;color:#f5cf88;border-radius:7px}.new-task{display:flex;gap:8px;align-items:center;padding:10px 18px;border-bottom:1px solid var(--line)}.new-task input{flex:1;max-width:520px}.footer-note{color:var(--muted);text-align:center;padding:14px;font-size:11px}
 @media(max-width:1100px){.layout{grid-template-columns:220px minmax(440px,1fr)}.right{grid-column:1/-1}.right .panel-body{max-height:300px;overflow:auto}}@media(max-width:760px){.topbar{padding:0 12px;gap:10px}.stats{display:none}.layout{display:block;padding:10px}.panel{margin-bottom:10px}.board{overflow-x:auto}.clock{display:none}}
 </style></head><body>
-<header class="topbar"><div class="brand"><span class="logo">C</span><span>Coord Board</span></div><div class="stats"><span class="stat"><b id="agent-count">0</b> agents</span><span class="stat"><b id="task-count">0</b> tasks</span></div><div class="top-spacer"></div><span class="clock" id="clock">00:00:00</span><span class="online"><i class="dot"></i><span id="connection">Online</span></span><button class="primary" id="new-task-button">＋ New Task</button><button id="settings-button" title="Settings">⚙</button><div class="settings hidden" id="settings"><label>Bearer token<input id="token" type="password" autocomplete="off"></label><label>Agent ID<input id="agent" value="ui-agent" autocomplete="off"></label><button id="save-settings">Save &amp; refresh</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">C</span><span>Coord Board</span></div><div class="stats"><span class="stat"><b id="agent-count">0</b> agents</span><span class="stat"><b id="task-count">0</b> tasks</span></div><div class="top-spacer"></div><span class="clock" id="clock">00:00:00</span><span class="online"><i class="dot"></i><span id="connection">Online</span></span><button class="primary" id="office-button">Office</button><button class="primary" id="new-task-button">＋ New Task</button><button id="settings-button" title="Settings">⚙</button><div class="settings hidden" id="settings"><label>Bearer token<input id="token" type="password" autocomplete="off"></label><label>Agent ID<input id="agent" value="ui-agent" autocomplete="off"></label><button id="save-settings">Save &amp; refresh</button></div></header>
 <div id="notice" class="notice hidden"></div><form class="new-task hidden" id="new-task-form"><input id="title" placeholder="Task title" required><button class="primary">Create task</button><button type="button" id="cancel-new">Cancel</button></form>
 <main class="layout"><section class="panel left"><div class="panel-head"><span>Agents · Roster</span><span id="deadletters" class="muted">0 dead</span></div><div class="panel-body" id="agents"><div class="empty">Connect a project to view agents.</div></div></section>
 <section class="panel center"><div class="panel-head"><span>Board · <span id="project-heading">default</span></span><button class="panel-toggle" id="pause-button">Pause refresh</button></div><div class="tabs"><button class="active" id="board-tab">Board</button><button id="roadmap-tab">Roadmap</button></div><div class="board" id="board"></div><div class="roadmap hidden" id="roadmap"></div></section>
@@ -4539,7 +4573,7 @@ function renderRoadmap(tasks){const groups={};tasks.forEach(t=>{const epic=t.epi
 function renderFeed(events){document.querySelector('#feed').innerHTML=events.length?events.map(e=>'<div class="feed-item"><div class="feed-type">◈ '+esc(e.type||'event')+'</div><div class="feed-meta">'+esc(relative(e.created_at))+' · '+esc(e.agent_id||'system')+(e.task_id?' · task '+esc(e.task_id):'')+'</div>'+(e.payload_summary?'<div class="feed-summary">'+esc(e.payload_summary)+'</div>':'')+'</div>').join(''):'<div class="empty">No events yet.</div>'}
 let lastTasks=[];let roadmapMode=false;async function load(){if(paused)return;const [team,events]=await Promise.all([api('/team?project='+encodeURIComponent(project)),api('/events?project='+encodeURIComponent(project)+'&limit=50')]);if(team.status>=400){setText('#connection','Offline');document.querySelector('#notice').textContent=team.data.error||'Unable to load project';document.querySelector('#notice').classList.remove('hidden');return}setText('#connection','Online');document.querySelector('#notice').classList.add('hidden');const d=team.data;lastTasks=d.tasks||[];setText('#agent-count',(d.agents||[]).length);setText('#task-count',lastTasks.length);setText('#deadletters',(d.dead_letter_count||0)+' dead');renderAgents(d.agents||[]);roadmapMode?renderRoadmap(lastTasks):renderBoard(lastTasks);if(events.status<400)renderFeed(events.data.events||[])}
 async function write(path,body){const r=await api(path,{method:'POST',body:JSON.stringify(body||{})});if(r.status<400)load();else alert(r.data.error||'Request failed')}
-document.querySelector('#board').addEventListener('click',e=>{const b=e.target.closest('button[data-action]');if(!b||readOnly)return;const id=b.dataset.id;const action=b.dataset.action;if(action==='claim'||action==='complete')write('/tasks/'+encodeURIComponent(id)+'/'+action,{agent_id:agent.value});else if(action==='release')write('/tasks/'+encodeURIComponent(id)+'/release',{agent_id:b.dataset.agent});else if(action==='shutdown')write('/agents/'+encodeURIComponent(id)+'/shutdown',{});else if(action==='reassign'){const value=prompt('Assignee agent id (blank to clear):','');if(value!==null)write('/tasks/'+encodeURIComponent(id)+'/reassign',{assignee_agent_id:value||null})}});document.querySelector('#board-tab').onclick=()=>{roadmapMode=false;document.querySelector('#board-tab').classList.add('active');document.querySelector('#roadmap-tab').classList.remove('active');document.querySelector('#roadmap').classList.add('hidden');document.querySelector('#board').classList.remove('hidden');renderBoard(lastTasks)};document.querySelector('#roadmap-tab').onclick=()=>{roadmapMode=true;document.querySelector('#roadmap-tab').classList.add('active');document.querySelector('#board-tab').classList.remove('active');document.querySelector('#board').classList.add('hidden');document.querySelector('#roadmap').classList.remove('hidden');renderRoadmap(lastTasks)};
+document.querySelector('#office-button').onclick=async()=>{const result=await api('/office/link',{method:'POST',body:JSON.stringify({project_id:project})});if(result.status<400){window.open('/office?project='+encodeURIComponent(project)+'#bootstrap='+encodeURIComponent(result.data.bootstrap),'_blank','noopener,noreferrer')}else alert(result.data.error||'Unable to open office')};document.querySelector('#board').addEventListener('click',e=>{const b=e.target.closest('button[data-action]');if(!b||readOnly)return;const id=b.dataset.id;const action=b.dataset.action;if(action==='claim'||action==='complete')write('/tasks/'+encodeURIComponent(id)+'/'+action,{agent_id:agent.value});else if(action==='release')write('/tasks/'+encodeURIComponent(id)+'/release',{agent_id:b.dataset.agent});else if(action==='shutdown')write('/agents/'+encodeURIComponent(id)+'/shutdown',{});else if(action==='reassign'){const value=prompt('Assignee agent id (blank to clear):','');if(value!==null)write('/tasks/'+encodeURIComponent(id)+'/reassign',{assignee_agent_id:value||null})}});document.querySelector('#board-tab').onclick=()=>{roadmapMode=false;document.querySelector('#board-tab').classList.add('active');document.querySelector('#roadmap-tab').classList.remove('active');document.querySelector('#roadmap').classList.add('hidden');document.querySelector('#board').classList.remove('hidden');renderBoard(lastTasks)};document.querySelector('#roadmap-tab').onclick=()=>{roadmapMode=true;document.querySelector('#roadmap-tab').classList.add('active');document.querySelector('#board-tab').classList.remove('active');document.querySelector('#board').classList.add('hidden');document.querySelector('#roadmap').classList.remove('hidden');renderRoadmap(lastTasks)};
 document.querySelector('#agents').addEventListener('click',e=>{const b=e.target.closest('button[data-action="shutdown"]');if(b&&!readOnly)write('/agents/'+encodeURIComponent(b.dataset.id)+'/shutdown',{})});document.querySelector('#new-task-button').onclick=()=>{if(!readOnly)document.querySelector('#new-task-form').classList.toggle('hidden')};document.querySelector('#cancel-new').onclick=()=>document.querySelector('#new-task-form').classList.add('hidden');document.querySelector('#new-task-form').onsubmit=e=>{e.preventDefault();write('/tasks',{title:document.querySelector('#title').value,board_id:project});e.target.reset();e.target.classList.add('hidden')};document.querySelector('#settings-button').onclick=()=>document.querySelector('#settings').classList.toggle('hidden');document.querySelector('#save-settings').onclick=()=>{sessionStorage.setItem('coord-board-token',token.value);sessionStorage.setItem('coord-board-agent',agent.value);document.querySelector('#settings').classList.add('hidden');load()};document.querySelector('#pause-button').onclick=()=>{paused=!paused;document.querySelector('#pause-button').textContent=paused?'Resume refresh':'Pause refresh';if(!paused)load()};document.querySelector('#feed-toggle').onclick=()=>{feedCollapsed=!feedCollapsed;document.querySelector('#feed').classList.toggle('hidden',feedCollapsed);document.querySelector('#feed-toggle').textContent=feedCollapsed?'Expand':'Collapse'};setInterval(()=>{document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});document.querySelectorAll('.task-time,.agent-meta,.feed-meta').forEach(()=>{});},1000);setInterval(load,5000);document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});load()
 </script></body></html>`;
 
@@ -4588,6 +4622,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return json({ error: "unauthorized" }, 401);
     }
     if (url.pathname === "/api/board/office/bootstrap") return issueOfficeBootstrap(request, env, auth);
+    if (url.pathname === "/api/board/office/link") return issueOfficeLink(request, env, auth);
     if (isOfficeSession(auth) && (request.method !== "GET" || url.pathname !== "/api/board/office-actions")) {
       return json({ error: "office session is restricted to GET office data" }, 403);
     }

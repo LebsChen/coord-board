@@ -116,7 +116,9 @@ function buildInitialAgents(): Agent[] {
       y: desk.seatY,
       state,
       currentTask:
-        state === 'working' || state === 'thinking' ? entry.task : undefined,
+        state === 'working' || state === 'thinking' || state === 'blocked' || state === 'done'
+          ? entry.task
+          : undefined,
       assignedDeskId: desk.id,
       facing: i % 2 === 0 ? 1 : -1,
       viewFacing: 'front',
