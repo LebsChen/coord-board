@@ -412,7 +412,7 @@ export class OfficeScene {
       style: { fontFamily: 'system-ui', fontSize: 11, fontWeight: '600', fill: 0x73777e, letterSpacing: 1.5 },
     })
     roomLabel.anchor.set(0.5, 1)
-    roomLabel.position.set(LEADER_ROOM.x + LEADER_ROOM.width / 2, LEADER_ROOM.y - 12)
+    roomLabel.position.set(LEADER_ROOM.x + LEADER_ROOM.width / 2, LEADER_ROOM.y - 28)
     map.addChild(roomLabel)
 
     for (const zone of PUBLIC_ZONES) {
@@ -428,7 +428,7 @@ export class OfficeScene {
       }
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 13, fill: zone.color } })
       label.anchor.set(0.5)
-      label.position.set(zone.x, zone.y - 133)
+      label.position.set(zone.x, zone.y - 125)
       map.addChild(label)
     }
 

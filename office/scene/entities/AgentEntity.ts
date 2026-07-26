@@ -182,7 +182,7 @@ export class AgentEntity extends Container {
       ? this.character.getHeadOffsetY()
       : -58
     const leaderAtDesk = this.agent.assignedDeskId === 'desk-0' && this.agent.state !== 'walking'
-    this.statusLabel.setBaselineY(leaderAtDesk ? -190 : -100)
+    this.statusLabel.setBaselineY(leaderAtDesk ? -189 : -100)
     this.statusLabel.layout(crownTopY)
     const labelTopY = this.statusLabel.getLabelTopY(crownTopY)
     const gapAboveLabel = 4
