@@ -6,5 +6,6 @@ owned by the project; no code, sprites, or other assets were copied from
 third-party office visualizations.
 
 The committed WebP files are optimized derivatives of the supplied PNG
-sources. Transparent workstation and character-sheet backgrounds were
-background-keyed during conversion; the showroom room plate remains opaque.
+sources. The workstation and character-sheet magenta backgrounds were keyed
+to real alpha with edge de-fringing during conversion; the showroom room
+plate remains opaque.
