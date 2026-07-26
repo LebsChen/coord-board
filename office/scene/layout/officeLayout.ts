@@ -1,26 +1,35 @@
 import type { Agent, AgentState, Desk } from '../../types/agent'
 
-export const SCENE_WIDTH = 960
-export const SCENE_HEIGHT = 640
+export const SCENE_WIDTH = 1120
+export const SCENE_HEIGHT = 760
 
 export const COLORS = {
-  floor: 0xffffff,
-  wall: 0xe8e6e1,
-  desk: 0xffffff,
+  floor: 0xf6f6f7,
+  wall: 0xe9eaec,
+  desk: 0xfdfdfd,
   deskShadow: 0x00000014,
-  monitor: 0x2a2a2a,
-  chair: 0xd4d2cc,
-  agentBody: 0x1a1a1a,
+  monitor: 0x171a1e,
+  chair: 0xe1e2e4,
+  agentBody: 0x131313,
 } as const
 
 /** 动态工位区 */
-const DESK_COL_GAP = 150
+const DESK_COL_GAP = 220
 const DESK_ROW_GAP = 220
 export const SEAT_OFFSET_Y = 45
+export const LEADER_ROOM = {
+  x: 44,
+  y: 72,
+  width: 290,
+  height: 300,
+  doorwayX: 334,
+  doorwayY: 222,
+} as const
+export const OPEN_AREA = { x: 430, y: 150, width: 620, height: 500 } as const
 export const PUBLIC_ZONES = [
-  { id: 'coffee' as const, label: 'Coffee', x: 120, y: 120, color: 0xd99b5f },
-  { id: 'workout' as const, label: 'Workout', x: 820, y: 120, color: 0x6eb5a5 },
-  { id: 'restroom' as const, label: 'Restroom', x: 820, y: 520, color: 0x8299c7 },
+  { id: 'coffee' as const, label: 'Coffee', x: 370, y: 145, color: 0xd99b5f },
+  { id: 'workout' as const, label: 'Workout', x: 370, y: 355, color: 0x6eb5a5 },
+  { id: 'restroom' as const, label: 'Restroom', x: 370, y: 565, color: 0x8299c7 },
 ] as const
 export type PublicZoneId = typeof PUBLIC_ZONES[number]['id']
 
@@ -51,14 +60,22 @@ export function selectPublicZone(
 
 export function buildDesks(count: number): Desk[] {
   const total = Math.max(1, count)
-  const columns = Math.max(1, Math.ceil(Math.sqrt(total)))
-  const rows = Math.max(1, Math.ceil(total / columns))
-  const blockWidth = (columns - 1) * DESK_COL_GAP
-  const blockHeight = (rows - 1) * DESK_ROW_GAP
-  const originX = (SCENE_WIDTH - blockWidth) / 2
-  const originY = (SCENE_HEIGHT - blockHeight) / 2
+  const workerCount = Math.max(0, total - 1)
+  const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(workerCount || 1))))
+  const rows = Math.max(1, Math.ceil((workerCount || 1) / columns))
+  const originX = OPEN_AREA.x + (OPEN_AREA.width - (columns - 1) * DESK_COL_GAP) / 2
+  const originY = OPEN_AREA.y + (OPEN_AREA.height - (rows - 1) * DESK_ROW_GAP) / 2
   const desks: Desk[] = []
-  let n = 0
+  desks.push({
+    id: 'desk-0',
+    x: LEADER_ROOM.x + LEADER_ROOM.width / 2,
+    y: LEADER_ROOM.y + LEADER_ROOM.height / 2 + 20,
+    seatX: LEADER_ROOM.x + LEADER_ROOM.width / 2,
+    seatY: LEADER_ROOM.y + LEADER_ROOM.height / 2 + 65,
+    isLeader: true,
+    room: 'leader',
+  })
+  let n = 1
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < columns && n < total; col++) {
       const x = originX + col * DESK_COL_GAP
@@ -69,6 +86,7 @@ export function buildDesks(count: number): Desk[] {
         y,
         seatX: x,
         seatY: y + SEAT_OFFSET_Y,
+        room: 'open',
       })
       n++
     }

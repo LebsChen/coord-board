@@ -10,6 +10,8 @@ import {
   SCENE_HEIGHT,
   SCENE_WIDTH,
   PUBLIC_ZONES,
+  LEADER_ROOM,
+  OPEN_AREA,
   publicZonePosition,
   selectPublicZone,
 } from './layout/officeLayout'
@@ -192,18 +194,22 @@ export class OfficeScene {
     const minX = Math.min(
       ...DESKS.map((desk) => desk.x - LABEL_WIDTH / 2),
       ...PUBLIC_ZONES.map((zone) => zone.x - 62),
+      LEADER_ROOM.x,
     ) - padding
     const maxX = Math.max(
       ...DESKS.map((desk) => desk.x + LABEL_WIDTH / 2),
       ...PUBLIC_ZONES.map((zone) => zone.x + 62),
+      LEADER_ROOM.x + LEADER_ROOM.width,
     ) + padding
     const minY = Math.min(
       ...DESKS.map((desk) => desk.y - 100 - LABEL_HEIGHT),
       ...PUBLIC_ZONES.map((zone) => zone.y - 38),
+      LEADER_ROOM.y,
     ) - padding
     const maxY = Math.max(
       ...DESKS.map((desk) => desk.y + 80),
       ...PUBLIC_ZONES.map((zone) => zone.y + 38),
+      LEADER_ROOM.y + LEADER_ROOM.height,
     ) + padding
     const contentWidth = maxX - minX
     const contentHeight = maxY - minY
@@ -366,11 +372,35 @@ export class OfficeScene {
     floor.rect(0, 0, SCENE_WIDTH, SCENE_HEIGHT)
     floor.fill(COLORS.floor)
     map.addChild(floor)
+    const openFloor = new Graphics()
+    openFloor.roundRect(OPEN_AREA.x - 54, OPEN_AREA.y - 74, OPEN_AREA.width + 108, OPEN_AREA.height + 130, 28)
+    openFloor.fill({ color: 0xffffff, alpha: 0.72 })
+    openFloor.stroke({ color: 0xe9eaec, width: 2, alpha: 0.7 })
+    map.addChild(openFloor)
+
+    const room = new Graphics()
+    room.roundRect(LEADER_ROOM.x, LEADER_ROOM.y, LEADER_ROOM.width, LEADER_ROOM.height, 18)
+    room.fill({ color: 0xffffff, alpha: 0.9 })
+    room.stroke({ color: 0xdfe1e4, width: 3, alpha: 0.9 })
+    room.rect(LEADER_ROOM.doorwayX - 4, LEADER_ROOM.doorwayY - 20, 12, 42)
+    room.fill(COLORS.floor)
+    map.addChild(room)
+    const roomLabel = new Text({
+      text: 'LEADER OFFICE',
+      style: { fontFamily: 'system-ui', fontSize: 11, fontWeight: '600', fill: 0x73777e, letterSpacing: 1.5 },
+    })
+    roomLabel.position.set(LEADER_ROOM.x + 20, LEADER_ROOM.y + 18)
+    map.addChild(roomLabel)
+
     for (const zone of PUBLIC_ZONES) {
       const zoneGfx = new Graphics()
-      zoneGfx.roundRect(zone.x - 62, zone.y - 38, 124, 76, 14)
-      zoneGfx.fill({ color: zone.color, alpha: 0.22 })
-      zoneGfx.stroke({ color: zone.color, alpha: 0.7, width: 2 })
+      zoneGfx.roundRect(zone.x - 62, zone.y - 38, 124, 76, 18)
+      zoneGfx.fill({ color: 0xffffff, alpha: 0.96 })
+      zoneGfx.stroke({ color: 0xe0e2e5, alpha: 1, width: 2 })
+      zoneGfx.ellipse(zone.x, zone.y + 10, 38, 12)
+      zoneGfx.fill({ color: zone.color, alpha: 0.12 })
+      zoneGfx.circle(zone.x - 26, zone.y - 10, 6)
+      zoneGfx.fill({ color: zone.color, alpha: 0.8 })
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 14, fill: zone.color } })
       label.anchor.set(0.5)
       label.position.set(zone.x, zone.y)
@@ -387,6 +417,24 @@ export class OfficeScene {
     for (const agent of this.agents) {
       if (agent.publicZone) occupied.set(agent.publicZone, (occupied.get(agent.publicZone) ?? 0) + 1)
     }
+    for (const agent of this.agents) {
+      if (!agent.publicZone || agent.targetX != null || agent.mission) continue
+      const elapsed = (this.zoneClock.get(agent.id) ?? 0) + 6
+      this.zoneClock.set(agent.id, elapsed)
+      if (elapsed < 18) continue
+      const desk = DESKS.find((item) => item.id === agent.assignedDeskId)
+      if (desk) {
+        this.agents = this.agents.map((item) => item.id === agent.id
+          ? {
+              ...MovementSystem.assignWalkPath(item, [{ x: desk.seatX, y: desk.seatY }]),
+              publicZone: undefined,
+            }
+          : item)
+        this.zoneClock.delete(agent.id)
+        this.pushDataToEntities()
+      }
+    }
+
     const candidates = this.agents.filter((agent) =>
       (agent.authoritativeState ?? agent.state) === 'idle' &&
       !agent.mission &&
@@ -396,23 +444,7 @@ export class OfficeScene {
     const candidate = candidates.length
       ? candidates[this.idleVisitSequence % candidates.length]
       : undefined
-    if (!candidate) {
-      for (const agent of this.agents) {
-        if (!agent.publicZone) continue
-        const elapsed = (this.zoneClock.get(agent.id) ?? 0) + 6
-        this.zoneClock.set(agent.id, elapsed)
-        if (elapsed < 12) continue
-        const desk = DESKS.find((item) => item.id === agent.assignedDeskId)
-        if (desk) {
-          this.agents = this.agents.map((item) => item.id === agent.id
-            ? { ...MovementSystem.assignWalkPath(item, [{ x: desk.seatX, y: desk.seatY }]), publicZone: undefined }
-            : item)
-          this.zoneClock.delete(agent.id)
-          this.pushDataToEntities()
-        }
-      }
-      return
-    }
+    if (!candidate) return
     const selectedZone = selectPublicZone(this.idleVisitSequence, occupied)
     if (!selectedZone) return
     const zone = PUBLIC_ZONES.find((entry) => entry.id === selectedZone.id)!

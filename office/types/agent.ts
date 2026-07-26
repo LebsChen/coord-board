@@ -64,5 +64,7 @@ export interface Desk {
   y: number
   seatX: number
   seatY: number
+  isLeader?: boolean
+  room?: 'leader' | 'open'
   occupiedBy?: string
 }

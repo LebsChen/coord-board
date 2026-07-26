@@ -7,13 +7,13 @@ import {
 } from '../systems/deskDepthSort'
 
 const STYLE = {
-  shadow: { color: 0x3d4f6e, alpha: 0.1 },
-  deskTop: 0xfaf8f4,
-  deskEdge: 0xe8e0d4,
-  deskStroke: 0xd8d0c4,
-  chairDark: 0x556b7d,
-  chair: 0x7a8fa3,
-  chairWheel: 0x3d4a56,
+  shadow: { color: 0x000000, alpha: 0.09 },
+  deskTop: 0xfdfdfd,
+  deskEdge: 0xededee,
+  deskStroke: 0xe0e1e3,
+  chairDark: 0xbfc2c6,
+  chair: 0xe7e8ea,
+  chairWheel: 0xb8bbc0,
   monitor: 0x2e3238,
   screenTop: 0x7ec8ff,
   screenBottom: 0x4a8fd9,
@@ -84,7 +84,9 @@ export class DeskEntity {
   private drawShadow() {
     const g = this.shadowGfx
     g.clear()
-    g.ellipse(0, SEAT_OFFSET_Y + 20, 54, 14)
+    g.ellipse(3, SEAT_OFFSET_Y + 24, 78, 21)
+    g.fill({ color: STYLE.shadow.color, alpha: 0.035 })
+    g.ellipse(0, SEAT_OFFSET_Y + 19, 58, 14)
     g.fill(STYLE.shadow)
   }
 
@@ -114,13 +116,17 @@ export class DeskEntity {
   private drawDeskFallback() {
     const g = new Graphics()
 
-    g.roundRect(-46, -6, 92, 34, 10)
+    const width = this.desk.isLeader ? 132 : 98
+    const half = width / 2
+    g.roundRect(-half, -6, width, 38, 12)
     g.fill(STYLE.deskTop)
     g.stroke({ color: STYLE.deskStroke, width: 1.5, alpha: 0.55 })
-    g.roundRect(-44, 22, 88, 8, 4)
+    g.roundRect(-half + 3, 29, width - 6, 9, 4)
     g.fill(STYLE.deskEdge)
 
-    g.roundRect(-22, -48, 44, 30, 6)
+    const monitorWidth = this.desk.isLeader ? 58 : 46
+    const monitorHalf = monitorWidth / 2
+    g.roundRect(-monitorHalf, -56, monitorWidth, 34, 6)
     g.fill(STYLE.monitor)
 
     const screenGrad = new FillGradient({
@@ -133,7 +139,7 @@ export class DeskEntity {
       ],
       textureSpace: 'local',
     })
-    g.roundRect(-18, -44, 36, 22, 4)
+    g.roundRect(-monitorHalf + 4, -52, monitorWidth - 8, 24, 4)
     g.fill(screenGrad)
 
     g.roundRect(-20, 0, 40, 8, 4)

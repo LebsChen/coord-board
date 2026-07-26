@@ -33,6 +33,7 @@ export class OfficeSimulator {
     return agents.map((agent) => {
       if (agentHasActiveMission(agent)) return agent
       if (agent.targetX != null || agent.walkPath != null) return agent
+      if (agent.publicZone) return agent
 
       const desk = this.deskFor(agent)
       const roster = AGENT_ROSTER.find((r) => r.id === agent.id)

@@ -11,7 +11,8 @@ const projectId = params.get('project')?.trim() ?? ''
 app.innerHTML = `
   <section class="shell">
     <header><div><strong>Coord Board Office</strong><span id="project"></span></div><div><span id="connection">Signed out</span><button id="sign-out" class="hidden" type="button">Sign out</button></div></header>
-    <div id="auth" class="card">
+    <div id="loading" class="card"><p>Checking office session…</p></div>
+    <div id="auth" class="card hidden">
       <h1>Open a project office</h1>
       <p>Paste a read-only project share token. It is exchanged for a short-lived secure session and is not saved.</p>
       <form id="token-form"><input id="token" type="password" autocomplete="off" placeholder="Read-only share token" required /><button>Open office</button></form>
@@ -19,13 +20,14 @@ app.innerHTML = `
     </div>
     <div id="office" class="hidden">
       <section class="scene-wrap"><div id="scene"></div></section>
-      <aside class="card"><h2>Activity</h2><div id="status"></div><ol id="events"></ol></aside>
+      <aside class="card"><h2>Activity <span id="event-count">0</span></h2><div id="status"></div><ol id="events"></ol></aside>
     </div>
   </section>
 `
 document.querySelector('#project')!.textContent = projectId ? ` · ${projectId}` : ''
 
 const auth = document.querySelector<HTMLDivElement>('#auth')!
+const loading = document.querySelector<HTMLDivElement>('#loading')!
 const office = document.querySelector<HTMLDivElement>('#office')!
 const status = document.querySelector<HTMLDivElement>('#status')!
 const events = document.querySelector<HTMLOListElement>('#events')!
@@ -73,7 +75,7 @@ async function officeFeed(): Promise<OfficeFeed> {
 
 function renderFeed(feed: OfficeFeed): void {
   const stateByAgent = new Map(feed.states.map((item) => [item.agentId, item]))
-  status.textContent = `${feed.roster.length} agents · ${feed.visits.length} recent visits`
+  status.textContent = `${feed.roster.length} agents · ${activityLog.length} activity events`
   const names = new Map(feed.roster.map((agent) => [agent.agentId, agent.name]))
   for (const state of feed.states) {
     const signature = `${state.state}:${state.task ?? ''}`
@@ -87,6 +89,7 @@ function renderFeed(feed: OfficeFeed): void {
     if (!activityLog.includes(message)) activityLog.unshift(message)
   }
   events.innerHTML = activityLog.slice(0, 40).map((entry) => `<li>${escapeHtml(entry)}</li>`).join('')
+  document.querySelector('#event-count')!.textContent = String(Math.min(activityLog.length, 40))
 }
 
 function escapeHtml(value: string): string {
@@ -127,7 +130,16 @@ async function start(): Promise<void> {
   const bootstrap = fragment.get('bootstrap')
   if (bootstrap) {
     history.replaceState(null, '', `${location.pathname}${location.search}`)
-    if (await exchangeBootstrap(bootstrap)) await openOffice()
+    try {
+      if (await exchangeBootstrap(bootstrap)) await openOffice()
+      else auth.classList.remove('hidden')
+    } catch (reason) {
+      document.querySelector<HTMLParagraphElement>('#auth-error')!.textContent =
+        reason instanceof Error ? reason.message : 'Unable to open office'
+      auth.classList.remove('hidden')
+    } finally {
+      loading.classList.add('hidden')
+    }
     return
   }
   try {
@@ -137,6 +149,9 @@ async function start(): Promise<void> {
       document.querySelector<HTMLParagraphElement>('#auth-error')!.textContent =
         reason instanceof Error ? reason.message : 'Unable to load office'
     }
+    auth.classList.remove('hidden')
+  } finally {
+    loading.classList.add('hidden')
   }
 }
 
