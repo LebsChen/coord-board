@@ -59,7 +59,7 @@ export class DeskEntity {
       Math.abs(agent.y - this.desk.seatY) < 32,
     )
     const deskZ = nearby
-      ? this.desk.y + 100
+      ? this.desk.y + 30
       : computeDeskLayerZ(this.desk, agentPositions)
     const chairZ = computeChairLayerZ(
       this.desk,
@@ -68,9 +68,9 @@ export class DeskEntity {
     )
     this.deskLayer.zIndex = deskZ
     this.shadowGfx.zIndex = deskZ - 0.5
-    this.chairLayer.zIndex = nearby ? this.desk.y + 20 : chairZ
+    this.chairLayer.zIndex = nearby ? this.desk.y + 18 : chairZ
     this.occupiedIndicator.zIndex = chairZ + 0.5
-    this.screenAccent.zIndex = this.deskLayer.zIndex + 1
+    this.screenAccent.zIndex = this.deskLayer.zIndex + 12
   }
 
   setOccupied(occupied: boolean) {
@@ -85,9 +85,9 @@ export class DeskEntity {
   setScreenAccent(color?: number, alpha = 0.9) {
     this.screenAccent.clear()
     if (color == null) return
-    const width = this.desk.isLeader ? 58 : 54
-    const height = this.desk.isLeader ? 30 : 28
-    this.screenAccent.roundRect(-width / 2, -43, width, height, 3)
+    const width = this.desk.isLeader ? 48 : 44
+    const height = this.desk.isLeader ? 25 : 23
+    this.screenAccent.roundRect(-width / 2, -45, width, height, 3)
     this.screenAccent.fill({ color, alpha: Math.min(1, alpha) })
   }
 

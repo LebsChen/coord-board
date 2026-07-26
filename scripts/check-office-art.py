@@ -22,7 +22,15 @@ for name in ASSETS:
         alpha > 220 and max(red, green, blue) - min(red, green, blue) <= 12
         for red, green, blue, alpha in pixels
     )
+    magenta = sum(
+        alpha > 12
+        and red > green * 1.3
+        and blue > green * 1.3
+        and red > 100
+        for red, green, blue, alpha in pixels
+    )
     assert transparent > 0, f"{name}: missing real transparent pixels"
     assert neutral > len(pixels) * 0.15, f"{name}: surviving art is not neutral"
+    assert magenta == 0, f"{name}: surviving magenta-dominant pixels"
 
 print(f"checked {len(ASSETS)} keyed Office assets")
