@@ -29,6 +29,7 @@ export class DeskEntity {
   readonly deskId: string
   readonly shadowGfx = new Graphics()
   readonly deskLayer = new Container()
+  readonly deskFrontLayer = new Container()
   readonly chairLayer = new Container()
   readonly occupiedIndicator = new Graphics()
   readonly screenAccent = new Graphics()
@@ -42,6 +43,7 @@ export class DeskEntity {
     for (const part of [
       this.shadowGfx,
       this.deskLayer,
+      this.deskFrontLayer,
       this.chairLayer,
       this.occupiedIndicator,
       this.screenAccent,
@@ -61,6 +63,7 @@ export class DeskEntity {
       CHAIR_DEPTH_AHEAD,
     )
     this.deskLayer.zIndex = deskZ
+    this.deskFrontLayer.zIndex = this.desk.seatY + 1
     this.shadowGfx.zIndex = deskZ - 0.5
     this.chairLayer.zIndex = chairZ
     this.occupiedIndicator.zIndex = chairZ + 0.5
@@ -75,12 +78,13 @@ export class DeskEntity {
     }
   }
 
-  setScreenAccent(color: number, alpha = 0.9) {
+  setScreenAccent(color?: number, alpha = 0.9) {
     this.screenAccent.clear()
-    const width = this.desk.isLeader ? 34 : 27
-    const height = this.desk.isLeader ? 18 : 14
-    this.screenAccent.roundRect(-width / 2, -53, width, height, 3)
-    this.screenAccent.fill({ color, alpha })
+    if (color == null) return
+    const width = this.desk.isLeader ? 58 : 48
+    const height = this.desk.isLeader ? 26 : 22
+    this.screenAccent.roundRect(-width / 2, -95, width, height, 4)
+    this.screenAccent.fill({ color, alpha: Math.min(1, alpha) })
   }
 
   getSeatPosition() {
@@ -93,9 +97,19 @@ export class DeskEntity {
       const workstation = new Sprite(texture)
       workstation.anchor.set(0.5, 0.68)
       workstation.position.set(0, SEAT_OFFSET_Y - 6)
-      const targetWidth = this.desk.isLeader ? 190 : 150
+      workstation.alpha = 1
+      const targetWidth = this.desk.isLeader ? 270 : 220
       workstation.scale.set(targetWidth / texture.width)
-      this.deskLayer.addChild(workstation)
+      this.deskLayer.addChild(workstation, this.screenAccent)
+      const front = new Sprite(texture)
+      front.anchor.copyFrom(workstation.anchor)
+      front.position.copyFrom(workstation.position)
+      front.scale.copyFrom(workstation.scale)
+      const mask = new Graphics()
+      mask.rect(-110, -18, 220, 72)
+      mask.fill(0xffffff)
+      front.mask = mask
+      this.deskFrontLayer.addChild(front, mask)
     } else {
       this.drawDeskFallback()
       this.drawChairFallback()

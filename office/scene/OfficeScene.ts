@@ -331,7 +331,18 @@ export class OfficeScene {
     for (const agent of this.agents) {
       if (!agent.assignedDeskId) continue
       const desk = this.deskEntities.get(agent.assignedDeskId)
-      if (desk) desk.setScreenAccent(screenColors[agent.state] ?? screenColors.idle)
+      if (desk) {
+        desk.setScreenAccent(
+          agent.state === 'idle' || agent.publicZone
+            ? undefined
+            : screenColors[agent.state] ?? screenColors.idle,
+        )
+      }
+    }
+    for (const desk of this.deskEntities.values()) {
+      if (!this.agents.some((agent) => agent.assignedDeskId === desk.deskId)) {
+        desk.setScreenAccent(undefined)
+      }
     }
   }
 
@@ -354,7 +365,7 @@ export class OfficeScene {
         entity.deskLayer,
         entity.chairLayer,
         entity.occupiedIndicator,
-        entity.screenAccent,
+        entity.deskFrontLayer,
       )
     }
 
@@ -405,7 +416,7 @@ export class OfficeScene {
     for (const zone of PUBLIC_ZONES) {
       const label = new Text({ text: zone.label, style: { fontFamily: 'system-ui', fontSize: 14, fill: zone.color } })
       label.anchor.set(0.5)
-      label.position.set(zone.x, zone.y)
+      label.position.set(zone.x, zone.y - 24)
       map.addChild(label)
     }
 

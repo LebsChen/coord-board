@@ -34,8 +34,8 @@ export const PUBLIC_ZONES = [
 export type PublicZoneId = typeof PUBLIC_ZONES[number]['id']
 
 const PUBLIC_ZONE_OFFSETS = [
-  { x: -18, y: -14 },
-  { x: 18, y: 14 },
+  { x: -18, y: 6 },
+  { x: 18, y: 6 },
 ] as const
 
 export function publicZonePosition(zoneId: PublicZoneId, slot: number): { x: number; y: number } {
