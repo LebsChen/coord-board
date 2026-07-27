@@ -263,7 +263,7 @@ export class OfficeScene {
 
     this.animation.update(this.agentEntities, dt)
     this.sortOfficeDepth()
-    this.syncDeskOccupancy()
+    this.syncDeskVisuals()
 
   }
 
@@ -317,15 +317,7 @@ export class OfficeScene {
     })
   }
 
-  private syncDeskOccupancy() {
-    const occupied = new Set(
-      this.agents
-        .filter((a) => a.state === 'working' && a.assignedDeskId)
-        .map((a) => a.assignedDeskId!),
-    )
-    for (const desk of this.deskEntities.values()) {
-      desk.setOccupied(occupied.has(desk.deskId))
-    }
+  private syncDeskVisuals() {
     const screenColors: Record<AgentState, number> = {
       idle: 0xb9bec5,
       walking: 0x92a9bf,
@@ -371,7 +363,6 @@ export class OfficeScene {
         entity.shadowGfx,
         entity.deskLayer,
         entity.chairLayer,
-        entity.occupiedIndicator,
         entity.screenAccent,
       )
     }

@@ -30,7 +30,6 @@ export class DeskEntity {
   readonly shadowGfx = new Graphics()
   readonly deskLayer = new Container()
   readonly chairLayer = new Container()
-  readonly occupiedIndicator = new Graphics()
   readonly screenAccent = new Graphics()
 
   private desk: Desk
@@ -43,7 +42,6 @@ export class DeskEntity {
       this.shadowGfx,
       this.deskLayer,
       this.chairLayer,
-      this.occupiedIndicator,
       this.screenAccent,
     ]) {
       part.position.set(desk.x, desk.y)
@@ -69,17 +67,7 @@ export class DeskEntity {
     this.deskLayer.zIndex = deskZ
     this.shadowGfx.zIndex = deskZ - 0.5
     this.chairLayer.zIndex = nearby ? this.desk.y + 18 : chairZ
-    this.occupiedIndicator.zIndex = chairZ + 0.5
     this.screenAccent.zIndex = this.desk.y + 110
-  }
-
-  setOccupied(occupied: boolean) {
-    this.occupiedIndicator.clear()
-    if (occupied) {
-      this.occupiedIndicator.circle(0, SEAT_OFFSET_Y - 4, 5.5)
-      this.occupiedIndicator.fill({ color: 0x50b86c, alpha: 0.85 })
-      this.occupiedIndicator.stroke({ color: 0xffffff, width: 1.5, alpha: 0.6 })
-    }
   }
 
   setScreenAccent(color?: number, alpha = 0.9) {

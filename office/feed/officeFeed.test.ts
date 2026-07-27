@@ -30,6 +30,7 @@ describe('office feed adapter', () => {
     expect(convertOfficeVisits([
       { visitorAgentId: 'a', hostAgentId: 'b', message: 'sync', at: 'now' },
       { visitorAgentId: 'a', hostAgentId: 'missing', message: 'drop', at: 'now' },
+      { visitorAgentId: 'a', hostAgentId: 'a', message: 'self', at: 'now' },
     ], map)).toEqual([{ visitor: 1, host: 2, message: 'sync' }])
   })
 })

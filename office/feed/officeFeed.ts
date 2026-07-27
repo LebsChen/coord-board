@@ -48,6 +48,7 @@ export function convertOfficeVisits(
   rosterMap: Map<string, number>,
 ): Array<{ visitor: number; host: number; message: string }> {
   return visits.flatMap((visit) => {
+    if (visit.visitorAgentId === visit.hostAgentId) return []
     const visitor = rosterMap.get(visit.visitorAgentId)
     const host = rosterMap.get(visit.hostAgentId)
     return visitor && host && visitor !== host

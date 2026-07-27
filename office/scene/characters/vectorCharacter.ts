@@ -66,10 +66,11 @@ export class VectorCharacter extends Container {
     const texture = getAgentFrame(frame)
     if (texture) this.sprite.texture = texture
     const seated = frame === 3
-    const scale = seated ? 0.18 : 0.22
+    const scale = seated ? 0.18 : this.inZone ? 0.19 : 0.22
     this.sprite.scale.set(scale * this.direction, scale)
     this.sprite.position.y = seated ? 0 : 0
     this.identityBand.scale.set(1)
-    this.identityBand.position.set(0, seated ? -55 : -45)
+    const neckY = -(this.sprite.texture.height * this.sprite.anchor.y * scale) + 22
+    this.identityBand.position.set(0, seated ? -55 : neckY)
   }
 }

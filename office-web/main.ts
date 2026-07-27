@@ -85,6 +85,7 @@ function renderFeed(feed: OfficeFeed): void {
     }
   }
   for (const visit of feed.visits.slice(-10)) {
+    if (visit.visitorAgentId === visit.hostAgentId) continue
     const message = `${names.get(visit.visitorAgentId) ?? visit.visitorAgentId} → ${names.get(visit.hostAgentId) ?? visit.hostAgentId}${visit.message ? `: ${visit.message}` : ''}`
     if (!activityLog.includes(message)) activityLog.unshift(message)
   }
