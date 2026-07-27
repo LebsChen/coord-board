@@ -35,6 +35,7 @@ ALTER TABLE task_item ADD COLUMN spawn_status TEXT CHECK (spawn_status IN ('requ
 CREATE INDEX IF NOT EXISTS idx_task_spawn ON task_item(spawn_status, phase, board_id);
 ALTER TABLE project ADD COLUMN leader_agent_id TEXT;
 ALTER TABLE project ADD COLUMN spawn_budget_max INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE project ADD COLUMN spawn_used INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE task_item ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0 CHECK (needs_human IN (0, 1));
 ALTER TABLE task_item ADD COLUMN watchdog_status TEXT;
 CREATE INDEX IF NOT EXISTS idx_task_needs_human ON task_item(board_id, needs_human, deleted_at);
@@ -57,5 +58,6 @@ CREATE INDEX IF NOT EXISTS idx_message_project_created ON message(project_id, cr
 CREATE INDEX IF NOT EXISTS idx_message_sender_created ON message(sender_agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_delivery_recipient_status ON message_delivery(recipient_agent_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_delivery_project_status ON message_delivery(project_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_project_spawn_budget ON project(spawn_budget_max, spawn_used);
 `;
 export default schema;

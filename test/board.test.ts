@@ -241,8 +241,8 @@ describe("coord board", () => {
     fetchMock.mockRestore();
     const oldAgent = await env.DB.prepare("SELECT status, token_revoked_at FROM agent WHERE id = ?")
       .bind("failover-agent").first<{ status: string; token_revoked_at: string | null }>();
-    const updatedTask = await env.DB.prepare("SELECT lease_generation, lease_owner FROM task_item WHERE id = ?")
-      .bind(task.body.id).first<{ lease_generation: number; lease_owner: string | null }>();
+    const updatedTask = await env.DB.prepare("SELECT lease_generation, lease_owner, assignee_agent_id FROM task_item WHERE id = ?")
+      .bind(task.body.id).first<{ lease_generation: number; lease_owner: string | null; assignee_agent_id: string | null }>();
     const replacement = await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM agent WHERE project_id = ? AND id <> ?",
     ).bind("failover-project", "failover-agent").first<{ count: number }>();
@@ -250,8 +250,61 @@ describe("coord board", () => {
     expect(oldAgent?.token_revoked_at).toBeTruthy();
     expect(updatedTask?.lease_generation).toBe(5);
     expect(updatedTask?.lease_owner).toBeNull();
+    expect(updatedTask?.assignee_agent_id).not.toBe("failover-agent");
     expect(Number(replacement?.count)).toBe(1);
     expect((await env.DB.prepare("SELECT status FROM backup_account WHERE id = ?").bind("failover-a").first<{ status: string }>())?.status).toBe("active");
+    const replacementId = String(updatedTask?.assignee_agent_id);
+    const claimed = await call(`/api/board/tasks/${task.body.id}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: replacementId }),
+    });
+    expect(claimed.response.status).toBe(200);
+    expect(claimed.body.lease_owner).toBe(replacementId);
+  });
+
+  it("fails over every stale task owned by one agent", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "multi-failover-project", name: "Multi Failover" }) });
+    for (const suffix of ["a", "b"]) {
+      await call("/api/board/backup-accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: "multi-failover-project",
+          id: `multi-failover-backup-${suffix}`,
+          role_tag: "worker",
+          org_id: "org-multi-failover",
+          credential: `multi-failover-secret-${suffix}`,
+        }),
+      });
+    }
+    await call("/api/board/failover-config", {
+      method: "POST",
+      body: JSON.stringify({ project_id: "multi-failover-project", failover_enabled: true, max_replacements: 4 }),
+    });
+    await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "multi-failover-agent", project_id: "multi-failover-project", name: "Stale", role: "worker" }),
+    });
+    const tasks = await Promise.all(["a", "b"].map((suffix) => call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "multi-failover-project", title: `Task ${suffix}`, assignee_agent_id: "multi-failover-agent" }),
+    })));
+    for (const task of tasks) {
+      await env.DB.prepare(
+        "UPDATE task_item SET phase = 'in_progress', lease_owner = ?, lease_generation = 1 WHERE id = ?",
+      ).bind("multi-failover-agent", task.body.id).run();
+    }
+    await env.DB.prepare("UPDATE agent SET last_seen_at = ?, status = 'online' WHERE id = ?")
+      .bind("2000-01-01T00:00:00.000Z", "multi-failover-agent").run();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({ session_id: "multi-failover-session" }), { status: 200 }));
+    await worker.scheduled({} as ScheduledEvent, env);
+    fetchMock.mockRestore();
+    expect(Number((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM failover_replacement WHERE project_id = ? AND status = 'created'",
+    ).bind("multi-failover-project").first<{ count: number }>())?.count)).toBe(2);
+    expect(Number((await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM task_item WHERE board_id = ? AND assignee_agent_id <> ?",
+    ).bind("multi-failover-project", "multi-failover-agent").first<{ count: number }>())?.count)).toBe(2);
   });
 
   it("releases a reserved account when Devin session creation fails", async () => {
@@ -427,6 +480,33 @@ describe("coord board", () => {
     const first = await call("/api/board/tasks", init);
     const second = await call("/api/board/tasks", init);
     expect(first.body.id).toBe(second.body.id);
+  });
+
+  it("scopes project and provision idempotency keys by project identity", async () => {
+    const projectA = await call("/api/board/projects", {
+      method: "POST",
+      headers: { "idempotency-key": "same-project-key" },
+      body: JSON.stringify({ id: "same-key-project-a", name: "A" }),
+    });
+    const projectB = await call("/api/board/projects", {
+      method: "POST",
+      headers: { "idempotency-key": "same-project-key" },
+      body: JSON.stringify({ id: "same-key-project-b", name: "B" }),
+    });
+    expect(projectA.response.status).toBe(201);
+    expect(projectB.response.status).toBe(201);
+    const provisionA = await call("/api/board/provision", {
+      method: "POST",
+      headers: { "idempotency-key": "same-provision-key" },
+      body: JSON.stringify({ project: { id: "same-provision-a", name: "A" } }),
+    });
+    const provisionB = await call("/api/board/provision", {
+      method: "POST",
+      headers: { "idempotency-key": "same-provision-key" },
+      body: JSON.stringify({ project: { id: "same-provision-b", name: "B" } }),
+    });
+    expect(provisionA.response.status).toBe(201);
+    expect(provisionB.response.status).toBe(201);
   });
 
   it("reclaims expired leases without a claim-time sweep", async () => {
@@ -1073,12 +1153,14 @@ describe("coord board", () => {
     });
     const lifecycleTaskId = String(lifecycleTask.body.id);
     expect((await call(`/api/board/tasks/${lifecycleTaskId}/claim`, { method: "POST" }, developerToken)).response.status).toBe(200);
-    expect((await call("/api/board/agents/phase4-developer/idle", { method: "POST" }, developerToken)).response.status).toBe(200);
+    const idle = await call("/api/board/agents/phase4-developer/idle", { method: "POST" }, developerToken);
+    expect(idle.response.status).toBe(200);
+    expect(idle.body.released_leases).toBe(1);
     const deniedLifecycle = await call("/api/board/agents/phase4-tester/shutdown", { method: "POST" }, developerToken);
     expect(deniedLifecycle.response.status).toBe(403);
     const shutdown = await call("/api/board/agents/phase4-developer/shutdown", { method: "POST" }, developerToken);
     expect(shutdown.response.status).toBe(200);
-    expect(shutdown.body.released_leases).toBe(1);
+    expect(shutdown.body.released_leases).toBe(0);
     expect((await call(`/api/board/tasks/${lifecycleTaskId}/claim`, { method: "POST" }, testerToken)).response.status).toBe(200);
     expect((await call("/api/board/agents/phase4-tester/shutdown", { method: "POST" }, leadToken)).response.status).toBe(200);
 
@@ -1574,6 +1656,43 @@ describe("coord board", () => {
     expect(after.body.lease_generation).toBe(generation);
   });
 
+  it("rejects stale lease generations for completion, release, and plan submission", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "lease-generation-project", name: "Lease Generation" }),
+    });
+    expect(project.response.status).toBe(201);
+    const agent = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "lease-generation-agent", project_id: "lease-generation-project", name: "Worker", role: "developer" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "lease-generation-project", title: "generation task" }),
+    });
+    const claimed = await call(`/api/board/tasks/${task.body.id}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: agent.body.id, lease_seconds: 120 }),
+    });
+    const generation = Number(claimed.body.lease_generation);
+    await env.DB.prepare("UPDATE task_item SET lease_generation = lease_generation + 1 WHERE id = ?").bind(task.body.id).run();
+    const complete = await call(`/api/board/tasks/${task.body.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: agent.body.id, lease_generation: generation }),
+    }, String(agent.body.token));
+    expect(complete.response.status).toBe(409);
+    const release = await call(`/api/board/tasks/${task.body.id}/release`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: agent.body.id, lease_generation: generation }),
+    }, String(agent.body.token));
+    expect(release.response.status).toBe(409);
+    const plan = await call(`/api/board/tasks/${task.body.id}/plan`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: agent.body.id, lease_generation: generation, plan: "stale plan" }),
+    }, String(agent.body.token));
+    expect(plan.response.status).toBe(409);
+  });
+
   it("does not reclaim an unexpired lease when the agent is stale", async () => {
     const created = await call("/api/board/tasks", {
       method: "POST",
@@ -1641,6 +1760,39 @@ describe("coord board", () => {
     });
     expect(crossProject.response.status).toBe(422);
     expect((await call(`/api/board/tasks/${taskId}`)).body.assignee_agent_id).toBeNull();
+  });
+
+  it("clears and generations-bumps an active lease when PATCH changes assignee", async () => {
+    const project = await call("/api/board/projects", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-lease-project", name: "Patch Lease" }),
+    });
+    expect(project.response.status).toBe(201);
+    const first = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-lease-first", project_id: "patch-lease-project", name: "First", role: "worker" }),
+    });
+    const second = await call("/api/board/agents", {
+      method: "POST",
+      body: JSON.stringify({ id: "patch-lease-second", project_id: "patch-lease-project", name: "Second", role: "worker" }),
+    });
+    const task = await call("/api/board/tasks", {
+      method: "POST",
+      body: JSON.stringify({ board_id: "patch-lease-project", title: "patch lease" }),
+    });
+    const claimed = await call(`/api/board/tasks/${task.body.id}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: first.body.id, lease_seconds: 120 }),
+    });
+    const beforeGeneration = Number(claimed.body.lease_generation);
+    const patched = await call(`/api/board/tasks/${task.body.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ assignee_agent_id: second.body.id }),
+    });
+    expect(patched.response.status).toBe(200);
+    expect(patched.body.lease_owner).toBeNull();
+    expect(patched.body.lease_expires_at).toBeNull();
+    expect(patched.body.lease_generation).toBe(beforeGeneration + 1);
   });
 
   it("rejects completion without an active lease for a worker", async () => {
@@ -2598,6 +2750,18 @@ describe("coord board", () => {
     expect(devin.seen.some((e) => e.includes("devin-sleep"))).toBe(false);
   });
 
+  it("does not mark a worker leader-slept when sleep delivery fails", async () => {
+    await call("/api/board/projects", { method: "POST", body: JSON.stringify({ id: "sleep-failure-project", name: "Sleep Failure" }) });
+    const { taskId, agentId } = await seedSpawnedTask("sleep-failure-project", { session: "devin-sleep-failure", account: "sleep-failure-acct" });
+    const devin = withDevin(() => new Response("failed", { status: 503 }));
+    const slept = await call(`/api/board/tasks/${taskId}/sleep`, { method: "POST", body: JSON.stringify({}) });
+    devin.restore();
+    expect(slept.response.status).toBe(502);
+    expect(slept.body.delivered).toBe(false);
+    const agent = await env.DB.prepare("SELECT metadata_json FROM agent WHERE id = ?").bind(agentId).first<{ metadata_json: string }>();
+    expect(JSON.parse(agent!.metadata_json).leader_sleep).toBeUndefined();
+  });
+
   it("budget breaker stops spawning once the project spawn budget is consumed", async () => {
     await call("/api/board/provision", {
       method: "POST",
@@ -2616,6 +2780,7 @@ describe("coord board", () => {
     await env.DB.prepare(
       "INSERT INTO task_event(id, task_id, actor_agent_id, event_type, payload_json, created_at) VALUES (?, ?, NULL, 'spawn_created', ?, ?)",
     ).bind(`evt-${Math.random().toString(36).slice(2)}`, taskId, JSON.stringify({ project_id: "budget-project" }), nowForTest()).run();
+    await env.DB.prepare("UPDATE project SET spawn_used = spawn_used + 1 WHERE id = ?").bind("budget-project").run();
     const devin = withDevin(() => new Response(JSON.stringify({ session_id: "should-not-happen" }), { status: 200 }));
     await worker.scheduled({} as ScheduledEvent, env);
     devin.restore();

@@ -381,6 +381,14 @@ function checkAgentIdentity(body: Json, auth: Auth): Response | null {
   return null;
 }
 
+function requestedLeaseGeneration(body: Json): number | null | Response {
+  if (body.lease_generation === undefined) return null;
+  const value = Number(body.lease_generation);
+  return Number.isInteger(value) && value >= 0
+    ? value
+    : json({ error: "lease_generation must be a non-negative integer" }, 400);
+}
+
 function projectAllowed(auth: Auth, projectId: string): boolean {
   return isAdmin(auth) || auth.projectId === projectId;
 }
@@ -1211,10 +1219,7 @@ async function runCloudFailover(
          AND a.project_id = ? AND a.last_seen_at IS NOT NULL AND a.last_seen_at <= ?
          AND a.status NOT IN ('shutdown')`,
     ).bind(project.id, project.id, staleBefore).all<StaleFailoverCandidate>();
-    const seenAgents = new Set<string>();
     for (const candidate of candidates.results) {
-      if (seenAgents.has(candidate.agent_id)) continue;
-      seenAgents.add(candidate.agent_id);
       const maxReplacements = Math.max(
         1,
         Number(project.failover_max_replacements) || DEFAULT_FAILOVER_MAX_REPLACEMENTS,
@@ -1281,8 +1286,10 @@ async function runCloudFailover(
           "UPDATE failover_replacement SET session_id = ?, status = 'created', updated_at = ? WHERE id = ? AND status = 'reserved'",
         ).bind(sessionId, timestamp, quotaReservation).run();
         const releaseReservationLease = await db.prepare(
-          "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND lease_owner = ? AND lease_generation = ?",
-        ).bind(timestamp, candidate.task_id, project.id, reservationLeaseOwner, generation).run();
+          `UPDATE task_item
+           SET assignee_agent_id = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+           WHERE id = ? AND board_id = ? AND lease_owner = ? AND lease_generation = ?`,
+        ).bind(replacement.id, timestamp, candidate.task_id, project.id, reservationLeaseOwner, generation).run();
         if ((releaseReservationLease.meta.changes ?? 0) !== 1) throw new Error("task lease changed while finalizing failover");
         await db.prepare(
           "UPDATE agent SET metadata_json = json_set(metadata_json, '$.session_id', ?), updated_at = ? WHERE id = ? AND project_id = ?",
@@ -1449,6 +1456,29 @@ async function reconcileStaleSpawns(db: D1Database, env: Env, timestamp: string)
   }
 }
 
+async function reserveSpawnBudget(
+  db: D1Database,
+  projectId: string,
+): Promise<{ reserved: boolean; max: number; used: number }> {
+  const result = await db.prepare(
+    `UPDATE project
+     SET spawn_used = spawn_used + 1
+     WHERE id = ? AND (spawn_budget_max = 0 OR spawn_used < spawn_budget_max)`,
+  ).bind(projectId).run();
+  const project = await db.prepare("SELECT spawn_budget_max, spawn_used FROM project WHERE id = ?")
+    .bind(projectId).first<{ spawn_budget_max: number; spawn_used: number }>();
+  return {
+    reserved: (result.meta.changes ?? 0) === 1,
+    max: Number(project?.spawn_budget_max ?? 0),
+    used: Number(project?.spawn_used ?? 0),
+  };
+}
+
+async function releaseSpawnBudget(db: D1Database, projectId: string): Promise<void> {
+  await db.prepare("UPDATE project SET spawn_used = CASE WHEN spawn_used > 0 THEN spawn_used - 1 ELSE 0 END WHERE id = ?")
+    .bind(projectId).run();
+}
+
 async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Promise<void> {
   await reconcileStaleSpawns(db, env, timestamp);
   const pending = await db.prepare(
@@ -1483,31 +1513,23 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
       ]);
       continue;
     }
-    // Budget breaker: stop spawning new workers once the project has consumed its cumulative
-    // spawn budget (0 = unlimited). Counted from spawn_created events so it survives restarts.
-    const budgetRow = await db.prepare("SELECT spawn_budget_max FROM project WHERE id = ?")
-      .bind(candidate.project_id).first<{ spawn_budget_max: number }>();
-    const budgetMax = Number(budgetRow?.spawn_budget_max ?? 0);
-    if (budgetMax > 0) {
-      const usedRow = await db.prepare(
-        "SELECT COUNT(*) AS c FROM task_event WHERE event_type = 'spawn_created' AND json_extract(payload_json, '$.project_id') = ?",
-      ).bind(candidate.project_id).first<{ c: number }>();
-      if (Number(usedRow?.c ?? 0) >= budgetMax) {
-        await db.batch([
-          db.prepare("UPDATE task_item SET spawn_status = 'failed', needs_human = 1, updated_at = ? WHERE id = ? AND spawn_status = 'spawning'")
-            .bind(timestamp, candidate.task_id),
-          event(db, candidate.task_id, "spawn_budget_exceeded", null, {
-            project_id: candidate.project_id, budget_max: budgetMax, used: Number(usedRow?.c ?? 0),
-          }),
-        ]);
-        await notifyLeader(db, candidate.project_id, "Spawn budget exceeded", {
-          type: "spawn_budget_exceeded", task_id: candidate.task_id, budget_max: budgetMax, used: Number(usedRow?.c ?? 0),
-        });
-        continue;
-      }
+    const budget = await reserveSpawnBudget(db, candidate.project_id);
+    if (!budget.reserved) {
+      await db.batch([
+        db.prepare("UPDATE task_item SET spawn_status = 'failed', needs_human = 1, updated_at = ? WHERE id = ? AND spawn_status = 'spawning'")
+          .bind(timestamp, candidate.task_id),
+        event(db, candidate.task_id, "spawn_budget_exceeded", null, {
+          project_id: candidate.project_id, budget_max: budget.max, used: budget.used,
+        }),
+      ]);
+      await notifyLeader(db, candidate.project_id, "Spawn budget exceeded", {
+        type: "spawn_budget_exceeded", task_id: candidate.task_id, budget_max: budget.max, used: budget.used,
+      });
+      continue;
     }
     const backup = await reserveBackupAccount(db, candidate.project_id, profile.role_tag, timestamp);
     if (!backup) {
+      await releaseSpawnBudget(db, candidate.project_id);
       await db.prepare(
         "UPDATE task_item SET spawn_status = 'requested', updated_at = ? WHERE id = ? AND spawn_status = 'spawning'",
       ).bind(timestamp, candidate.task_id).run();
@@ -1535,6 +1557,7 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
         "UPDATE task_item SET spawn_status = 'spawned', assignee_agent_id = ?, phase = CASE WHEN phase = 'pending' THEN 'ready' ELSE phase END, updated_at = ? WHERE id = ? AND spawn_status = 'spawning' AND deleted_at IS NULL",
       ).bind(agent.id, timestamp, candidate.task_id).run();
       if ((assigned.meta.changes ?? 0) !== 1) {
+        await releaseSpawnBudget(db, candidate.project_id);
         await releaseSpawnResources(db, env, candidate.project_id, backup, agent, sessionId, timestamp);
         await event(db, candidate.task_id, "spawn_aborted", null, {
           project_id: candidate.project_id,
@@ -1556,6 +1579,7 @@ async function runWorkerSpawn(db: D1Database, env: Env, timestamp: string): Prom
         }),
       ]);
     } catch (error) {
+      await releaseSpawnBudget(db, candidate.project_id);
       await releaseSpawnResources(db, env, candidate.project_id, backup, agent, sessionId, timestamp);
       await db.batch([
         db.prepare(
@@ -1690,6 +1714,42 @@ async function taskView(db: D1Database, row: Record<string, unknown>) {
   };
 }
 
+async function taskViews(db: D1Database, rows: Record<string, unknown>[]): Promise<Record<string, unknown>[]> {
+  const ids = rows.map((row) => String(row.id));
+  if (ids.length === 0) return [];
+  const [dependencyRows, gateRows] = await Promise.all([
+    selectByIdChunks<{ task_id: string; depends_on_id: string }>(
+      db,
+      ids,
+      (placeholders) => `SELECT task_id, depends_on_id FROM task_dependency WHERE task_id IN (${placeholders}) ORDER BY task_id, depends_on_id`,
+    ),
+    selectByIdChunks<Record<string, unknown>>(
+      db,
+      ids,
+      (placeholders) => `SELECT task_id, gate_name, status, by_agent, note, created_at, updated_at FROM task_gate WHERE task_id IN (${placeholders}) ORDER BY task_id, gate_name`,
+    ),
+  ]);
+  const dependencies = new Map<string, string[]>();
+  for (const row of dependencyRows) {
+    const values = dependencies.get(row.task_id) ?? [];
+    values.push(row.depends_on_id);
+    dependencies.set(row.task_id, values);
+  }
+  const gates = new Map<string, Record<string, unknown>[]>();
+  for (const row of gateRows) {
+    const taskGates = gates.get(String(row.task_id)) ?? [];
+    const { task_id: _taskId, ...gate } = row;
+    taskGates.push(gate);
+    gates.set(String(row.task_id), taskGates);
+  }
+  return rows.map((row) => ({
+    ...row,
+    required_gates: requiredGates(row),
+    dependencies: dependencies.get(String(row.id)) ?? [],
+    gates: gates.get(String(row.id)) ?? [],
+  }));
+}
+
 async function authorizeTask(
   db: D1Database,
   auth: Auth,
@@ -1717,7 +1777,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       ? db.prepare("SELECT * FROM task_item WHERE board_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at").bind(board)
       : db.prepare("SELECT * FROM task_item WHERE deleted_at IS NULL ORDER BY board_id, sort_order, created_at");
     const rows = (await query.all()).results as Record<string, unknown>[];
-    return json({ tasks: await Promise.all(rows.map((row) => taskView(db, row))) });
+    return json({ tasks: await taskViews(db, rows) });
   }
   if (!taskId && method === "POST") {
     const body = await parseBody(request);
@@ -1835,6 +1895,7 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
     const assignee = !assigneeSpecified || body.assignee_agent_id === null || body.assignee_agent_id === ""
       ? (assigneeSpecified ? null : current.assignee_agent_id ?? null)
       : String(body.assignee_agent_id);
+    const assigneeChanged = assignee !== (current.assignee_agent_id ?? null);
     if (!["pending", "ready", "in_progress", "done"].includes(String(phase))) {
       return json({ error: "invalid phase" }, 422);
     }
@@ -1900,8 +1961,9 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       spawn_status: spawnStatus,
       attempt_count: attemptCount,
       blocked,
-      lease_owner: phase === "done" ? null : current.lease_owner ?? null,
-      lease_expires_at: phase === "done" ? null : current.lease_expires_at ?? null,
+      lease_owner: phase === "done" || assigneeChanged ? null : current.lease_owner ?? null,
+      lease_expires_at: phase === "done" || assigneeChanged ? null : current.lease_expires_at ?? null,
+      lease_generation: Number(current.lease_generation ?? 0) + (assigneeChanged ? 1 : 0),
       updated_at: timestamp,
     };
     const gateRequirementsChanged = JSON.stringify(requiredGates(current)) !== responseBody.required_gates;
@@ -1909,11 +1971,16 @@ async function handleTask(request: Request, env: Env, auth: Auth, taskId?: strin
       db.prepare(
         `UPDATE task_item
          SET title = ?, description = ?, priority = ?, phase = ?, require_plan = ?, require_acceptance = ?, required_gates = ?, assignee_agent_id = ?, worker_profile_id = ?, spawn_status = ?, attempt_count = ?, blocked = ?,
-             lease_owner = CASE WHEN ? = 'done' THEN NULL ELSE lease_owner END,
-             lease_expires_at = CASE WHEN ? = 'done' THEN NULL ELSE lease_expires_at END,
+             lease_owner = CASE WHEN ? = 'done' OR ? = 1 THEN NULL ELSE lease_owner END,
+             lease_expires_at = CASE WHEN ? = 'done' OR ? = 1 THEN NULL ELSE lease_expires_at END,
+             lease_generation = lease_generation + CASE WHEN ? = 1 THEN 1 ELSE 0 END,
              updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND board_id = ?`,
-      ).bind(title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee, workerProfileId, spawnStatus, attemptCount, blocked, phase, phase, timestamp, taskId, String(current.board_id)),
+      ).bind(
+        title, description, priority, phase, requirePlan, requireAcceptance, responseBody.required_gates, assignee,
+        workerProfileId, spawnStatus, attemptCount, blocked, phase, assigneeChanged ? 1 : 0,
+        phase, assigneeChanged ? 1 : 0, assigneeChanged ? 1 : 0, timestamp, taskId, String(current.board_id),
+      ),
       event(db, taskId, "updated", actor(auth), { phase, assignee_agent_id: assignee }),
       ...(phase === "done" && gateRequirementsChanged
         ? [event(db, taskId, "done_gate_requirements_changed", actor(auth), {
@@ -2132,6 +2199,8 @@ async function releaseTask(request: Request, env: Env, auth: Auth, taskId: strin
     if (identityError) return identityError;
   }
   const owner = requestedOwner || bodyAgent(body, auth);
+  const requestedGeneration = requestedLeaseGeneration(body);
+  if (requestedGeneration instanceof Response) return requestedGeneration;
   const key = idempotencyKey(request, body);
   const replay = await replayOrReserve(env.DB, `task:release:${taskId}`, key);
   if (replay) return replay;
@@ -2139,8 +2208,10 @@ async function releaseTask(request: Request, env: Env, auth: Auth, taskId: strin
   const projectId = String(access.row?.board_id);
   const result = await env.DB.batch([
     env.DB.prepare(
-      "UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND board_id = ? AND lease_owner = ? AND deleted_at IS NULL",
-    ).bind(timestamp, taskId, projectId, owner),
+      `UPDATE task_item SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+       WHERE id = ? AND board_id = ? AND lease_owner = ? AND deleted_at IS NULL
+       ${override || requestedGeneration === null ? "" : "AND lease_generation = ?"}`,
+    ).bind(timestamp, taskId, projectId, owner, ...(override || requestedGeneration === null ? [] : [requestedGeneration])),
     conditionalEvent(env.DB, taskId, "released", actor(auth), { project_id: projectId, released_agent_id: owner, forced: override }, "EXISTS (SELECT 1 FROM task_item WHERE id = ? AND board_id = ? AND lease_owner IS NULL AND updated_at = ?)", [taskId, projectId, timestamp]),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "lease not owned" }, 409);
@@ -2166,7 +2237,8 @@ async function reassignTask(request: Request, env: Env, auth: Auth, taskId: stri
   const result = await env.DB.batch([
     env.DB.prepare(
       `UPDATE task_item
-       SET assignee_agent_id = ?, phase = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+       SET assignee_agent_id = ?, phase = ?, lease_owner = NULL, lease_expires_at = NULL,
+           lease_generation = lease_generation + 1, updated_at = ?
        WHERE id = ? AND board_id = ? AND deleted_at IS NULL`,
     ).bind(assignee ?? null, nextPhase, timestamp, taskId, current.board_id),
     event(env.DB, taskId, "reassigned", actor(auth), {
@@ -2190,6 +2262,8 @@ async function completeTask(request: Request, env: Env, auth: Auth, ctx: Executi
   if (identityError) return identityError;
   const owner = bodyAgent(body, auth);
   const current = access.row as Record<string, unknown>;
+  const requestedGeneration = requestedLeaseGeneration(body);
+  if (requestedGeneration instanceof Response) return requestedGeneration;
   const timestamp = now();
   const leaseOverride = canManage(auth);
   if (!leaseOverride && (
@@ -2212,8 +2286,12 @@ async function completeTask(request: Request, env: Env, auth: Auth, ctx: Executi
   const requiresAcceptance = Number(current.require_acceptance ?? 0) === 1;
   const leaseCondition = leaseOverride
     ? ""
-    : " AND lease_owner = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?";
-  const leaseValues = leaseOverride ? [] : [owner, timestamp];
+    : ` AND lease_owner = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?${
+      requestedGeneration === null ? "" : " AND lease_generation = ?"
+    }`;
+  const leaseValues = leaseOverride
+    ? []
+    : [owner, timestamp, ...(requestedGeneration === null ? [] : [requestedGeneration])];
   const result = await env.DB.batch([
     requiresAcceptance
       ? env.DB.prepare(
@@ -2256,6 +2334,8 @@ async function submitPlan(request: Request, env: Env, auth: Auth, ctx: Execution
   const current = access.row as Record<string, unknown>;
   const owner = bodyAgent(body, auth);
   const timestamp = now();
+  const requestedGeneration = requestedLeaseGeneration(body);
+  if (requestedGeneration instanceof Response) return requestedGeneration;
   const projectId = String(current.board_id);
   const result = await env.DB.batch([
     env.DB.prepare(
@@ -2264,8 +2344,9 @@ async function submitPlan(request: Request, env: Env, auth: Auth, ctx: Execution
            plan_submitted_at = ?, plan_reviewed_by = NULL, plan_review_note = NULL,
            plan_reviewed_at = NULL, updated_at = ?
        WHERE id = ? AND board_id = ? AND deleted_at IS NULL AND phase = 'in_progress'
-         AND lease_owner = ? AND (lease_expires_at IS NULL OR lease_expires_at > ?)`,
-    ).bind(plan, owner, timestamp, timestamp, taskId, projectId, owner, timestamp),
+         AND lease_owner = ? AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+         ${requestedGeneration === null ? "" : "AND lease_generation = ?"}`,
+    ).bind(plan, owner, timestamp, timestamp, taskId, projectId, owner, timestamp, ...(requestedGeneration === null ? [] : [requestedGeneration])),
     conditionalEvent(
       env.DB,
       taskId,
@@ -2915,7 +2996,8 @@ async function projects(request: Request, env: Env, auth: Auth): Promise<Respons
   const name = String(body.name || projectId).trim();
   if (!projectId || !name) return json({ error: "id and name are required" }, 400);
   const key = idempotencyKey(request, body);
-  const replay = await replayOrReserve(env.DB, "project:create", key);
+  const scope = `project:create:${projectId}`;
+  const replay = await replayOrReserve(env.DB, scope, key);
   if (replay) return replay;
   const timestamp = now();
   const result = await env.DB.prepare(
@@ -2923,7 +3005,7 @@ async function projects(request: Request, env: Env, auth: Auth): Promise<Respons
   ).bind(projectId, name, JSON.stringify(body.metadata || {}), timestamp, timestamp).run();
   if ((result.meta.changes ?? 0) !== 1) return json({ error: "project already exists" }, 409);
   const response = json({ id: projectId, name, metadata_json: JSON.stringify(body.metadata || {}), created_at: timestamp, updated_at: timestamp }, 201);
-  return saveIdempotentResponse(env.DB, "project:create", key, response);
+  return saveIdempotentResponse(env.DB, scope, key, response);
 }
 
 async function briefing(request: Request, env: Env, auth: Auth): Promise<Response> {
@@ -3022,15 +3104,16 @@ async function sleepWorker(request: Request, env: Env, auth: Auth, taskId: strin
   if (!context) return json({ error: "no active worker session for this task" }, 404);
   const note = String(body.message || "No further tasks are assigned. You may sleep now; you will be woken if new work arrives.").trim();
   const sent = await sendDevinSessionMessage(context.orgId, context.credential, context.sessionId, note);
+  if (!sent) return json({ error: "failed to deliver sleep request to worker session", task_id: taskId, delivered: false }, 502);
   const timestamp = now();
   await env.DB.batch([
     // Mark the worker leader-slept so the watchdog stops waking it, and clear needs_human.
     env.DB.prepare("UPDATE agent SET metadata_json = json_set(metadata_json, '$.leader_sleep', 1), updated_at = ? WHERE id = ? AND project_id = ?")
       .bind(timestamp, context.agentId, projectId),
     env.DB.prepare("UPDATE task_item SET needs_human = 0, updated_at = ? WHERE id = ?").bind(timestamp, taskId),
-    event(env.DB, taskId, "worker_slept", actor(auth), { project_id: projectId, agent_id: context.agentId, delivered: sent }),
+    event(env.DB, taskId, "worker_slept", actor(auth), { project_id: projectId, agent_id: context.agentId, delivered: true }),
   ]);
-  return json({ ok: true, task_id: taskId, delivered: sent });
+  return json({ ok: true, task_id: taskId, delivered: true });
 }
 
 // M2: register (or re-link) a project's Cloud-Dev Leader session as a role=lead board agent.
@@ -3106,8 +3189,8 @@ async function leaderDashboard(env: Env, auth: Auth, url: URL): Promise<Response
   const projectId = (url.searchParams.get("project") || url.searchParams.get("project_id") || (isAdmin(auth) || isShare(auth) ? "" : auth.projectId)).trim();
   if (!projectId) return json({ error: "project is required" }, 400);
   if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
-  const project = await env.DB.prepare("SELECT id, name, leader_agent_id, spawn_budget_max FROM project WHERE id = ?")
-    .bind(projectId).first<{ id: string; name: string; leader_agent_id: string | null; spawn_budget_max: number }>();
+  const project = await env.DB.prepare("SELECT id, name, leader_agent_id, spawn_budget_max, spawn_used FROM project WHERE id = ?")
+    .bind(projectId).first<{ id: string; name: string; leader_agent_id: string | null; spawn_budget_max: number; spawn_used: number }>();
   if (!project) return json({ error: "project not found" }, 404);
   const phaseRows = await env.DB.prepare(
     "SELECT phase, COUNT(*) AS c FROM task_item WHERE board_id = ? AND deleted_at IS NULL GROUP BY phase",
@@ -3123,12 +3206,9 @@ async function leaderDashboard(env: Env, auth: Auth, url: URL): Promise<Response
   const workers = await env.DB.prepare(
     "SELECT id, title, spawn_status, watchdog_status, blocked, needs_human, assignee_agent_id FROM task_item WHERE board_id = ? AND deleted_at IS NULL AND spawn_status IS NOT NULL ORDER BY updated_at DESC LIMIT 100",
   ).bind(projectId).all<Record<string, unknown>>();
-  const usedRow = await env.DB.prepare(
-    "SELECT COUNT(*) AS c FROM task_event WHERE event_type = 'spawn_created' AND json_extract(payload_json, '$.project_id') = ?",
-  ).bind(projectId).first<{ c: number }>();
   return json({
     project: { id: project.id, name: project.name, leader_agent_id: project.leader_agent_id },
-    budget: { max: Number(project.spawn_budget_max ?? 0), used: Number(usedRow?.c ?? 0) },
+    budget: { max: Number(project.spawn_budget_max ?? 0), used: Number(project.spawn_used ?? 0) },
     task_phase_counts: phases,
     blocked: blocked.results,
     needs_human: needsHuman.results,
@@ -3148,7 +3228,8 @@ async function provision(request: Request, env: Env, auth: Auth): Promise<Respon
   const projectName = String(projectInput.name || projectId).trim();
   if (!projectId || !projectName) return json({ error: "project.id and project.name are required" }, 400);
   const key = idempotencyKey(request, body);
-  const replay = await replayOrReserve(env.DB, "provision", key);
+  const scope = `provision:${projectId}`;
+  const replay = await replayOrReserve(env.DB, scope, key);
   if (replay) return replay;
   const timestamp = now();
   const statements: D1PreparedStatement[] = [];
@@ -3203,7 +3284,7 @@ async function provision(request: Request, env: Env, auth: Auth): Promise<Respon
     backup_account_ids: accountIds,
     leader: leaderSummary,
   }, 201);
-  return saveIdempotentResponse(env.DB, "provision", key, response);
+  return saveIdempotentResponse(env.DB, scope, key, response);
 }
 
 function requestOrigin(request: Request): string {
@@ -3217,8 +3298,8 @@ async function spawnStats(request: Request, env: Env, auth: Auth): Promise<Respo
   const projectId = (url.searchParams.get("project") || url.searchParams.get("project_id") || (isAdmin(auth) || isShare(auth) ? "" : auth.projectId)).trim();
   if (!projectId) return json({ error: "project is required" }, 400);
   if (!projectAllowed(auth, projectId)) return json({ error: "project access denied" }, 403);
-  const project = await env.DB.prepare("SELECT id, spawn_budget_max FROM project WHERE id = ?")
-    .bind(projectId).first<{ id: string; spawn_budget_max: number }>();
+  const project = await env.DB.prepare("SELECT id, spawn_budget_max, spawn_used FROM project WHERE id = ?")
+    .bind(projectId).first<{ id: string; spawn_budget_max: number; spawn_used: number }>();
   if (!project) return json({ error: "project not found" }, 404);
   const rows = await env.DB.prepare(
     `SELECT p.id AS profile_id, p.name AS name, p.role_tag AS role_tag, p.enabled AS enabled,
@@ -3235,9 +3316,6 @@ async function spawnStats(request: Request, env: Env, auth: Auth): Promise<Respo
      GROUP BY p.id, p.name, p.role_tag, p.enabled
      ORDER BY p.name`,
   ).bind(projectId).all<Record<string, unknown>>();
-  const usedRow = await env.DB.prepare(
-    "SELECT COUNT(*) AS c FROM task_event WHERE event_type = 'spawn_created' AND json_extract(payload_json, '$.project_id') = ?",
-  ).bind(projectId).first<{ c: number }>();
   const profiles = rows.results.map((row) => ({
     worker_profile_id: String(row.profile_id),
     name: String(row.name ?? ""),
@@ -3253,7 +3331,7 @@ async function spawnStats(request: Request, env: Env, auth: Auth): Promise<Respo
   }));
   return json({
     project_id: projectId,
-    budget: { max: Number(project.spawn_budget_max ?? 0), used: Number(usedRow?.c ?? 0) },
+    budget: { max: Number(project.spawn_budget_max ?? 0), used: Number(project.spawn_used ?? 0) },
     profiles,
   });
 }
@@ -3882,7 +3960,9 @@ async function lifecycle(
     ).bind(id(), agentId, row.project_id, `agent_${transition}`, JSON.stringify({ actor_agent_id: actor(auth), token_revoked: revokeToken }), timestamp),
   ]);
   if ((result[0].meta.changes ?? 0) !== 1) return json({ error: "agent lifecycle transition failed" }, 409);
-  const releasedProjects = transition === "shutdown" ? await releaseAgentLeases(env.DB, agentId) : [];
+  const releasedProjects = transition === "idle" || transition === "shutdown"
+    ? await releaseAgentLeases(env.DB, agentId)
+    : [];
   if (transition === "shutdown") {
     dispatchHooks(ctx, env, row.project_id, "agent_shutdown", "post", { agent_id: agentId, actor_agent_id: actor(auth), released_leases: releasedProjects.length, token_revoked: revokeToken });
   }
@@ -4150,10 +4230,10 @@ function taskCard(t){const gates=(t.gates||[]).map(g=>esc(g.gate_name+':'+g.stat
 function renderAgents(agents){document.querySelector('#agents').innerHTML=agents.length?agents.map(a=>'<article class="agent"><span class="avatar" style="background:'+color(a.id)+'">'+esc(initial(a))+'</span><div><div class="agent-name">'+esc(a.name||a.id)+'</div><div class="agent-meta">'+esc(a.role||'worker')+' · '+esc(relative(a.last_seen_at))+'</div></div><span class="status '+esc(a.status||'offline')+'">'+esc(a.status||'offline')+'</span>'+(a.current_task?'<div class="agent-task">↳ '+esc(a.current_task.title)+'</div>':'<div class="agent-task muted">No active task</div>')+'<div class="agent-actions"><button class="danger" data-write="1" data-action="shutdown" data-id="'+esc(a.id)+'">Force shutdown</button></div></article>').join(''):'<div class="empty">No agents in this project.</div>';renderReadOnly()}
 function renderBoard(tasks){const groups={inbox:[],assigned:[],review:[],done:[],blocked:[]};tasks.forEach(t=>groups[phaseBucket(t)].push(t));const columns=[['inbox','INBOX'],['assigned','ASSIGNED'],['review','REVIEW / ACCEPTANCE'],['done','DONE'],['blocked','BLOCKED']];document.querySelector('#board').innerHTML=columns.map(([key,label])=>'<div class="column"><div class="column-head"><span>'+label+'</span><span class="count">'+groups[key].length+'</span></div>'+(groups[key].map(taskCard).join('')||'<div class="empty">Clear</div>')+'</div>').join('');renderReadOnly()}
 function renderFeed(events){document.querySelector('#feed').innerHTML=events.length?events.map(e=>'<div class="feed-item"><div class="feed-type">◈ '+esc(e.type||'event')+'</div><div class="feed-meta">'+esc(relative(e.created_at))+' · '+esc(e.agent_id||'system')+(e.task_id?' · task '+esc(e.task_id):'')+'</div>'+(e.payload_summary?'<div class="feed-summary">'+esc(e.payload_summary)+'</div>':'')+'</div>').join(''):'<div class="empty">No events yet.</div>'}
-async function load(){if(paused)return;const [team,events]=await Promise.all([api('/team?project='+encodeURIComponent(project)),api('/events?project='+encodeURIComponent(project)+'&limit=50')]);if(team.status>=400){setText('#connection','Offline');document.querySelector('#notice').textContent=team.data.error||'Unable to load project';document.querySelector('#notice').classList.remove('hidden');return}setText('#connection','Online');document.querySelector('#notice').classList.add('hidden');const d=team.data;setText('#agent-count',(d.agents||[]).length);setText('#task-count',(d.tasks||[]).length);setText('#deadletters',(d.dead_letter_count||0)+' dead');renderAgents(d.agents||[]);renderBoard(d.tasks||[]);if(events.status<400)renderFeed(events.data.events||[])}
+  async function load(){if(paused)return;try{const [team,events]=await Promise.all([api('/team?project='+encodeURIComponent(project)),api('/events?project='+encodeURIComponent(project)+'&limit=50')]);if(team.status>=400){setText('#connection','Offline');document.querySelector('#notice').textContent=team.data.error||'Unable to load project';document.querySelector('#notice').classList.remove('hidden');return}setText('#connection','Online');document.querySelector('#notice').classList.add('hidden');const d=team.data;setText('#agent-count',(d.agents||[]).length);setText('#task-count',(d.tasks||[]).length);setText('#deadletters',(d.dead_letter_count||0)+' dead');renderAgents(d.agents||[]);renderBoard(d.tasks||[]);if(events.status<400)renderFeed(events.data.events||[])}catch(error){setText('#connection','Offline');document.querySelector('#notice').textContent=error instanceof Error?error.message:'Unable to refresh project';document.querySelector('#notice').classList.remove('hidden')}}
 async function write(path,body){const r=await api(path,{method:'POST',body:JSON.stringify(body||{})});if(r.status<400)load();else alert(r.data.error||'Request failed')}
 document.querySelector('#board').addEventListener('click',e=>{const b=e.target.closest('button[data-action]');if(!b||readOnly)return;const id=b.dataset.id;const action=b.dataset.action;if(action==='claim'||action==='complete')write('/tasks/'+encodeURIComponent(id)+'/'+action,{agent_id:agent.value});else if(action==='release')write('/tasks/'+encodeURIComponent(id)+'/release',{agent_id:b.dataset.agent});else if(action==='shutdown')write('/agents/'+encodeURIComponent(id)+'/shutdown',{});else if(action==='reassign'){const value=prompt('Assignee agent id (blank to clear):','');if(value!==null)write('/tasks/'+encodeURIComponent(id)+'/reassign',{assignee_agent_id:value||null})}});
-document.querySelector('#agents').addEventListener('click',e=>{const b=e.target.closest('button[data-action="shutdown"]');if(b&&!readOnly)write('/agents/'+encodeURIComponent(b.dataset.id)+'/shutdown',{})});document.querySelector('#new-task-button').onclick=()=>{if(!readOnly)document.querySelector('#new-task-form').classList.toggle('hidden')};document.querySelector('#cancel-new').onclick=()=>document.querySelector('#new-task-form').classList.add('hidden');document.querySelector('#new-task-form').onsubmit=e=>{e.preventDefault();write('/tasks',{title:document.querySelector('#title').value,board_id:project});e.target.reset();e.target.classList.add('hidden')};document.querySelector('#settings-button').onclick=()=>document.querySelector('#settings').classList.toggle('hidden');document.querySelector('#save-settings').onclick=()=>{sessionStorage.setItem('coord-board-token',token.value);sessionStorage.setItem('coord-board-agent',agent.value);document.querySelector('#settings').classList.add('hidden');load()};document.querySelector('#pause-button').onclick=()=>{paused=!paused;document.querySelector('#pause-button').textContent=paused?'Resume refresh':'Pause refresh';if(!paused)load()};document.querySelector('#feed-toggle').onclick=()=>{feedCollapsed=!feedCollapsed;document.querySelector('#feed').classList.toggle('hidden',feedCollapsed);document.querySelector('#feed-toggle').textContent=feedCollapsed?'Expand':'Collapse'};setInterval(()=>{document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});document.querySelectorAll('.task-time,.agent-meta,.feed-meta').forEach(()=>{});},1000);setInterval(load,5000);document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});load()
+  document.querySelector('#agents').addEventListener('click',e=>{const b=e.target.closest('button[data-action="shutdown"]');if(b&&!readOnly)write('/agents/'+encodeURIComponent(b.dataset.id)+'/shutdown',{})});document.querySelector('#new-task-button').onclick=()=>{if(!readOnly)document.querySelector('#new-task-form').classList.toggle('hidden')};document.querySelector('#cancel-new').onclick=()=>document.querySelector('#new-task-form').classList.add('hidden');document.querySelector('#new-task-form').onsubmit=e=>{e.preventDefault();write('/tasks',{title:document.querySelector('#title').value,board_id:project});e.target.reset();e.target.classList.add('hidden')};document.querySelector('#settings-button').onclick=()=>document.querySelector('#settings').classList.toggle('hidden');document.querySelector('#save-settings').onclick=()=>{sessionStorage.setItem('coord-board-token',token.value);sessionStorage.setItem('coord-board-agent',agent.value);document.querySelector('#settings').classList.add('hidden');load()};document.querySelector('#pause-button').onclick=()=>{paused=!paused;document.querySelector('#pause-button').textContent=paused?'Resume refresh':'Pause refresh';if(!paused)load()};document.querySelector('#feed-toggle').onclick=()=>{feedCollapsed=!feedCollapsed;document.querySelector('#feed').classList.toggle('hidden',feedCollapsed);document.querySelector('#feed-toggle').textContent=feedCollapsed?'Expand':'Collapse'};setInterval(()=>{document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});},1000);setInterval(load,5000);document.querySelector('#clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});load()
 </script></body></html>`;
 
 export default {
